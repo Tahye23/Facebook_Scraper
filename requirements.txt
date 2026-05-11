@@ -1,0 +1,12 @@
+flask==3.1.3
+playwright==1.58.0
+requests==2.32.5
+flask-cors==4.0.0
+# Désinstaller l'ancien playwright cassé
+# pip uninstall playwright greenlet pyee -y
+
+# Réinstaller avec les bonnes versions
+# pip install flask==3.1.3 playwright==1.58.0 requests==2.32.5 flask-cors==4.0.0
+#python -m playwright install chromium
+#Tester que tout fonctionne
+#python -c "from playwright.sync_api import sync_playwright; print('OK')"

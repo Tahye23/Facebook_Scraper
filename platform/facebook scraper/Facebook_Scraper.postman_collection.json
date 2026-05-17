@@ -1,0 +1,256 @@
+{
+  "info": {
+    "name": "Facebook Scraper API",
+    "description": "Collection complète pour tester tous les endpoints du scraper Facebook",
+    "_postman_id": "fb-scraper-collection-v1",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:5000",
+      "type": "string"
+    },
+    {
+      "key": "job_id",
+      "value": "",
+      "type": "string",
+      "description": "Rempli automatiquement après POST /scrape/batch/urls"
+    }
+  ],
+  "item": [
+    {
+      "name": "🟢 Health Check",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/health",
+          "host": ["{{base_url}}"],
+          "path": ["health"]
+        },
+        "description": "Vérifier que le serveur Flask est bien démarré."
+      },
+      "response": [
+        {
+          "name": "Succès",
+          "status": "OK",
+          "code": 200,
+          "body": "{\"status\": \"ok\"}"
+        }
+      ]
+    },
+    {
+      "name": "📄 Scraper une page (sans date)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"url\": \"https://www.facebook.com/BBCNews\",\n  \"max_posts\": 5\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{base_url}}/scrape/page",
+          "host": ["{{base_url}}"],
+          "path": ["scrape", "page"]
+        },
+        "description": "Scrape les posts d'une page Facebook.\n\n- `url` : URL de la page Facebook (obligatoire)\n- `max_posts` : nombre max de posts à récupérer (optionnel, défaut = tous)"
+      },
+      "response": [
+        {
+          "name": "Succès",
+          "status": "OK",
+          "code": 200,
+          "body": "{\n  \"posts\": [\n    {\n      \"message\": \"Texte du post...\",\n      \"author\": \"BBC News\",\n      \"date\": \"1715600000\",\n      \"reactions\": \"250\",\n      \"comments\": \"45\",\n      \"shares\": \"12\",\n      \"post_url\": \"https://www.facebook.com/BBCNews/posts/123456\"\n    }\n  ],\n  \"total\": 5,\n  \"url\": \"https://www.facebook.com/BBCNews\"\n}"
+        },
+        {
+          "name": "Cookies expirés",
+          "status": "OK",
+          "code": 200,
+          "body": "{\n  \"posts\": [],\n  \"total\": 0,\n  \"error\": \"login_required\"\n}"
+        },
+        {
+          "name": "URL invalide",
+          "status": "Bad Request",
+          "code": 400,
+          "body": "{\n  \"error\": \"URL Facebook invalide\"\n}"
+        }
+      ]
+    },
+    {
+      "name": "💬 Scraper les commentaires d'un post",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"post_url\": \"https://www.facebook.com/permalink.php?story_fbid=123456789&id=987654321\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{base_url}}/scrape/comments",
+          "host": ["{{base_url}}"],
+          "path": ["scrape", "comments"]
+        },
+        "description": "Scrape les commentaires d'un post Facebook.\n\n- `post_url` : URL du post (obligatoire)\n  - Format 1 : `https://www.facebook.com/permalink.php?story_fbid=XXX&id=YYY`\n  - Format 2 : `https://www.facebook.com/pagename/posts/XXX`"
+      },
+      "response": [
+        {
+          "name": "Succès",
+          "status": "OK",
+          "code": 200,
+          "body": "{\n  \"comments\": [\n    {\n      \"author\": \"John Doe\",\n      \"message\": \"Super article !\"\n    },\n    {\n      \"author\": \"Jane Smith\",\n      \"message\": \"Merci pour l'info\"\n    }\n  ],\n  \"total\": 2\n}"
+        },
+        {
+          "name": "Paramètre manquant",
+          "status": "Bad Request",
+          "code": 400,
+          "body": "{\n  \"error\": \"post_url manquant\"\n}"
+        }
+      ]
+    },
+    {
+      "name": "📦 Batch avec filtre de dates (synchrone)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"csv_path\": \"data/facebook_urls.csv\",\n  \"date_from\": \"2024-01-01\",\n  \"date_to\": \"2024-12-31\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{base_url}}/scrape/batch",
+          "host": ["{{base_url}}"],
+          "path": ["scrape", "batch"]
+        },
+        "description": "Scrape toutes les pages du CSV avec filtre de dates.\n\n⚠️ Requête **bloquante** — attend que toutes les pages soient scrapées avant de répondre.\n\n- `csv_path` : chemin du CSV sur le serveur (obligatoire)\n- `date_from` : date de début ISO format `YYYY-MM-DD` (obligatoire)\n- `date_to` : date de fin ISO format `YYYY-MM-DD` (obligatoire)\n\nFormats de date acceptés :\n- `2024-01-01`\n- `2024-01-01T00:00:00`"
+      },
+      "response": [
+        {
+          "name": "Succès",
+          "status": "OK",
+          "code": 200,
+          "body": "{\n  \"results\": [\n    {\n      \"url\": \"https://www.facebook.com/BBCNews\",\n      \"posts\": [...],\n      \"total\": 3,\n      \"total_scraped\": 10,\n      \"date_from\": \"2024-01-01T00:00:00\",\n      \"date_to\": \"2024-12-31T00:00:00\"\n    }\n  ],\n  \"pages_count\": 1\n}"
+        },
+        {
+          "name": "Batch déjà en cours",
+          "status": "Too Many Requests",
+          "code": 429,
+          "body": "{\n  \"error\": \"Un batch est déjà en cours\"\n}"
+        }
+      ]
+    },
+    {
+      "name": "🚀 Batch URLs sans date (asynchrone) — Lancer",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "var json = pm.response.json();",
+              "if (json.job_id) {",
+              "    pm.collectionVariables.set('job_id', json.job_id);",
+              "    console.log('job_id sauvegardé :', json.job_id);",
+              "}"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"csv_path\": \"data/facebook_urls.csv\",\n  \"max_posts\": 5\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{base_url}}/scrape/batch/urls",
+          "host": ["{{base_url}}"],
+          "path": ["scrape", "batch", "urls"]
+        },
+        "description": "Lance un batch asynchrone sans filtre de dates.\n\n✅ Répond **immédiatement** avec un `job_id`.\nUtilise ensuite `GET /scrape/job/:job_id` pour suivre l'avancement.\n\n- `csv_path` : chemin du CSV sur le serveur (obligatoire)\n- `max_posts` : nombre max de posts par page (optionnel)\n\n⚡ Le script de test sauvegarde automatiquement le `job_id` dans la variable de collection."
+      },
+      "response": [
+        {
+          "name": "Succès — job lancé",
+          "status": "OK",
+          "code": 200,
+          "body": "{\n  \"job_id\": \"a3f9c1d2-4e5b-6789-abcd-ef0123456789\",\n  \"status\": \"started\"\n}"
+        }
+      ]
+    },
+    {
+      "name": "🔍 Statut d'un job",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/scrape/job/{{job_id}}",
+          "host": ["{{base_url}}"],
+          "path": ["scrape", "job", "{{job_id}}"]
+        },
+        "description": "Consulter l'état d'un job batch asynchrone.\n\nLa variable `{{job_id}}` est remplie automatiquement si tu as utilisé le script de test de l'endpoint `POST /scrape/batch/urls`.\n\nStatuts possibles :\n- `pending` : en attente de démarrage\n- `running` : en cours d'exécution\n- `done` : terminé avec succès\n- `error` : terminé avec une erreur"
+      },
+      "response": [
+        {
+          "name": "Job en cours",
+          "status": "OK",
+          "code": 200,
+          "body": "{\n  \"status\": \"running\",\n  \"result\": null,\n  \"error\": null,\n  \"created_at\": \"2024-05-13T10:00:00\",\n  \"started_at\": \"2024-05-13T10:00:01\",\n  \"finished_at\": null\n}"
+        },
+        {
+          "name": "Job terminé",
+          "status": "OK",
+          "code": 200,
+          "body": "{\n  \"status\": \"done\",\n  \"result\": [\n    {\n      \"url\": \"https://www.facebook.com/BBCNews\",\n      \"posts\": [...],\n      \"total\": 5\n    }\n  ],\n  \"error\": null,\n  \"created_at\": \"2024-05-13T10:00:00\",\n  \"started_at\": \"2024-05-13T10:00:01\",\n  \"finished_at\": \"2024-05-13T10:02:30\"\n}"
+        },
+        {
+          "name": "Job introuvable",
+          "status": "Not Found",
+          "code": 404,
+          "body": "{\n  \"error\": \"job introuvable\"\n}"
+        }
+      ]
+    }
+  ]
+}

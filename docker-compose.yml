@@ -1,0 +1,118 @@
+services:
+
+  # ─── MongoDB ───────────────────────────────────────────────────────────────
+  mongodb:
+    image: mongo:7.0
+    container_name: scraper_mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+      MONGO_INITDB_DATABASE: ${MONGO_DB}
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - scraper_net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── RabbitMQ ──────────────────────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: scraper_rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    ports:
+      - "5672:5672"      # AMQP
+      - "15672:15672"    # Management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - scraper_net
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Spring Boot Gateway ───────────────────────────────────────────────────
+  gateway:
+    build:
+      context: ./scraper
+      dockerfile: Dockerfile
+    container_name: scraper_gateway
+    restart: unless-stopped
+    environment:
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+      SPRING_DATA_MONGODB_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/${MONGO_DB}?authSource=admin
+    ports:
+      - "8080:8080"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - scraper_net
+
+  # ─── Worker Facebook ───────────────────────────────────────────────────────
+  worker-facebook:
+    build:
+      context: "./platform/facebook scraper"
+      dockerfile: Dockerfile
+    container_name: scraper_worker_facebook
+    restart: unless-stopped
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+      RABBITMQ_QUEUE: scraping_queue_facebook
+      RABBITMQ_RESULT_QUEUE: scrape_result_queue
+      RABBITMQ_EXCHANGE: scrape.exchange
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - scraper_net
+
+  # ─── Worker TikTok ─────────────────────────────────────────────────────────
+  worker-tiktok:
+    build:
+      context: "./platform/tiktok scraper"
+      dockerfile: Dockerfile
+    container_name: scraper_worker_tiktok
+    restart: unless-stopped
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+      RABBITMQ_QUEUE: scraping_queue_tiktok
+      RABBITMQ_RESULT_QUEUE: scrape_result_queue
+      RABBITMQ_EXCHANGE: scrape.exchange
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - scraper_net
+
+# ─── Volumes ───────────────────────────────────────────────────────────────
+volumes:
+  mongodb_data:
+  rabbitmq_data:
+
+# ─── Network ───────────────────────────────────────────────────────────────
+networks:
+  scraper_net:
+    driver: bridge

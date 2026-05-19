@@ -1,0 +1,259 @@
+{
+  "info": {
+    "_postman_id": "a6cf5fbe-e8d7-4adb-a8ae-8bc4f90e9357",
+    "name": "Scraper Gateway API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "Collection pour tester toutes les APIs de la gateway Spring Boot scraper."
+  },
+  "item": [
+    {
+      "name": "Health - GET /actuator/health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/actuator/health",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "actuator",
+            "health"
+          ]
+        },
+        "description": "Vérifie que la gateway est UP."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create Job Facebook - POST /scrape",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"url\": \"https://www.facebook.com/some-page-or-post\",\n  \"platform\": \"facebook\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/scrape",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape"
+          ]
+        },
+        "description": "Crée un job de scraping Facebook et récupère scrape_id."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 202', function () {",
+              "    pm.response.to.have.status(202);",
+              "});",
+              "",
+              "const data = pm.response.json();",
+              "pm.test('Response contains scrape_id', function () {",
+              "    pm.expect(data.scrape_id).to.exist;",
+              "});",
+              "",
+              "if (data.scrape_id) {",
+              "    pm.collectionVariables.set('scrape_id', data.scrape_id);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create Job TikTok - POST /scrape",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"url\": \"https://www.tiktok.com/@someuser\",\n  \"platform\": \"tiktok\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/scrape",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape"
+          ]
+        },
+        "description": "Crée un job de scraping TikTok et met à jour scrape_id."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 202', function () {",
+              "    pm.response.to.have.status(202);",
+              "});",
+              "",
+              "const data = pm.response.json();",
+              "pm.test('Response contains scrape_id', function () {",
+              "    pm.expect(data.scrape_id).to.exist;",
+              "});",
+              "",
+              "if (data.scrape_id) {",
+              "    pm.collectionVariables.set('scrape_id', data.scrape_id);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Get Job Status - GET /scrape/{scrapeId}",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/scrape/{{scrape_id}}",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape",
+            "{{scrape_id}}"
+          ]
+        },
+        "description": "Récupère le statut du job (QUEUED/RUNNING/SUCCESS/FAILED)."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Get Job Results - GET /scrape/{scrapeId}/results",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/scrape/{{scrape_id}}/results",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape",
+            "{{scrape_id}}",
+            "results"
+          ]
+        },
+        "description": "Récupère les résultats stockés en MongoDB pour un scrape_id."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "const data = pm.response.json();",
+              "pm.test('Response has results array', function () {",
+              "    pm.expect(data.results).to.be.an('array');",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Validation Error - POST /scrape (invalid platform)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"url\": \"https://example.com\",\n  \"platform\": \"instagram\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/scrape",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape"
+          ]
+        },
+        "description": "Teste l'erreur métier pour une plateforme non supportée."
+      }
+    },
+    {
+      "name": "Not Found - GET /scrape/{scrapeId}",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/scrape/not-existing-id",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape",
+            "not-existing-id"
+          ]
+        },
+        "description": "Teste le 404 quand le scrape_id n'existe pas."
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "scrape_id",
+      "value": ""
+    }
+  ]
+}

@@ -4,9 +4,11 @@ import com.richatt.scraper.api.dto.ScrapeRequest;
 import com.richatt.scraper.api.dto.ScrapeResponse;
 import com.richatt.scraper.model.ScrapeJob;
 import com.richatt.scraper.model.ScrapeResult;
+import com.richatt.scraper.model.ScrapeStatus;
 import com.richatt.scraper.service.ScrapeOrchestrationService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -42,9 +44,40 @@ public class ScrapeController {
 
     @GetMapping("/{scrapeId}/results")
     public ResponseEntity<?> getResults(@PathVariable String scrapeId) {
+        ScrapeJob job = orchestrationService.getJob(scrapeId).orElse(null);
+        if (job == null) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of(
+                "scrape_id", scrapeId,
+                "message", "Scrape job not found"
+            ));
+        }
+
         List<ScrapeResult> results = orchestrationService.getResultsByScrapeId(scrapeId);
+
+        if ((job.getStatus() == ScrapeStatus.QUEUED || job.getStatus() == ScrapeStatus.RUNNING)
+            && results.isEmpty()) {
+            return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
+                "scrape_id", scrapeId,
+                "status", job.getStatus().name(),
+                "message", "Scraping in progress, results not ready yet",
+                "count", 0,
+                "results", List.of()
+            ));
+        }
+
+        if (job.getStatus() == ScrapeStatus.FAILED && results.isEmpty()) {
+            return ResponseEntity.ok(Map.of(
+                "scrape_id", scrapeId,
+                "status", job.getStatus().name(),
+                "message", job.getErrorMessage() != null ? job.getErrorMessage() : "Scraping failed",
+                "count", 0,
+                "results", List.of()
+            ));
+        }
+
         return ResponseEntity.ok(Map.of(
                 "scrape_id", scrapeId,
+            "status", job.getStatus().name(),
                 "count", results.size(),
                 "results", results
         ));

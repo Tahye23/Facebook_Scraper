@@ -55,6 +55,14 @@ services:
       SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER}
       SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
       SPRING_DATA_MONGODB_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/${MONGO_DB}?authSource=admin
+      SPRING_MONGODB_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/${MONGO_DB}?authSource=admin
+    command:
+      - --spring.rabbitmq.host=rabbitmq
+      - --spring.rabbitmq.port=5672
+      - --spring.rabbitmq.username=${RABBITMQ_USER}
+      - --spring.rabbitmq.password=${RABBITMQ_PASSWORD}
+      - --spring.data.mongodb.uri=mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/${MONGO_DB}?authSource=admin
+      - --spring.mongodb.uri=mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/${MONGO_DB}?authSource=admin
     ports:
       - "8080:8080"
     depends_on:
@@ -73,6 +81,7 @@ services:
     container_name: scraper_worker_facebook
     restart: unless-stopped
     environment:
+      PYTHONUNBUFFERED: "1"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
       RABBITMQ_USER: ${RABBITMQ_USER}
@@ -80,6 +89,7 @@ services:
       RABBITMQ_QUEUE: scraping_queue_facebook
       RABBITMQ_RESULT_QUEUE: scrape_result_queue
       RABBITMQ_EXCHANGE: scrape.exchange
+    command: ["python", "-u", "worker.py"]
     depends_on:
       rabbitmq:
         condition: service_healthy

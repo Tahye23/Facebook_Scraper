@@ -1198,7 +1198,16 @@ def _extract_comments_dom(page) -> list:
 
 # ─── SCRAPING PAGE ─────────────────────────────────────────────────────────────
 
-def scrape_facebook_page(url: str, max_posts: int = None) -> dict:
+def _post_signature(post: dict) -> str:
+    post_id = str(post.get("post_id") or post.get("id") or "").strip()
+    if post_id:
+        return f"id:{post_id}"
+    post_url = str(post.get("post_url") or "").strip()
+    msg = str(post.get("message") or post.get("text") or "").strip()
+    return f"u:{post_url}|m:{msg[:120]}"
+
+
+def scrape_facebook_page(url: str, max_posts: int = None, on_post=None) -> dict:
     page = get_page()
     try:
         if not _warmup_session(page):
@@ -1225,10 +1234,75 @@ def scrape_facebook_page(url: str, max_posts: int = None) -> dict:
         if max_posts:
             scrolls = max(3, (max_posts // 3) + 2)
 
-        graphql_responses = _scroll_and_collect(
-            page, scrolls=scrolls, max_posts=max_posts, label="posts"
-        )
+        emitted = set()
+
+        def emit_new_posts_from_responses(responses):
+            if on_post is None:
+                return
+            parsed = _parse_graphql_responses_posts(responses)
+            for p in parsed:
+                sig = _post_signature(p)
+                if sig in emitted:
+                    continue
+                emitted.add(sig)
+                try:
+                    on_post(p)
+                except Exception as cb_err:
+                    print(f"[!] on_post callback error: {cb_err}")
+
+        graphql_responses = []
+        stopped = False
+
+        def handle_response(response):
+            if stopped:
+                return
+            if "graphql" in response.url or "api/graphql" in response.url:
+                try:
+                    body = response.text()
+                    if body and len(body) > 100:
+                        graphql_responses.append((response.url, body))
+                        print(f"[*] GraphQL posts: {len(body)} chars")
+                except Exception:
+                    pass
+
+        page.on("response", handle_response)
+
+        try:
+            for i in range(scrolls):
+                try:
+                    page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                    _human_delay(2.5, 3.5)
+                    print(f"[*] Scroll {i+1}/{scrolls}")
+
+                    # Emission progressive: publie les nouveaux posts détectés à chaque scroll.
+                    emit_new_posts_from_responses(graphql_responses)
+
+                    if max_posts and len(emitted) >= max_posts:
+                        print(f"[*] Limite {max_posts} posts atteinte, arrêt scroll")
+                        break
+                except Exception:
+                    time.sleep(2)
+        finally:
+            stopped = True
+            try:
+                page.remove_listener("response", handle_response)
+            except Exception:
+                pass
+            print(f"[*] Total GraphQL posts: {len(graphql_responses)}")
+
         posts = _parse_graphql_responses_posts(graphql_responses)
+
+        # Rattrapage final des éventuels posts non émis pendant le scroll.
+        if on_post is not None:
+            for p in posts:
+                sig = _post_signature(p)
+                if sig in emitted:
+                    continue
+                emitted.add(sig)
+                try:
+                    on_post(p)
+                except Exception as cb_err:
+                    print(f"[!] on_post callback error: {cb_err}")
 
         if not posts:
             print("[*] Aucun résultat GraphQL → fallback DOM")

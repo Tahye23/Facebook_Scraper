@@ -202,6 +202,109 @@
       ]
     },
     {
+      "name": "List Jobs DB - GET /scrape/jobs",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/scrape/jobs?platform=tiktok&status=SUCCESS&limit=20",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape",
+            "jobs"
+          ],
+          "query": [
+            {
+              "key": "platform",
+              "value": "tiktok",
+              "description": "facebook|tiktok"
+            },
+            {
+              "key": "status",
+              "value": "SUCCESS",
+              "description": "QUEUED|RUNNING|SUCCESS|FAILED"
+            },
+            {
+              "key": "limit",
+              "value": "20"
+            }
+          ]
+        },
+        "description": "Liste les jobs stockés en MongoDB avec filtres optionnels: platform, status, limit."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "const data = pm.response.json();",
+              "pm.test('Response has jobs array', function () {",
+              "    pm.expect(data.jobs).to.be.an('array');",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "List Results DB - GET /scrape/results",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/scrape/results?scrapeId={{scrape_id}}&platform=tiktok&limit=100",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape",
+            "results"
+          ],
+          "query": [
+            {
+              "key": "scrapeId",
+              "value": "{{scrape_id}}"
+            },
+            {
+              "key": "platform",
+              "value": "tiktok",
+              "description": "facebook|tiktok"
+            },
+            {
+              "key": "limit",
+              "value": "100"
+            }
+          ]
+        },
+        "description": "Liste les résultats stockés en MongoDB avec filtres optionnels: scrapeId, platform, limit."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "const data = pm.response.json();",
+              "pm.test('Response has results array', function () {",
+              "    pm.expect(data.results).to.be.an('array');",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
       "name": "Validation Error - POST /scrape (invalid platform)",
       "request": {
         "method": "POST",

@@ -96,27 +96,6 @@ services:
     networks:
       - scraper_net
 
-  # ─── Worker TikTok ─────────────────────────────────────────────────────────
-  worker-tiktok:
-    build:
-      context: "./platform/tiktok scraper"
-      dockerfile: Dockerfile
-    container_name: scraper_worker_tiktok
-    restart: unless-stopped
-    environment:
-      RABBITMQ_HOST: rabbitmq
-      RABBITMQ_PORT: 5672
-      RABBITMQ_USER: ${RABBITMQ_USER}
-      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
-      RABBITMQ_QUEUE: scraping_queue_tiktok
-      RABBITMQ_RESULT_QUEUE: scrape_result_queue
-      RABBITMQ_EXCHANGE: scrape.exchange
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
-    networks:
-      - scraper_net
-
 # ─── Volumes ───────────────────────────────────────────────────────────────
 volumes:
   mongodb_data:

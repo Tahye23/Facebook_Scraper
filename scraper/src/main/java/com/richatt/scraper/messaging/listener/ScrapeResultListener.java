@@ -53,7 +53,7 @@ public class ScrapeResultListener {
         }
 
         // Sauvegarder le résultat dans scrape_results
-        ScrapeResult result = ScrapeResult.builder()
+        ScrapeResult incoming = ScrapeResult.builder()
                 .scrapeId(scrapeId)
                 .platform(Platform.from(getString(message, "platform")))
                 .postId(getString(message, "postId", "post_id"))
@@ -68,7 +68,7 @@ public class ScrapeResultListener {
                 .scrapedAt(parseInstantOrNow(getString(message, "scrapedAt", "scraped_at")))
                 .build();
 
-        resultRepository.save(result);
+            ScrapeResult result = upsertResult(incoming);
         log.info("ScrapeResult sauvegardé : postId={}", result.getPostId());
 
         // Tant que des résultats arrivent, le job est en cours.
@@ -141,6 +141,55 @@ public class ScrapeResultListener {
                 .shares(toLong(map.get("shares")))
                 .views(toLong(map.get("views")))
                 .build();
+    }
+
+    private ScrapeResult upsertResult(ScrapeResult incoming) {
+        String postId = incoming.getPostId();
+        if (postId == null || postId.isBlank()) {
+            return resultRepository.save(incoming);
+        }
+
+        ScrapeResult existing = resultRepository
+                .findFirstByScrapeIdAndPostId(incoming.getScrapeId(), postId)
+                .orElse(null);
+
+        if (existing == null) {
+            return resultRepository.save(incoming);
+        }
+
+        existing.setPlatform(incoming.getPlatform());
+        existing.setAuthor(preferNonBlank(incoming.getAuthor(), existing.getAuthor()));
+        existing.setTextContent(preferNonBlank(incoming.getTextContent(), existing.getTextContent()));
+        existing.setSourceUrl(preferNonBlank(incoming.getSourceUrl(), existing.getSourceUrl()));
+        existing.setSourceMediaUrl(preferNonBlank(incoming.getSourceMediaUrl(), existing.getSourceMediaUrl()));
+        existing.setMediaPath(preferNonBlank(incoming.getMediaPath(), existing.getMediaPath()));
+        existing.setHashtags((incoming.getHashtags() == null || incoming.getHashtags().isEmpty())
+                ? existing.getHashtags()
+                : incoming.getHashtags());
+        existing.setPublishedAt(incoming.getPublishedAt() != null ? incoming.getPublishedAt() : existing.getPublishedAt());
+        existing.setScrapedAt(incoming.getScrapedAt() != null ? incoming.getScrapedAt() : existing.getScrapedAt());
+        existing.setMetrics(mergeMetrics(existing.getMetrics(), incoming.getMetrics()));
+
+        return resultRepository.save(existing);
+    }
+
+    private PostMetrics mergeMetrics(PostMetrics existing, PostMetrics incoming) {
+        if (incoming == null) {
+            return existing;
+        }
+        if (existing == null) {
+            return incoming;
+        }
+        return PostMetrics.builder()
+                .likes(incoming.getLikes() != null ? incoming.getLikes() : existing.getLikes())
+                .comments(incoming.getComments() != null ? incoming.getComments() : existing.getComments())
+                .shares(incoming.getShares() != null ? incoming.getShares() : existing.getShares())
+                .views(incoming.getViews() != null ? incoming.getViews() : existing.getViews())
+                .build();
+    }
+
+    private String preferNonBlank(String incoming, String fallback) {
+        return incoming != null && !incoming.isBlank() ? incoming : fallback;
     }
 
     private Long toLong(Object value) {

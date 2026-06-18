@@ -1,0 +1,11 @@
+# Sensitive session cookies (never commit)
+cookies.json
+fb_cookies.json
+platform/facebook scraper/fb_cookies.json
+platform/tiktok scraper/tiktok_cookies.json
+platform/tiktok scraper/tiktok_challenge.png
+platform/tiktok scraper/tiktok_challenge.html
+platform/tiktok scraper/tiktok_profile/
+platform/tiktok scraper/__pycache__/
+platform/tiktok scraper/*.pyc
+platform/tiktok scraper/video_reports/

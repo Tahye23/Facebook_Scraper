@@ -10,6 +10,7 @@ import com.richatt.scraper.model.ScrapeStatus;
 import com.richatt.scraper.repository.ScrapeJobRepository;
 import com.richatt.scraper.repository.ScrapeResultRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 
 import java.time.Instant;
@@ -71,5 +72,35 @@ public class ScrapeOrchestrationService {
 
     public List<ScrapeResult> getResultsByScrapeId(String scrapeId) {
         return resultRepository.findByScrapeId(scrapeId);
+    }
+
+    public List<ScrapeJob> listJobs(Platform platform, ScrapeStatus status, int limit) {
+        PageRequest page = PageRequest.of(0, limit);
+
+        if (platform != null && status != null) {
+            return jobRepository.findByPlatformAndStatusOrderByCreatedAtDesc(platform, status, page);
+        }
+        if (platform != null) {
+            return jobRepository.findByPlatformOrderByCreatedAtDesc(platform, page);
+        }
+        if (status != null) {
+            return jobRepository.findByStatusOrderByCreatedAtDesc(status, page);
+        }
+        return jobRepository.findAllByOrderByCreatedAtDesc(page);
+    }
+
+    public List<ScrapeResult> listResults(String scrapeId, Platform platform, int limit) {
+        PageRequest page = PageRequest.of(0, limit);
+
+        if (scrapeId != null && platform != null) {
+            return resultRepository.findByPlatformAndScrapeIdOrderByScrapedAtDesc(platform, scrapeId, page);
+        }
+        if (scrapeId != null) {
+            return resultRepository.findByScrapeIdOrderByScrapedAtDesc(scrapeId, page);
+        }
+        if (platform != null) {
+            return resultRepository.findByPlatformOrderByScrapedAtDesc(platform, page);
+        }
+        return resultRepository.findAllByOrderByScrapedAtDesc(page);
     }
 }

@@ -1,0 +1,368 @@
+{
+  "info": {
+    "_postman_id": "d71cfd52-4c3b-4ec5-9a8f-2d95f8b2c0b1",
+    "name": "TikTok Gateway + Rabbit Flow",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "Collection TikTok uniquement: creation job, progression en stream (cursor/long-poll), et verification DB via gateway."
+  },
+  "item": [
+    {
+      "name": "Health - GET /actuator/health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/actuator/health",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "actuator",
+            "health"
+          ]
+        },
+        "description": "Verifie que la gateway est UP."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create Job TikTok - POST /scrape",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"url\": \"https://www.tiktok.com/@kingmauritan\",\n  \"platform\": \"tiktok\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/scrape",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape"
+          ]
+        },
+        "description": "Cree un job TikTok et memorise scrape_id."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 202', function () {",
+              "    pm.response.to.have.status(202);",
+              "});",
+              "const data = pm.response.json();",
+              "pm.test('Response contains scrape_id', function () {",
+              "    pm.expect(data.scrape_id).to.exist;",
+              "});",
+              "if (data.scrape_id) {",
+              "    pm.collectionVariables.set('scrape_id', data.scrape_id);",
+              "    pm.collectionVariables.set('result_cursor', '');",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Get Job Status - GET /scrape/{scrapeId}",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/scrape/{{scrape_id}}",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape",
+            "{{scrape_id}}"
+          ]
+        },
+        "description": "Recupere le statut du job (QUEUED/RUNNING/SUCCESS/FAILED)."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Stream Results (cursor + long-poll) - GET /scrape/{scrapeId}/results/stream",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/scrape/{{scrape_id}}/results/stream?cursor={{result_cursor}}&limit=5&waitMs=15000",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape",
+            "{{scrape_id}}",
+            "results",
+            "stream"
+          ],
+          "query": [
+            {
+              "key": "cursor",
+              "value": "{{result_cursor}}",
+              "description": "Cursor retourne par l'appel precedent (vide au premier appel)"
+            },
+            {
+              "key": "limit",
+              "value": "5"
+            },
+            {
+              "key": "waitMs",
+              "value": "15000",
+              "description": "Long-poll en ms (0..30000)"
+            }
+          ]
+        },
+        "description": "Retourne uniquement les nouveaux resultats apres cursor. Met a jour result_cursor automatiquement."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "const data = pm.response.json();",
+              "pm.test('Response has results array', function () {",
+              "    pm.expect(data.results).to.be.an('array');",
+              "});",
+              "if (data.next_cursor !== undefined) {",
+              "    pm.collectionVariables.set('result_cursor', data.next_cursor || '');",
+              "}",
+              "if (data.done === true) {",
+              "    console.log('Job finished with status:', data.status);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Get Full Results - GET /scrape/{scrapeId}/results",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/scrape/{{scrape_id}}/results",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape",
+            "{{scrape_id}}",
+            "results"
+          ]
+        },
+        "description": "Recupere tous les resultats du scrape_id en base (snapshot complet)."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "const data = pm.response.json();",
+              "pm.test('Response has results array', function () {",
+              "    pm.expect(data.results).to.be.an('array');",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "List TikTok Jobs DB - GET /scrape/jobs",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/scrape/jobs?platform=tiktok&limit=20",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape",
+            "jobs"
+          ],
+          "query": [
+            {
+              "key": "platform",
+              "value": "tiktok",
+              "description": "facebook|tiktok"
+            },
+            {
+              "key": "limit",
+              "value": "20"
+            }
+          ]
+        },
+        "description": "Liste les jobs TikTok presents en MongoDB."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "const data = pm.response.json();",
+              "pm.test('Response has jobs array', function () {",
+              "    pm.expect(data.jobs).to.be.an('array');",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "List TikTok Results DB - GET /scrape/results",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/scrape/results?scrapeId={{scrape_id}}&platform=tiktok&limit=100",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape",
+            "results"
+          ],
+          "query": [
+            {
+              "key": "scrapeId",
+              "value": "{{scrape_id}}"
+            },
+            {
+              "key": "platform",
+              "value": "tiktok",
+              "description": "facebook|tiktok"
+            },
+            {
+              "key": "limit",
+              "value": "100"
+            }
+          ]
+        },
+        "description": "Liste les resultats TikTok stockes en DB."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "const data = pm.response.json();",
+              "pm.test('Response has results array', function () {",
+              "    pm.expect(data.results).to.be.an('array');",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Validation Error - POST /scrape (invalid platform)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"url\": \"https://example.com\",\n  \"platform\": \"instagram\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/scrape",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape"
+          ]
+        },
+        "description": "Teste l'erreur metier pour plateforme non supportee."
+      }
+    },
+    {
+      "name": "Not Found - GET /scrape/{scrapeId}",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/scrape/not-existing-id",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape",
+            "not-existing-id"
+          ]
+        },
+        "description": "Teste le 404 quand scrape_id n'existe pas."
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "scrape_id",
+      "value": ""
+    },
+    {
+      "key": "result_cursor",
+      "value": ""
+    }
+  ]
+}

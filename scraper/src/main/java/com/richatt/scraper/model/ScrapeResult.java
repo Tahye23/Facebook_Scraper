@@ -10,6 +10,7 @@ import org.springframework.data.mongodb.core.mapping.Document;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 
 @Data
 @Builder
@@ -35,6 +36,7 @@ public class ScrapeResult {
     private String sourceUrl;
     private String sourceMediaUrl;
     private String mediaPath;
+    private Map<String, Object> videoReport;
     private Instant publishedAt;
     private Instant scrapedAt;
 }

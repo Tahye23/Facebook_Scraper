@@ -1,0 +1,138 @@
+{
+  "info": {
+    "_postman_id": "5df41a33-5dfb-4c84-98e5-0bdccf2f7f84",
+    "name": "TikTok Local Scraper API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "Collection pour tester les endpoints locaux TikTok (scrape + analyse video Whisper)."
+  },
+  "item": [
+    {
+      "name": "Health - GET /health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/health",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "health"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Scrape Page - POST /scrape/page",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"url\": \"https://www.tiktok.com/@kingmauritan\",\n  \"max_posts\": 5,\n  \"headless\": false\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/scrape/page",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape",
+            "page"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "const data = pm.response.json();",
+              "pm.test('Response contains posts array', function () {",
+              "    pm.expect(data.posts).to.be.an('array');",
+              "});",
+              "if (Array.isArray(data.posts) && data.posts.length > 0 && data.posts[0].post_url) {",
+              "    pm.collectionVariables.set('video_url', data.posts[0].post_url);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Analyze Video - POST /analyze/video",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"video_url\": \"{{video_url}}\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/analyze/video",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "analyze",
+            "video"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "const data = pm.response.json();",
+              "pm.test('Response contains executive_summary', function () {",
+              "    pm.expect(data.executive_summary).to.be.an('array');",
+              "});"
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:5001"
+    },
+    {
+      "key": "video_url",
+      "value": "https://www.tiktok.com/@kingmauritan/video/7639407173100997895"
+    }
+  ]
+}

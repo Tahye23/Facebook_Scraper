@@ -13,5 +13,6 @@ public class ScrapeTaskMessage {
     private String scrapeId;
     private String url;
     private String platform;
+    private Integer maxPosts;
     private String requestedAt;
 }

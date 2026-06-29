@@ -8,6 +8,7 @@ from urllib.parse import unquote, urlparse, urlsplit, urlunsplit
 
 import requests
 from playwright.sync_api import sync_playwright
+from video_analysis import analyze_tiktok_video, build_small_video_report
 
 
 COOKIES_FILE = "tiktok_cookies.json"
@@ -375,6 +376,78 @@ def _merge_post_data(base: dict, extra: dict) -> dict:
     return merged
 
 
+def _attach_video_analysis(posts: list[dict], on_post=None) -> list[dict]:
+    if not posts:
+        return posts
+
+    enabled = _env_bool("TIKTOK_ANALYZE_VIDEO_CONTENT", False)
+    if not enabled:
+        if on_post is not None:
+            for post in posts:
+                try:
+                    on_post(dict(post))
+                except Exception as cb_err:
+                    print(f"[!] on_post callback error: {cb_err}")
+        return posts
+
+    raw_limit = (os.getenv("TIKTOK_ANALYZE_VIDEO_LIMIT") or "2").strip()
+    try:
+        limit = int(raw_limit)
+    except ValueError:
+        limit = 2
+
+    # 0 disables analysis; negative values mean unlimited (analyze all posts).
+    if limit == 0:
+        return posts
+
+    output_dir = os.getenv("VIDEO_ANALYSIS_OUTPUT_DIR") or "video_reports"
+    updated = []
+
+    for idx, post in enumerate(posts):
+        post_copy = dict(post)
+        post_url = str(post_copy.get("post_url") or "").strip()
+
+        if (limit > 0 and idx >= limit) or not post_url or "/video/" not in post_url:
+            updated.append(post_copy)
+            if on_post is not None:
+                try:
+                    on_post(dict(post_copy))
+                except Exception as cb_err:
+                    print(f"[!] on_post callback error: {cb_err}")
+            continue
+
+        try:
+            report = analyze_tiktok_video(video_url=post_url, output_dir=output_dir)
+            post_copy["source_media_url"] = report.get("video_metadata", {}).get("media_url")
+            post_copy["media_path"] = report.get("artifacts", {}).get("video_path")
+            post_copy["video_report"] = build_small_video_report(report)
+            post_copy["message"] = post_copy.get("message") or report.get("transcript_excerpt") or ""
+            print(f"[*] Video analysis done for post={post_copy.get('post_id')}")
+        except Exception as exc:
+            post_copy["video_report"] = {
+                "executive_summary": ["Analyse video indisponible."],
+                "transcript_excerpt": "",
+                "themes": [],
+                "visual_elements_detected": [],
+                "keywords": [],
+                "confidence_and_limits": {
+                    "score": 0.0,
+                    "level": "low",
+                    "limits": [f"video_analysis_error: {exc}"],
+                },
+            }
+            print(f"[!] Video analysis failed for {post_url}: {exc}")
+
+        updated.append(post_copy)
+        if on_post is not None:
+            try:
+                on_post(dict(post_copy))
+            except Exception as cb_err:
+                print(f"[!] on_post callback error: {cb_err}")
+
+    return updated
+
+
 def _extract_video_detail_from_page(page) -> dict:
     return page.evaluate(
         r"""
@@ -617,11 +690,6 @@ def _scrape_with_browser(playwright, profile_url: str, max_posts: int, on_post, 
                     continue
                 seen.add(sig)
                 all_posts.append(card)
-                if on_post is not None:
-                    try:
-                        on_post(card)
-                    except Exception as cb_err:
-                        print(f"[!] on_post callback error: {cb_err}")
                 if len(all_posts) >= max_posts:
                     break
 
@@ -642,7 +710,8 @@ def _scrape_with_browser(playwright, profile_url: str, max_posts: int, on_post, 
             return {"posts": [], "total": 0, "error": "no_posts_found", "url": profile_url}
 
         enriched_posts = _enrich_posts_from_video_pages(context, all_posts)
-        return {"posts": enriched_posts, "total": len(enriched_posts), "url": profile_url}
+        analyzed_posts = _attach_video_analysis(enriched_posts, on_post=on_post)
+        return {"posts": analyzed_posts, "total": len(analyzed_posts), "url": profile_url}
     except Exception as e:
         return {"posts": [], "error": str(e), "url": profile_url}
     finally:

@@ -49,7 +49,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"url\": \"https://www.facebook.com/some-page-or-post\",\n  \"platform\": \"facebook\"\n}"
+          "raw": "{\n  \"url\": \"https://www.facebook.com/some-page-or-post\",\n  \"platform\": \"facebook\",\n  \"max_posts\": 5\n}"
         },
         "url": {
           "raw": "{{base_url}}/scrape",
@@ -79,6 +79,9 @@
               "",
               "if (data.scrape_id) {",
               "    pm.collectionVariables.set('scrape_id', data.scrape_id);",
+              "    pm.collectionVariables.set('result_cursor', '');",
+              "    pm.collectionVariables.set('scrape_id_facebook', data.scrape_id);",
+              "    pm.collectionVariables.set('result_cursor_facebook', '');",
               "}"
             ]
           }
@@ -97,7 +100,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"url\": \"https://www.tiktok.com/@someuser\",\n  \"platform\": \"tiktok\"\n}"
+          "raw": "{\n  \"url\": \"https://www.tiktok.com/@someuser\",\n  \"platform\": \"tiktok\",\n  \"max_posts\": 5\n}"
         },
         "url": {
           "raw": "{{base_url}}/scrape",
@@ -127,11 +130,50 @@
               "",
               "if (data.scrape_id) {",
               "    pm.collectionVariables.set('scrape_id', data.scrape_id);",
+              "    pm.collectionVariables.set('result_cursor', '');",
+              "    pm.collectionVariables.set('scrape_id_tiktok', data.scrape_id);",
+              "    pm.collectionVariables.set('result_cursor_tiktok', '');",
               "}"
             ]
           }
         }
       ]
+    },
+    {
+      "name": "Get Facebook Status - GET /scrape/{scrapeId}",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/scrape/{{scrape_id_facebook}}",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape",
+            "{{scrape_id_facebook}}"
+          ]
+        },
+        "description": "Statut du job Facebook."
+      }
+    },
+    {
+      "name": "Get TikTok Status - GET /scrape/{scrapeId}",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/scrape/{{scrape_id_tiktok}}",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape",
+            "{{scrape_id_tiktok}}"
+          ]
+        },
+        "description": "Statut du job TikTok."
+      }
     },
     {
       "name": "Get Job Status - GET /scrape/{scrapeId}",
@@ -196,6 +238,158 @@
               "pm.test('Response has results array', function () {",
               "    pm.expect(data.results).to.be.an('array');",
               "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Stream Facebook Results - GET /scrape/{scrapeId}/results/stream",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/scrape/{{scrape_id_facebook}}/results/stream?cursor={{result_cursor_facebook}}&limit=5&waitMs=15000",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape",
+            "{{scrape_id_facebook}}",
+            "results",
+            "stream"
+          ],
+          "query": [
+            {
+              "key": "cursor",
+              "value": "{{result_cursor_facebook}}"
+            },
+            {
+              "key": "limit",
+              "value": "5"
+            },
+            {
+              "key": "waitMs",
+              "value": "15000"
+            }
+          ]
+        },
+        "description": "Nouveaux résultats Facebook en mode progressif (RabbitMQ -> DB)."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const data = pm.response.json();",
+              "if (data.next_cursor !== undefined) {",
+              "    pm.collectionVariables.set('result_cursor_facebook', data.next_cursor || '');",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Stream TikTok Results - GET /scrape/{scrapeId}/results/stream",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/scrape/{{scrape_id_tiktok}}/results/stream?cursor={{result_cursor_tiktok}}&limit=5&waitMs=15000",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape",
+            "{{scrape_id_tiktok}}",
+            "results",
+            "stream"
+          ],
+          "query": [
+            {
+              "key": "cursor",
+              "value": "{{result_cursor_tiktok}}"
+            },
+            {
+              "key": "limit",
+              "value": "5"
+            },
+            {
+              "key": "waitMs",
+              "value": "15000"
+            }
+          ]
+        },
+        "description": "Nouveaux résultats TikTok en mode progressif (RabbitMQ -> DB)."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const data = pm.response.json();",
+              "if (data.next_cursor !== undefined) {",
+              "    pm.collectionVariables.set('result_cursor_tiktok', data.next_cursor || '');",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Stream Results (cursor + long-poll) - GET /scrape/{scrapeId}/results/stream",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/scrape/{{scrape_id}}/results/stream?cursor={{result_cursor}}&limit=5&waitMs=15000",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape",
+            "{{scrape_id}}",
+            "results",
+            "stream"
+          ],
+          "query": [
+            {
+              "key": "cursor",
+              "value": "{{result_cursor}}",
+              "description": "Cursor returned by previous stream call (empty for first call)"
+            },
+            {
+              "key": "limit",
+              "value": "5"
+            },
+            {
+              "key": "waitMs",
+              "value": "15000",
+              "description": "Long-poll wait time in ms (0..30000)"
+            }
+          ]
+        },
+        "description": "Requête générique de stream basée sur scrape_id/result_cursor. Dans cette collection mixte, préfère Stream Facebook Results ou Stream TikTok Results pour éviter toute confusion de variables."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "const data = pm.response.json();",
+              "pm.test('Response has results array', function () {",
+              "    pm.expect(data.results).to.be.an('array');",
+              "});",
+              "if (data.next_cursor !== undefined) {",
+              "    pm.collectionVariables.set('result_cursor', data.next_cursor || '');",
+              "}"
             ]
           }
         }
@@ -356,6 +550,26 @@
     },
     {
       "key": "scrape_id",
+      "value": ""
+    },
+    {
+      "key": "result_cursor",
+      "value": ""
+    },
+    {
+      "key": "scrape_id_facebook",
+      "value": ""
+    },
+    {
+      "key": "scrape_id_tiktok",
+      "value": ""
+    },
+    {
+      "key": "result_cursor_facebook",
+      "value": ""
+    },
+    {
+      "key": "result_cursor_tiktok",
       "value": ""
     }
   ]

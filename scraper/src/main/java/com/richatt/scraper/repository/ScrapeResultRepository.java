@@ -11,6 +11,10 @@ import java.util.Optional;
 public interface ScrapeResultRepository extends MongoRepository<ScrapeResult, String> {
     List<ScrapeResult> findByScrapeId(String scrapeId);
 
+    List<ScrapeResult> findByScrapeIdOrderByIdAsc(String scrapeId, Pageable pageable);
+
+    List<ScrapeResult> findByScrapeIdAndIdGreaterThanOrderByIdAsc(String scrapeId, String id, Pageable pageable);
+
     Optional<ScrapeResult> findFirstByScrapeIdAndPostId(String scrapeId, String postId);
 
     List<ScrapeResult> findByScrapeIdOrderByScrapedAtDesc(String scrapeId, Pageable pageable);

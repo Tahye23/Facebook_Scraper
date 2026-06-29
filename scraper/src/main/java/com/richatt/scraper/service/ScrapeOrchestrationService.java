@@ -36,6 +36,7 @@ public class ScrapeOrchestrationService {
 
         Instant now = Instant.now();
         String scrapeId = UUID.randomUUID().toString();
+        int maxPosts = request.maxPosts() != null ? request.maxPosts() : 20;
 
         ScrapeJob job = ScrapeJob.builder()
                 .scrapeId(scrapeId)
@@ -53,6 +54,7 @@ public class ScrapeOrchestrationService {
                     .scrapeId(scrapeId)
                     .url(request.url())
                     .platform(platform.name().toLowerCase())
+                    .maxPosts(maxPosts)
                     .requestedAt(now.toString())
                     .build());
         } catch (RuntimeException ex) {
@@ -72,6 +74,14 @@ public class ScrapeOrchestrationService {
 
     public List<ScrapeResult> getResultsByScrapeId(String scrapeId) {
         return resultRepository.findByScrapeId(scrapeId);
+    }
+
+    public List<ScrapeResult> getResultsAfterCursor(String scrapeId, String cursor, int limitPlusOne) {
+        PageRequest page = PageRequest.of(0, limitPlusOne);
+        if (cursor == null || cursor.isBlank()) {
+            return resultRepository.findByScrapeIdOrderByIdAsc(scrapeId, page);
+        }
+        return resultRepository.findByScrapeIdAndIdGreaterThanOrderByIdAsc(scrapeId, cursor, page);
     }
 
     public List<ScrapeJob> listJobs(Platform platform, ScrapeStatus status, int limit) {

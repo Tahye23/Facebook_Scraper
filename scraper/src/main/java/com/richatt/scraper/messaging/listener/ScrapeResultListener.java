@@ -63,12 +63,13 @@ public class ScrapeResultListener {
                 .metrics(getMetrics(message.get("metrics")))
                 .sourceUrl(getString(message, "sourceUrl", "source_url"))
                 .sourceMediaUrl(getString(message, "sourceMediaUrl", "source_media_url"))
-                .mediaPath(null)
+                .mediaPath(getString(message, "mediaPath", "media_path"))
+                .videoReport(getObjectMap(message, "videoReport", "video_report"))
                 .publishedAt(parseInstant(getString(message, "publishedAt", "published_at")))
                 .scrapedAt(parseInstantOrNow(getString(message, "scrapedAt", "scraped_at")))
                 .build();
 
-            ScrapeResult result = upsertResult(incoming);
+        ScrapeResult result = upsertResult(incoming);
         log.info("ScrapeResult sauvegardé : postId={}", result.getPostId());
 
         // Tant que des résultats arrivent, le job est en cours.
@@ -163,6 +164,7 @@ public class ScrapeResultListener {
         existing.setSourceUrl(preferNonBlank(incoming.getSourceUrl(), existing.getSourceUrl()));
         existing.setSourceMediaUrl(preferNonBlank(incoming.getSourceMediaUrl(), existing.getSourceMediaUrl()));
         existing.setMediaPath(preferNonBlank(incoming.getMediaPath(), existing.getMediaPath()));
+        existing.setVideoReport(mergeObjectMaps(existing.getVideoReport(), incoming.getVideoReport()));
         existing.setHashtags((incoming.getHashtags() == null || incoming.getHashtags().isEmpty())
                 ? existing.getHashtags()
                 : incoming.getHashtags());
@@ -190,6 +192,44 @@ public class ScrapeResultListener {
 
     private String preferNonBlank(String incoming, String fallback) {
         return incoming != null && !incoming.isBlank() ? incoming : fallback;
+    }
+
+    private Map<String, Object> getObjectMap(Map<String, Object> message, String... keys) {
+        for (String key : keys) {
+            Object value = message.get(key);
+            if (value instanceof Map<?, ?> raw) {
+                Map<String, Object> result = new java.util.HashMap<>();
+                for (Map.Entry<?, ?> entry : raw.entrySet()) {
+                    if (entry.getKey() != null) {
+                        result.put(String.valueOf(entry.getKey()), entry.getValue());
+                    }
+                }
+                return result;
+            }
+        }
+        return null;
+    }
+
+    private Map<String, Object> mergeObjectMaps(Map<String, Object> existing, Map<String, Object> incoming) {
+        if (incoming == null || incoming.isEmpty()) {
+            return existing;
+        }
+        if (existing == null || existing.isEmpty()) {
+            return incoming;
+        }
+        Map<String, Object> merged = new java.util.HashMap<>(existing);
+        for (Map.Entry<String, Object> entry : incoming.entrySet()) {
+            String key = entry.getKey();
+            Object incomingValue = entry.getValue();
+            if (incomingValue == null) {
+                continue;
+            }
+            if (incomingValue instanceof String incomingText && incomingText.isBlank()) {
+                continue;
+            }
+            merged.put(key, incomingValue);
+        }
+        return merged;
     }
 
     private Long toLong(Object value) {

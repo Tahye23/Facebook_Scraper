@@ -72,8 +72,9 @@ def normalize_post(scrape_id: str, url: str, post: dict) -> dict:
             "views": _safe_int(post.get("views")),
         },
         "sourceUrl": post.get("post_url") or url,
-        "sourceMediaUrl": None,
-        "mediaPath": None,
+        "sourceMediaUrl": post.get("source_media_url"),
+        "mediaPath": post.get("media_path"),
+        "videoReport": post.get("video_report"),
         "publishedAt": post.get("published_at"),
         "scrapedAt": post.get("scraped_at") or datetime.now(tz=timezone.utc).isoformat(),
         "success": True,
@@ -140,7 +141,15 @@ def on_message(channel, method, properties, body):
         task = json.loads(body)
         scrape_id = task.get("scrape_id") or task.get("scrapeId", "unknown")
         url = task.get("url", "")
-        print(f"[<-] TikTok task: scrape_id={scrape_id} url={url}")
+        raw_max_posts = task.get("max_posts", task.get("maxPosts", 20))
+        try:
+            max_posts = int(raw_max_posts)
+        except (TypeError, ValueError):
+            max_posts = 20
+        if max_posts <= 0:
+            max_posts = 20
+
+        print(f"[<-] TikTok task: scrape_id={scrape_id} url={url} max_posts={max_posts}")
 
         if not url:
             publish_error(channel, scrape_id, "URL missing in message")
@@ -156,7 +165,7 @@ def on_message(channel, method, properties, body):
 
         def run_scrape():
             try:
-                worker_result["value"] = scrape_tiktok_page(url=url, on_post=on_post)
+                worker_result["value"] = scrape_tiktok_page(url=url, max_posts=max_posts, on_post=on_post)
             except Exception as exc:
                 worker_result["error"] = exc
             finally:
@@ -197,8 +206,9 @@ def on_message(channel, method, properties, body):
 
         for post in posts:
             sig = _post_signature(post)
-            # Publish final payload even for already-seen signatures so enriched metrics
-            # can update previously emitted progressive records.
+            if sig in published_sigs:
+                continue
+            published_sigs.add(sig)
             publish_result(channel, normalize_post(scrape_id, url, post))
             published_count += 1
 

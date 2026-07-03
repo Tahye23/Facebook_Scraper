@@ -16,6 +16,7 @@ Flux d'execution:
 import json
 import os
 import queue
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -24,8 +25,16 @@ from html import escape
 
 import pika
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from logging_setup import get_logger, with_context
 from scraper import scrape_tiktok_page
 from video_analysis import build_session_json_report
+
+
+LOGGER = get_logger(__name__, platform="tiktok", service="worker")
 
 
 def _load_env_file():
@@ -249,6 +258,10 @@ def _post_signature(post: dict) -> str:
 
 def publish_result(channel, result: dict):
     """Publie un evenement resultat (post TikTok normalise) vers RabbitMQ."""
+    LOGGER.debug(
+        "Publishing post result",
+        extra={"scrape_id": result.get("scrapeId"), "post_id": result.get("postId")},
+    )
     channel.basic_publish(
         exchange=EXCHANGE,
         routing_key=ROUTING_RESULT,
@@ -259,6 +272,7 @@ def publish_result(channel, result: dict):
 
 def publish_error(channel, scrape_id: str, error_msg: str):
     """Publie un evenement de cycle de vie ERROR pour un job de scraping."""
+    scoped_logger = with_context(LOGGER, scrape_id=scrape_id)
     payload = {
         "scrapeId": scrape_id,
         "platform": "tiktok",
@@ -266,6 +280,7 @@ def publish_error(channel, scrape_id: str, error_msg: str):
         "success": False,
         "errorMessage": error_msg,
     }
+    scoped_logger.error("Publishing ERROR event", extra={"url": None})
     channel.basic_publish(
         exchange=EXCHANGE,
         routing_key=ROUTING_RESULT,
@@ -276,6 +291,7 @@ def publish_error(channel, scrape_id: str, error_msg: str):
 
 def publish_completion(channel, scrape_id: str):
     """Publie un evenement de cycle de vie COMPLETED minimal pour un job."""
+    scoped_logger = with_context(LOGGER, scrape_id=scrape_id)
     payload = {
         "scrapeId": scrape_id,
         "platform": "tiktok",
@@ -283,6 +299,7 @@ def publish_completion(channel, scrape_id: str):
         "success": True,
         "errorMessage": None,
     }
+    scoped_logger.info("Publishing COMPLETED event")
     channel.basic_publish(
         exchange=EXCHANGE,
         routing_key=ROUTING_RESULT,
@@ -306,6 +323,7 @@ def on_message(channel, method, properties, body):
         task = json.loads(body)
         scrape_id = task.get("scrape_id") or task.get("scrapeId", "unknown")
         url = task.get("url", "")
+        scoped_logger = with_context(LOGGER, scrape_id=scrape_id, url=url)
         raw_max_posts = task.get("max_posts", task.get("maxPosts", 20))
         try:
             max_posts = int(raw_max_posts)
@@ -315,9 +333,12 @@ def on_message(channel, method, properties, body):
             max_posts = 20
 
         if not url:
+            scoped_logger.error("Invalid task payload: URL missing")
             publish_error(channel, scrape_id, "URL missing in message")
             channel.basic_ack(delivery_tag=method.delivery_tag)
             return
+
+        scoped_logger.info("Task received", extra={"post_id": None})
 
         post_queue = queue.Queue()
         done_event = threading.Event()
@@ -328,8 +349,10 @@ def on_message(channel, method, properties, body):
 
         def run_scrape():
             try:
+                scoped_logger.info("Starting scrape thread")
                 worker_result["value"] = scrape_tiktok_page(url=url, max_posts=max_posts, on_post=on_post)
             except Exception as exc:
+                scoped_logger.exception("Scrape thread failed")
                 worker_result["error"] = exc
             finally:
                 done_event.set()
@@ -357,12 +380,14 @@ def on_message(channel, method, properties, body):
 
         result = worker_result["value"] or {}
         if result.get("error"):
+            scoped_logger.error("Scraper returned error", extra={"post_id": None})
             publish_error(channel, scrape_id, result["error"])
             channel.basic_ack(delivery_tag=method.delivery_tag)
             return
 
         posts = result.get("posts", [])
         if not posts:
+            scoped_logger.warning("No posts found for task")
             publish_error(channel, scrape_id, "No TikTok posts found")
             channel.basic_ack(delivery_tag=method.delivery_tag)
             return
@@ -387,7 +412,7 @@ def on_message(channel, method, properties, body):
             session_html_path = _build_session_html_report(page_url=url, posts=raw_posts, output_dir=output_dir)
             session_pdf_path = _build_session_pdf_report(posts=raw_posts, output_dir=output_dir)
         except Exception:
-            pass
+            scoped_logger.exception("Failed to generate session reports")
 
         completion_payload = {
             "scrapeId": scrape_id,
@@ -408,9 +433,11 @@ def on_message(channel, method, properties, body):
             body=json.dumps(completion_payload, ensure_ascii=False),
             properties=pika.BasicProperties(content_type="application/json", delivery_mode=2),
         )
+        scoped_logger.info("Task completed", extra={"post_id": None})
         channel.basic_ack(delivery_tag=method.delivery_tag)
 
     except Exception as exc:
+        with_context(LOGGER, scrape_id=scrape_id).exception("Task failed")
         publish_error(channel, scrape_id, str(exc))
         channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
@@ -437,8 +464,10 @@ def connect_with_retry(retries=10, delay=5) -> pika.BlockingConnection:
     for attempt in range(1, retries + 1):
         try:
             conn = pika.BlockingConnection(params)
+            LOGGER.info("Connected to RabbitMQ")
             return conn
         except Exception:
+            LOGGER.warning("RabbitMQ connection failed", extra={"post_id": None, "url": None})
             if attempt < retries:
                 time.sleep(delay)
 
@@ -453,6 +482,8 @@ def main():
     """
     connection = connect_with_retry()
     channel = connection.channel()
+
+    LOGGER.info("Starting TikTok worker consumer")
 
     channel.exchange_declare(exchange=EXCHANGE, exchange_type="direct", durable=True)
     channel.queue_declare(
@@ -473,13 +504,13 @@ def main():
     try:
         channel.start_consuming()
     except KeyboardInterrupt:
-        pass
+        LOGGER.info("Worker interrupted by user")
     finally:
         try:
             channel.stop_consuming()
             connection.close()
         except Exception:
-            pass
+            LOGGER.exception("Error while shutting down worker")
 
 
 if __name__ == "__main__":

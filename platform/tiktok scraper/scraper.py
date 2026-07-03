@@ -2,16 +2,25 @@ import json
 import os
 import random
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from urllib.parse import unquote, urlparse, urlsplit, urlunsplit
 
 import requests
 from playwright.sync_api import sync_playwright
+from pathlib import Path
 from video_analysis import analyze_tiktok_video, build_small_video_report
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from logging_setup import get_logger, with_context
 
 
 COOKIES_FILE = "tiktok_cookies.json"
+LOGGER = get_logger(__name__, platform="tiktok", service="scraper")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -41,7 +50,7 @@ def load_cookies() -> list:
         with open(COOKIES_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
     except Exception as e:
-        print(f"[!] Failed to read cookies file: {e}")
+        LOGGER.warning("Failed to read cookies file", exc_info=True)
         return []
 
     if not isinstance(raw, list):
@@ -76,8 +85,7 @@ def load_cookies() -> list:
             try:
                 cookie["expires"] = int(float(expires))
             except (TypeError, ValueError):
-                print(f"[!] Invalid cookie expires value ignored: {expires}")
-                pass
+                LOGGER.debug("Invalid cookie expires value ignored", extra={"post_id": None})
 
         cookies.append(cookie)
 
@@ -257,16 +265,14 @@ def _save_challenge_artifacts(page):
     try:
         page.screenshot(path="tiktok_challenge.png", full_page=True)
     except Exception as exc:
-        print(f"[!] Failed to save challenge screenshot: {exc}")
-        pass
+        LOGGER.warning("Failed to save challenge screenshot", exc_info=True)
 
     try:
         html = page.content()
         with open("tiktok_challenge.html", "w", encoding="utf-8") as f:
             f.write(html)
     except Exception as exc:
-        print(f"[!] Failed to save challenge HTML: {exc}")
-        pass
+        LOGGER.warning("Failed to save challenge HTML", exc_info=True)
 
     try:
         current_url = page.url
@@ -365,8 +371,7 @@ def _extract_posts_from_html_fallback(profile_url: str) -> list:
             if posts:
                 return posts
         except Exception as exc:
-            print(f"[!] Failed to parse rehydration payload: {exc}")
-            pass
+            LOGGER.warning("Failed to parse rehydration payload", exc_info=True)
 
     sigi_match = re.search(
         r'<script[^>]+id="SIGI_STATE"[^>]*>(.*?)</script>',
@@ -381,8 +386,7 @@ def _extract_posts_from_html_fallback(profile_url: str) -> list:
             if posts:
                 return posts
         except Exception as exc:
-            print(f"[!] Failed to parse SIGI_STATE payload: {exc}")
-            pass
+            LOGGER.warning("Failed to parse SIGI_STATE payload", exc_info=True)
 
     return []
 
@@ -461,8 +465,7 @@ def _attach_video_analysis(posts: list[dict], on_post=None) -> list[dict]:
                 try:
                     on_post(dict(post))
                 except Exception as cb_err:
-                    print(f"[!] on_post callback error: {cb_err}")
-                    pass
+                    LOGGER.warning("on_post callback error", exc_info=True)
         return posts
 
     raw_limit = (os.getenv("TIKTOK_ANALYZE_VIDEO_LIMIT") or "2").strip()
@@ -488,8 +491,7 @@ def _attach_video_analysis(posts: list[dict], on_post=None) -> list[dict]:
                 try:
                     on_post(dict(post_copy))
                 except Exception as cb_err:
-                    print(f"[!] on_post callback error: {cb_err}")
-                    pass
+                    LOGGER.warning("on_post callback error", exc_info=True)
             continue
 
         try:
@@ -517,8 +519,7 @@ def _attach_video_analysis(posts: list[dict], on_post=None) -> list[dict]:
             try:
                 on_post(dict(post_copy))
             except Exception as cb_err:
-                print(f"[!] on_post callback error: {cb_err}")
-                pass
+                LOGGER.warning("on_post callback error", exc_info=True)
 
     return updated
 
@@ -643,8 +644,7 @@ def _enrich_posts_from_video_pages(context, posts: list[dict]) -> list[dict]:
                 try:
                     detail_page.close()
                 except Exception as exc:
-                    print(f"[!] Failed to close detail page: {exc}")
-                    pass
+                    LOGGER.warning("Failed to close detail page", exc_info=True)
 
     return enriched
 
@@ -680,7 +680,7 @@ def _scrape_with_browser(playwright, profile_url: str, max_posts: int, on_post, 
 
     # Log informatif si un proxy est actif pour cette tentative.
     if proxy_cfg:
-        pass
+        LOGGER.info("Using proxy candidate", extra={"url": _describe_proxy(proxy_cfg)})
 
     # Deux modes de contexte:
     # - persistent_context: reutilise un profil navigateur reel
@@ -720,8 +720,6 @@ def _scrape_with_browser(playwright, profile_url: str, max_posts: int, on_post, 
     )
     if _should_apply_stealth(user_data_dir):
         _install_stealth_scripts(context)
-    else:
-        pass
 
     # Injection de cookies si contexte non persistant, ou si forçage explicite.
     force_cookie_injection = _env_bool("TIKTOK_FORCE_COOKIE_INJECTION", False)
@@ -731,10 +729,7 @@ def _scrape_with_browser(playwright, profile_url: str, max_posts: int, on_post, 
             try:
                 context.add_cookies(cookies)
             except Exception as e:
-                print(f"[!] Failed to inject cookies: {e}")
-                pass
-    else:
-        pass
+                LOGGER.warning("Failed to inject cookies", exc_info=True)
 
     page = context.new_page()
 
@@ -761,7 +756,7 @@ def _scrape_with_browser(playwright, profile_url: str, max_posts: int, on_post, 
                 if parsed:
                     network_posts.extend(parsed)
             except Exception:
-                pass
+                LOGGER.debug("Failed to parse network JSON response", exc_info=True)
 
         page.on("response", handle_response)
 
@@ -774,8 +769,7 @@ def _scrape_with_browser(playwright, profile_url: str, max_posts: int, on_post, 
             try:
                 _warmup_and_open_profile(page, profile_url)
             except Exception as retry_err:
-                print(f"[!] Challenge retry warmup failed: {retry_err}")
-                pass
+                LOGGER.warning("Challenge retry warmup failed", exc_info=True)
 
         all_posts = []
         seen = set()
@@ -823,19 +817,18 @@ def _scrape_with_browser(playwright, profile_url: str, max_posts: int, on_post, 
             "page_report_pdf": None,
         }
     except Exception as e:
+        LOGGER.exception("Browser scraping pipeline failed")
         return {"posts": [], "error": str(e), "url": profile_url}
     finally:
         try:
             context.close()
         except Exception as exc:
-            print(f"[!] Failed to close browser context: {exc}")
-            pass
+            LOGGER.warning("Failed to close browser context", exc_info=True)
         if browser is not None:
             try:
                 browser.close()
             except Exception as exc:
-                print(f"[!] Failed to close browser: {exc}")
-                pass
+                LOGGER.warning("Failed to close browser", exc_info=True)
 
 
 def _extract_video_cards(page, profile_url: str) -> list:
@@ -1095,8 +1088,7 @@ def _looks_like_tiktok_challenge(page) -> bool:
         try:
             body_text = (page.locator("body").inner_text(timeout=2000) or "").lower()
         except Exception as exc:
-            print(f"[!] Failed to read page body text: {exc}")
-            pass
+            LOGGER.debug("Failed to read page body text", exc_info=True)
 
         if any(token in body_text for token in ("verify to continue", "security check", "unusual traffic", "complete the captcha")):
             return True
@@ -1160,6 +1152,7 @@ def scrape_tiktok_page(url: str, max_posts: int = 20, on_post=None, headless_ove
     - tente le scraping sur chaque candidat jusqu'au succes
     """
     profile_url = _normalize_profile_url(url)
+    scoped_logger = with_context(LOGGER, url=profile_url)
     if headless_override is None:
         headless = _env_bool("TIKTOK_HEADLESS", True)
     else:
@@ -1170,6 +1163,7 @@ def scrape_tiktok_page(url: str, max_posts: int = 20, on_post=None, headless_ove
     with sync_playwright() as p:
         last_result = None
         for attempt_index, proxy_cfg in enumerate(proxy_candidates, start=1):
+            scoped_logger.info("Scrape attempt started", extra={"post_id": None})
             # Rotation proxy: si challenge detecte, on passe au candidat suivant.
             result = _scrape_with_browser(
                 p,
@@ -1182,8 +1176,12 @@ def scrape_tiktok_page(url: str, max_posts: int = 20, on_post=None, headless_ove
             )
             last_result = result
             if result.get("error") != "challenge_detected":
+                if result.get("error"):
+                    scoped_logger.warning("Scrape finished with error")
+                else:
+                    scoped_logger.info("Scrape finished successfully")
                 return result
             if attempt_index < len(proxy_candidates):
-                pass
+                scoped_logger.warning("Challenge detected, rotating proxy candidate")
 
         return last_result or {"posts": [], "total": 0, "error": "challenge_detected", "url": profile_url}

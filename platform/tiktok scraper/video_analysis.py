@@ -1,9 +1,19 @@
 import json
 import os
+import sys
 from datetime import datetime, timezone
 import importlib
 from pathlib import Path
 import time
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from logging_setup import get_logger
+
+
+LOGGER = get_logger(__name__, platform="tiktok", service="video_analysis")
 
 
 def _load_env_file():
@@ -129,7 +139,7 @@ def _resolve_gemini_model_name() -> str:
 
     # Legacy/retired values should gracefully move to the current default.
     if raw in {"gemini-1.5-flash", "gemini-1.5-pro"}:
-        print(f"[*] Gemini model '{raw}' upgraded to 'gemini-2.5-flash'")
+        LOGGER.info("Gemini model upgraded to gemini-2.5-flash")
         return "gemini-2.5-flash"
 
     return raw
@@ -217,7 +227,7 @@ def _build_cookiefile(output_dir: Path) -> str | None:
     try:
         raw = json.loads(source_path.read_text(encoding="utf-8"))
     except Exception as exc:
-        print(f"[!] Impossible de lire les cookies TikTok JSON: {exc}")
+        LOGGER.warning("Impossible de lire les cookies TikTok JSON", exc_info=True)
         return None
 
     if not isinstance(raw, list):
@@ -434,7 +444,7 @@ def _analyze_video_with_gemini_sdk(video_path: str) -> dict:
         msg = str(exc)
         if "404" in msg and "not found" in msg.lower() and model_name != "gemini-2.5-flash":
             fallback_model = "gemini-2.5-flash"
-            print(f"[!] Gemini model '{model_name}' indisponible, retry avec '{fallback_model}'")
+            LOGGER.warning("Gemini model indisponible, retry avec fallback")
             response = client.models.generate_content(
                 model=fallback_model,
                 contents=[prompt, file_ref],

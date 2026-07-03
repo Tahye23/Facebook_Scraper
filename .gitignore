@@ -11,3 +11,11 @@ platform/tiktok scraper/tiktok_profile/
 platform/tiktok scraper/__pycache__/
 platform/tiktok scraper/*.pyc
 platform/tiktok scraper/video_reports/
+
+# Runtime logs
+logs/
+*.log
+
+# Python cache artifacts
+__pycache__/
+*.pyc

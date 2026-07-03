@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang='fr'>
+<head>
+    <meta charset='utf-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1'>
+    <title>Session TikTok</title>
+    <style>
+        body { font-family: -apple-system, Segoe UI, Arial, sans-serif; margin: 24px; color: #1f2937; }
+        h1 { margin-bottom: 4px; }
+        .meta { color: #4b5563; margin-bottom: 16px; }
+        .kpis { display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 8px; margin: 16px 0; }
+        .card { border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px; background: #f8fafc; }
+        table { width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 13px; }
+        th, td { border: 1px solid #e5e7eb; padding: 8px; text-align: left; vertical-align: top; }
+        th { background: #eef2ff; }
+        a { color: #1d4ed8; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <h1>Rapport Session TikTok</h1>
+    <div class='meta'>Page: __PAGE_URL__ | Genere le: __GENERATED_AT__ UTC</div>
+    <div class='kpis'>
+        <div class='card'><b>Posts</b><br>__TOTAL_POSTS__</div>
+        <div class='card'><b>Likes</b><br>__TOTAL_LIKES__</div>
+        <div class='card'><b>Commentaires</b><br>__TOTAL_COMMENTS__</div>
+        <div class='card'><b>Partages</b><br>__TOTAL_SHARES__</div>
+        <div class='card'><b>Vues</b><br>__TOTAL_VIEWS__</div>
+    </div>
+    <table>
+        <thead>
+            <tr>
+                <th>#</th><th>Auteur</th><th>URL</th><th>Likes</th><th>Commentaires</th><th>Partages</th><th>Vues</th><th>Resume IA</th>
+            </tr>
+        </thead>
+        <tbody>
+            __ROWS__
+        </tbody>
+    </table>
+</body>
+</html>

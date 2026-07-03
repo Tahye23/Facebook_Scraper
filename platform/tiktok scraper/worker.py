@@ -1,18 +1,45 @@
+"""Worker de scraping TikTok.
+
+Ce module consomme des taches de scraping depuis RabbitMQ, execute le
+scraping TikTok, publie les posts en flux, puis envoie les evenements de fin
+ou d'erreur.
+
+Flux d'execution:
+1) Charger les variables d'environnement (.env en fallback).
+2) Se connecter a RabbitMQ avec retry.
+3) Consommer les taches de scraping TikTok.
+4) Pour chaque tache, lancer le scraper dans un thread et publier les posts au fil de l'eau.
+5) Generer les rapports de session (JSON/HTML/PDF) si possible.
+6) Publier un evenement COMPLETED ou ERROR.
+"""
+
 import json
 import os
 import queue
 import threading
 import time
-import traceback
 from datetime import datetime, timezone
 from pathlib import Path
+from html import escape
 
 import pika
 
 from scraper import scrape_tiktok_page
+from video_analysis import build_session_json_report
 
 
 def _load_env_file():
+    """Charge les variables .env sans ecraser les variables deja definies.
+
+    Ordre de recherche:
+    - .env a la racine du repo (deux niveaux au-dessus de ce fichier)
+    - .env du dossier platform (un niveau au-dessus)
+    - .env du repertoire de travail courant
+
+    Notes:
+    - Les variables deja presentes dans l'OS sont conservees.
+    - Les lignes vides, commentees ou invalides sont ignorees.
+    """
     candidates = [
         Path(__file__).resolve().parents[2] / ".env",
         Path(__file__).resolve().parents[1] / ".env",
@@ -47,7 +74,125 @@ QUEUE_RESULT = os.getenv("RABBITMQ_RESULT_QUEUE", "scrape_result_queue")
 ROUTING_RESULT = "scrape.result"
 
 
+def _to_int(value) -> int:
+    """Convertit en entier au mieux, sinon retourne 0."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _build_session_html_report(page_url: str, posts: list[dict], output_dir: Path) -> str:
+    """Genere un rapport HTML lisible pour une session de scraping TikTok.
+
+    Le rapport contient:
+    - Metadonnees de session (page source, horodatage)
+    - KPI agreges (posts, likes, commentaires, partages, vues)
+    - Une ligne par post avec un court resume IA quand disponible
+
+    Retourne:
+        Le chemin du fichier HTML genere.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+    out_path = output_dir / f"session_report_{ts}.html"
+
+    total_posts = len(posts)
+    total_likes = sum(_to_int(p.get("likes") or p.get("metrics", {}).get("likes")) for p in posts)
+    total_comments = sum(_to_int(p.get("comments_count") or p.get("metrics", {}).get("comments")) for p in posts)
+    total_shares = sum(_to_int(p.get("shares") or p.get("metrics", {}).get("shares")) for p in posts)
+    total_views = sum(_to_int(p.get("views") or p.get("metrics", {}).get("views")) for p in posts)
+
+    rows = []
+    for idx, post in enumerate(posts, start=1):
+        post_url = post.get("post_url") or post.get("sourceUrl") or ""
+        author = post.get("author") or ""
+        report = post.get("video_report") if isinstance(post.get("video_report"), dict) else {}
+        summary = report.get("executive_summary") or []
+        summary_text = " ".join(str(x) for x in summary[:2])
+        rows.append(
+            "<tr>"
+            f"<td>{idx}</td>"
+            f"<td>{escape(author)}</td>"
+            f"<td><a href='{escape(post_url)}' target='_blank'>{escape(post_url)}</a></td>"
+            f"<td>{_to_int(post.get('likes') or post.get('metrics', {}).get('likes'))}</td>"
+            f"<td>{_to_int(post.get('comments_count') or post.get('metrics', {}).get('comments'))}</td>"
+            f"<td>{_to_int(post.get('shares') or post.get('metrics', {}).get('shares'))}</td>"
+            f"<td>{_to_int(post.get('views') or post.get('metrics', {}).get('views'))}</td>"
+            f"<td>{escape(summary_text)}</td>"
+            "</tr>"
+        )
+
+    template_path = Path(__file__).resolve().parent / "templates" / "session_report.html"
+    template_html = template_path.read_text(encoding="utf-8")
+
+    html = (
+        template_html
+        .replace("__PAGE_URL__", escape(page_url))
+        .replace("__GENERATED_AT__", datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
+        .replace("__TOTAL_POSTS__", str(total_posts))
+        .replace("__TOTAL_LIKES__", str(total_likes))
+        .replace("__TOTAL_COMMENTS__", str(total_comments))
+        .replace("__TOTAL_SHARES__", str(total_shares))
+        .replace("__TOTAL_VIEWS__", str(total_views))
+        .replace("__ROWS__", "".join(rows))
+    )
+
+    out_path.write_text(html, encoding="utf-8")
+    return str(out_path)
+
+
+def _build_session_pdf_report(posts: list[dict], output_dir: Path) -> str | None:
+    """Genere un PDF synthetique de la session de scraping.
+
+    Retourne:
+        Chemin du PDF genere, ou None si reportlab n'est pas installe.
+    """
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.pdfgen import canvas
+    except Exception:
+        return None
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+    out_path = output_dir / f"session_report_{ts}.pdf"
+
+    pdf = canvas.Canvas(str(out_path), pagesize=A4)
+    width, height = A4
+    y = height - 40
+
+    pdf.setFont("Helvetica-Bold", 14)
+    pdf.drawString(40, y, "Rapport Session TikTok")
+    y -= 24
+
+    pdf.setFont("Helvetica", 10)
+    pdf.drawString(40, y, f"Generated at: {datetime.now(tz=timezone.utc).isoformat()}")
+    y -= 20
+
+    for idx, post in enumerate(posts, start=1):
+        if y < 70:
+            pdf.showPage()
+            y = height - 40
+            pdf.setFont("Helvetica", 10)
+        post_url = str(post.get("post_url") or post.get("sourceUrl") or "")
+        author = str(post.get("author") or "")
+        likes = _to_int(post.get("likes") or post.get("metrics", {}).get("likes"))
+        comments = _to_int(post.get("comments_count") or post.get("metrics", {}).get("comments"))
+        shares = _to_int(post.get("shares") or post.get("metrics", {}).get("shares"))
+        views = _to_int(post.get("views") or post.get("metrics", {}).get("views"))
+
+        pdf.drawString(40, y, f"{idx}. {author} | likes={likes}, comments={comments}, shares={shares}, views={views}")
+        y -= 14
+        pdf.drawString(56, y, post_url[:130])
+        y -= 18
+
+    pdf.save()
+    return str(out_path)
+
+
 def _safe_int(val) -> int | None:
+    """Convertit une valeur en int, ou None si conversion impossible."""
     try:
         return int(val)
     except (TypeError, ValueError):
@@ -55,6 +200,11 @@ def _safe_int(val) -> int | None:
 
 
 def normalize_post(scrape_id: str, url: str, post: dict) -> dict:
+    """Normalise un post brut vers le format contractuel du gateway.
+
+    Permet de conserver un schema stable entre plateformes pour le stockage
+    et le traitement des evenements en aval.
+    """
     text = post.get("message") or post.get("text") or ""
     hashtags = [w for w in text.split() if w.startswith("#")]
 
@@ -83,6 +233,12 @@ def normalize_post(scrape_id: str, url: str, post: dict) -> dict:
 
 
 def _post_signature(post: dict) -> str:
+    """Construit une signature deterministe pour dedupliquer les posts publies.
+
+    Priorite:
+    1) id du post quand disponible
+    2) fallback URL du post + prefixe du texte
+    """
     post_id = str(post.get("post_id") or post.get("id") or "").strip()
     if post_id:
         return f"id:{post_id}"
@@ -92,16 +248,17 @@ def _post_signature(post: dict) -> str:
 
 
 def publish_result(channel, result: dict):
+    """Publie un evenement resultat (post TikTok normalise) vers RabbitMQ."""
     channel.basic_publish(
         exchange=EXCHANGE,
         routing_key=ROUTING_RESULT,
         body=json.dumps(result, ensure_ascii=False),
         properties=pika.BasicProperties(content_type="application/json", delivery_mode=2),
     )
-    print(f"[->] TikTok result published scrapeId={result.get('scrapeId')} postId={result.get('postId')}")
 
 
 def publish_error(channel, scrape_id: str, error_msg: str):
+    """Publie un evenement de cycle de vie ERROR pour un job de scraping."""
     payload = {
         "scrapeId": scrape_id,
         "platform": "tiktok",
@@ -115,10 +272,10 @@ def publish_error(channel, scrape_id: str, error_msg: str):
         body=json.dumps(payload, ensure_ascii=False),
         properties=pika.BasicProperties(content_type="application/json", delivery_mode=2),
     )
-    print(f"[!] TikTok error published for scrape_id={scrape_id}: {error_msg}")
 
 
 def publish_completion(channel, scrape_id: str):
+    """Publie un evenement de cycle de vie COMPLETED minimal pour un job."""
     payload = {
         "scrapeId": scrape_id,
         "platform": "tiktok",
@@ -132,10 +289,18 @@ def publish_completion(channel, scrape_id: str):
         body=json.dumps(payload, ensure_ascii=False),
         properties=pika.BasicProperties(content_type="application/json", delivery_mode=2),
     )
-    print(f"[+] TikTok completion published for scrape_id={scrape_id}")
 
 
 def on_message(channel, method, properties, body):
+    """Callback RabbitMQ pour traiter un message de tache TikTok.
+
+    Flux detaille:
+    - Parser et valider le payload entrant.
+    - Lancer le scraper dans un thread et diffuser les posts des qu'ils arrivent.
+    - Dedupliquer les posts (streaming + final).
+    - Generer les rapports de session.
+    - Publier COMPLETED (ou ERROR) puis ACK/NACK du message.
+    """
     scrape_id = "unknown"
     try:
         task = json.loads(body)
@@ -148,8 +313,6 @@ def on_message(channel, method, properties, body):
             max_posts = 20
         if max_posts <= 0:
             max_posts = 20
-
-        print(f"[<-] TikTok task: scrape_id={scrape_id} url={url} max_posts={max_posts}")
 
         if not url:
             publish_error(channel, scrape_id, "URL missing in message")
@@ -212,17 +375,56 @@ def on_message(channel, method, properties, body):
             publish_result(channel, normalize_post(scrape_id, url, post))
             published_count += 1
 
-        publish_completion(channel, scrape_id)
-        print(f"[+] TikTok published {published_count} posts for scrape_id={scrape_id}")
+        session_json_path = None
+        session_html_path = None
+        session_pdf_path = None
+
+        try:
+            output_dir = Path(os.getenv("VIDEO_ANALYSIS_OUTPUT_DIR") or "video_reports")
+            raw_posts = result.get("posts", [])
+            session_json = build_session_json_report(page_url=url, posts=raw_posts, output_dir=str(output_dir))
+            session_json_path = session_json.get("json_path")
+            session_html_path = _build_session_html_report(page_url=url, posts=raw_posts, output_dir=output_dir)
+            session_pdf_path = _build_session_pdf_report(posts=raw_posts, output_dir=output_dir)
+        except Exception:
+            pass
+
+        completion_payload = {
+            "scrapeId": scrape_id,
+            "platform": "tiktok",
+            "eventType": "COMPLETED",
+            "success": True,
+            "errorMessage": None,
+            "sessionReports": {
+                "jsonPath": session_json_path,
+                "htmlPath": session_html_path,
+                "pdfPath": session_pdf_path,
+            },
+        }
+
+        channel.basic_publish(
+            exchange=EXCHANGE,
+            routing_key=ROUTING_RESULT,
+            body=json.dumps(completion_payload, ensure_ascii=False),
+            properties=pika.BasicProperties(content_type="application/json", delivery_mode=2),
+        )
         channel.basic_ack(delivery_tag=method.delivery_tag)
 
     except Exception as exc:
-        traceback.print_exc()
         publish_error(channel, scrape_id, str(exc))
         channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
 
 def connect_with_retry(retries=10, delay=5) -> pika.BlockingConnection:
+    """Se connecte a RabbitMQ avec un nombre limite de tentatives.
+
+    Args:
+        retries: Nombre maximal de tentatives de connexion.
+        delay: Delai (secondes) entre deux tentatives.
+
+    Raises:
+        RuntimeError: Si toutes les tentatives echouent.
+    """
     credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASSWORD)
     params = pika.ConnectionParameters(
         host=RABBITMQ_HOST,
@@ -235,10 +437,8 @@ def connect_with_retry(retries=10, delay=5) -> pika.BlockingConnection:
     for attempt in range(1, retries + 1):
         try:
             conn = pika.BlockingConnection(params)
-            print(f"[+] Connected to RabbitMQ ({RABBITMQ_HOST}:{RABBITMQ_PORT})")
             return conn
-        except Exception as exc:
-            print(f"[!] Attempt {attempt}/{retries} failed: {exc}")
+        except Exception:
             if attempt < retries:
                 time.sleep(delay)
 
@@ -246,8 +446,11 @@ def connect_with_retry(retries=10, delay=5) -> pika.BlockingConnection:
 
 
 def main():
-    print("[*] Starting TikTok worker...")
+    """Point d'entree du worker.
 
+    Declare exchange/queues/bindings, configure la QoS, puis demarre la
+    consommation des messages TikTok jusqu'a interruption.
+    """
     connection = connect_with_retry()
     channel = connection.channel()
 
@@ -267,11 +470,10 @@ def main():
     channel.basic_qos(prefetch_count=1)
     channel.basic_consume(queue=QUEUE_CONSUME, on_message_callback=on_message)
 
-    print(f"[*] Waiting for TikTok messages on '{QUEUE_CONSUME}'...")
     try:
         channel.start_consuming()
     except KeyboardInterrupt:
-        print("[*] Stop requested")
+        pass
     finally:
         try:
             channel.stop_consuming()

@@ -1,4 +1,6 @@
 # Sensitive session cookies (never commit)
+.env
+!.env.example
 cookies.json
 fb_cookies.json
 platform/facebook scraper/fb_cookies.json

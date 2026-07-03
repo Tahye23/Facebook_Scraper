@@ -15,6 +15,11 @@ COOKIES_FILE = "tiktok_cookies.json"
 
 
 def _env_bool(name: str, default: bool) -> bool:
+    """Lit une variable d'environnement booleenne avec valeur par defaut.
+
+    Valeurs considerees comme vraies: 1, true, yes, y, on.
+    Si la variable n'existe pas, retourne `default`.
+    """
     raw = os.getenv(name)
     if raw is None:
         return default
@@ -22,8 +27,14 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def load_cookies() -> list:
+    """Charge et normalise les cookies TikTok depuis `tiktok_cookies.json`.
+
+    Objectif:
+    - Accepter un export JSON de cookies (liste d'objets).
+    - Garder uniquement les champs utiles pour Playwright.
+    - Retourner une liste prete pour `context.add_cookies(...)`.
+    """
     if not os.path.exists(COOKIES_FILE):
-        print(f"[!] Cookies file not found: {COOKIES_FILE}")
         return []
 
     try:
@@ -34,7 +45,6 @@ def load_cookies() -> list:
         return []
 
     if not isinstance(raw, list):
-        print("[!] Cookies format invalid: expected a JSON array")
         return []
 
     cookies = []
@@ -66,15 +76,19 @@ def load_cookies() -> list:
             try:
                 cookie["expires"] = int(float(expires))
             except (TypeError, ValueError):
+                print(f"[!] Invalid cookie expires value ignored: {expires}")
                 pass
 
         cookies.append(cookie)
 
-    print(f"[+] Loaded {len(cookies)} TikTok cookies")
     return cookies
 
 
 def _normalize_profile_url(url: str) -> str:
+    """Valide et nettoie une URL TikTok de profil.
+
+    Retourne une URL sans query string ni fragment pour eviter les doublons.
+    """
     parsed = urlparse(url)
     if "tiktok.com" not in parsed.netloc:
         raise ValueError("URL TikTok invalide")
@@ -83,6 +97,12 @@ def _normalize_profile_url(url: str) -> str:
 
 
 def _video_signature(video: dict) -> str:
+    """Construit une signature stable pour dedupliquer les videos.
+
+    Priorite:
+    1) post_id
+    2) URL du post
+    """
     vid = str(video.get("post_id") or "").strip()
     if vid:
         return f"id:{vid}"
@@ -90,10 +110,16 @@ def _video_signature(video: dict) -> str:
 
 
 def _human_pause(base: float = 1.0, jitter: float = 0.6):
+    """Ajoute une pause pseudo-humaine pour reduire les patterns robotiques."""
     time.sleep(base + random.uniform(0.0, jitter))
 
 
 def _install_stealth_scripts(context):
+    """Injecte un script de camouflage navigateur au demarrage des pages.
+
+    But: reduire quelques signaux anti-bot evidents sans ajouter de dependances
+    lourdes.
+    """
     # Keep this lightweight to reduce easy bot fingerprints without heavy dependencies.
     context.add_init_script(
         """
@@ -108,6 +134,7 @@ def _install_stealth_scripts(context):
 
 
 def _build_proxy_config() -> dict | None:
+    """Construit une configuration proxy unique a partir des variables env."""
     server = (os.getenv("TIKTOK_PROXY_SERVER") or "").strip()
     if not server:
         return None
@@ -122,16 +149,29 @@ def _build_proxy_config() -> dict | None:
 
 
 def _build_user_data_dir() -> str:
+    """Retourne le dossier profil navigateur persistant (ou chaine vide)."""
     return (os.getenv("TIKTOK_USER_DATA_DIR") or "").strip()
 
 
 def _should_apply_stealth(user_data_dir: str) -> bool:
+    """Decide si le mode stealth doit etre applique.
+
+    En profil persistant reel, on desactive par defaut le stealth agressif,
+    sauf si la variable d'env force son activation.
+    """
     # In persistent real-profile mode, aggressive stealth patches can look less natural.
     default = False if user_data_dir else True
     return _env_bool("TIKTOK_APPLY_STEALTH", default)
 
 
 def _parse_proxy_spec(spec: str) -> dict | None:
+    """Parse une ligne proxy en plusieurs formats supportes.
+
+    Formats acceptes:
+    - host:port|username|password
+    - scheme://username:password@host:port
+    - valeur brute (server)
+    """
     raw = (spec or "").strip()
     if not raw:
         return None
@@ -163,6 +203,14 @@ def _parse_proxy_spec(spec: str) -> dict | None:
 
 
 def _load_proxy_candidates() -> list[dict | None]:
+    """Construit la liste de proxies candidats avec deduplication.
+
+    Sources:
+    - TIKTOK_PROXY_SERVER (+ username/password)
+    - TIKTOK_PROXY_LIST (multi-lignes)
+
+    Retourne `[None]` si aucun proxy n'est configure (mode direct).
+    """
     candidates = []
     seen = set()
 
@@ -192,24 +240,32 @@ def _load_proxy_candidates() -> list[dict | None]:
 
 
 def _describe_proxy(proxy_cfg: dict | None) -> str:
+    """Retourne une description lisible du mode reseau (proxy/direct)."""
     if not proxy_cfg:
         return "direct"
     return proxy_cfg.get("server") or "proxy"
 
 
 def _save_challenge_artifacts(page):
+    """Sauvegarde des artefacts de debug quand un challenge TikTok est detecte.
+
+    Fichiers produits:
+    - screenshot PNG
+    - HTML complet de la page
+    - contexte URL + titre dans les logs
+    """
     try:
         page.screenshot(path="tiktok_challenge.png", full_page=True)
-        print("[!] Challenge screenshot saved: tiktok_challenge.png")
-    except Exception:
+    except Exception as exc:
+        print(f"[!] Failed to save challenge screenshot: {exc}")
         pass
 
     try:
         html = page.content()
         with open("tiktok_challenge.html", "w", encoding="utf-8") as f:
             f.write(html)
-        print("[!] Challenge HTML saved: tiktok_challenge.html")
-    except Exception:
+    except Exception as exc:
+        print(f"[!] Failed to save challenge HTML: {exc}")
         pass
 
     try:
@@ -222,10 +278,10 @@ def _save_challenge_artifacts(page):
     except Exception:
         title = "unknown"
 
-    print(f"[!] Challenge context url={current_url} title={title}")
 
 
 def _extract_posts_from_sigi_state(payload: object) -> list:
+    """Extrait les posts depuis `SIGI_STATE` (etat JS TikTok embarque)."""
     if not isinstance(payload, dict):
         return []
 
@@ -267,6 +323,13 @@ def _extract_posts_from_sigi_state(payload: object) -> list:
 
 
 def _extract_posts_from_html_fallback(profile_url: str) -> list:
+    """Fallback HTTP sans navigateur pour recuperer les posts d'un profil.
+
+    Strategie:
+    1) Telecharger la page HTML.
+    2) Tenter `__UNIVERSAL_DATA_FOR_REHYDRATION__`.
+    3) Sinon tenter `SIGI_STATE`.
+    """
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -282,7 +345,6 @@ def _extract_posts_from_html_fallback(profile_url: str) -> list:
     try:
         response = requests.get(profile_url, headers=headers, timeout=30)
     except Exception as exc:
-        print(f"[!] HTTP fallback request failed: {exc}")
         return []
 
     html = response.text or ""
@@ -301,9 +363,9 @@ def _extract_posts_from_html_fallback(profile_url: str) -> list:
             payload = json.loads(raw)
             posts = _extract_posts_from_json_payload(payload)
             if posts:
-                print(f"[*] HTTP fallback extracted {len(posts)} posts from rehydration payload")
                 return posts
-        except Exception:
+        except Exception as exc:
+            print(f"[!] Failed to parse rehydration payload: {exc}")
             pass
 
     sigi_match = re.search(
@@ -317,15 +379,19 @@ def _extract_posts_from_html_fallback(profile_url: str) -> list:
             payload = json.loads(raw)
             posts = _extract_posts_from_sigi_state(payload)
             if posts:
-                print(f"[*] HTTP fallback extracted {len(posts)} posts from SIGI_STATE")
                 return posts
-        except Exception:
+        except Exception as exc:
+            print(f"[!] Failed to parse SIGI_STATE payload: {exc}")
             pass
 
     return []
 
 
 def _manual_solve_wait_if_enabled(user_data_dir: str, headless: bool):
+    """Pause volontaire pour laisser l'utilisateur resoudre un challenge.
+
+    Active seulement en mode non-headless + profil persistant.
+    """
     if headless or not user_data_dir:
         return
 
@@ -338,11 +404,11 @@ def _manual_solve_wait_if_enabled(user_data_dir: str, headless: bool):
     if seconds <= 0:
         return
 
-    print(f"[*] Manual solve window: {seconds}s")
     time.sleep(seconds)
 
 
 def _wait_for_challenge_resolution(page, user_data_dir: str, headless: bool):
+    """Attend une resolution manuelle du challenge jusqu'au timeout configure."""
     if headless or not user_data_dir:
         return
 
@@ -355,18 +421,19 @@ def _wait_for_challenge_resolution(page, user_data_dir: str, headless: bool):
     if max_seconds <= 0:
         return
 
-    print(f"[*] Waiting up to {max_seconds}s for manual challenge resolution...")
     start = time.time()
     while (time.time() - start) < max_seconds:
         if not _looks_like_tiktok_challenge(page):
-            print("[+] Challenge appears resolved")
             return
         _human_pause(1.5, 0.8)
 
-    print("[!] Challenge still present after manual resolution window")
 
 
 def _merge_post_data(base: dict, extra: dict) -> dict:
+    """Fusionne des metadonnees de post sans ecraser les valeurs deja presentes.
+
+    On complete seulement les champs vides dans `base` avec les donnees de `extra`.
+    """
     merged = dict(base)
     for key in ("author", "message", "published_at", "likes", "comments_count", "shares", "views"):
         current = merged.get(key)
@@ -377,6 +444,13 @@ def _merge_post_data(base: dict, extra: dict) -> dict:
 
 
 def _attach_video_analysis(posts: list[dict], on_post=None) -> list[dict]:
+    """Ajoute une analyse video IA (optionnelle) sur les posts collectes.
+
+    Comportement:
+    - Controle par variables d'environnement.
+    - Limite configurable du nombre de videos analysees.
+    - Peut emettre chaque post via callback `on_post`.
+    """
     if not posts:
         return posts
 
@@ -388,6 +462,7 @@ def _attach_video_analysis(posts: list[dict], on_post=None) -> list[dict]:
                     on_post(dict(post))
                 except Exception as cb_err:
                     print(f"[!] on_post callback error: {cb_err}")
+                    pass
         return posts
 
     raw_limit = (os.getenv("TIKTOK_ANALYZE_VIDEO_LIMIT") or "2").strip()
@@ -414,15 +489,15 @@ def _attach_video_analysis(posts: list[dict], on_post=None) -> list[dict]:
                     on_post(dict(post_copy))
                 except Exception as cb_err:
                     print(f"[!] on_post callback error: {cb_err}")
+                    pass
             continue
 
         try:
-            report = analyze_tiktok_video(video_url=post_url, output_dir=output_dir)
+            report = analyze_tiktok_video(video_url=post_url, output_dir=output_dir, save_json_report=True)
             post_copy["source_media_url"] = report.get("video_metadata", {}).get("media_url")
             post_copy["media_path"] = report.get("artifacts", {}).get("video_path")
             post_copy["video_report"] = build_small_video_report(report)
             post_copy["message"] = post_copy.get("message") or report.get("transcript_excerpt") or ""
-            print(f"[*] Video analysis done for post={post_copy.get('post_id')}")
         except Exception as exc:
             post_copy["video_report"] = {
                 "executive_summary": ["Analyse video indisponible."],
@@ -436,7 +511,6 @@ def _attach_video_analysis(posts: list[dict], on_post=None) -> list[dict]:
                     "limits": [f"video_analysis_error: {exc}"],
                 },
             }
-            print(f"[!] Video analysis failed for {post_url}: {exc}")
 
         updated.append(post_copy)
         if on_post is not None:
@@ -444,11 +518,17 @@ def _attach_video_analysis(posts: list[dict], on_post=None) -> list[dict]:
                 on_post(dict(post_copy))
             except Exception as cb_err:
                 print(f"[!] on_post callback error: {cb_err}")
+                pass
 
     return updated
 
 
 def _extract_video_detail_from_page(page) -> dict:
+    """Extrait les metadonnees detaillees d'une page video TikTok.
+
+    Le JS embarque tente d'abord `window.SIGI_STATE`, puis le payload de
+    rehydratation SSR, et retourne un objet minimal si rien n'est disponible.
+    """
     return page.evaluate(
         r"""
         () => {
@@ -517,6 +597,11 @@ def _extract_video_detail_from_page(page) -> dict:
 
 
 def _enrich_posts_from_video_pages(context, posts: list[dict]) -> list[dict]:
+    """Enrichit les posts en ouvrant les pages video une a une.
+
+    Utilise `_extract_video_detail_from_page` pour completer les stats/auteur
+    quand le listing profil est incomplet.
+    """
     if not posts:
         return posts
 
@@ -552,19 +637,28 @@ def _enrich_posts_from_video_pages(context, posts: list[dict]) -> list[dict]:
             detail = _extract_video_detail_from_page(detail_page)
             enriched.append(_merge_post_data(post, detail))
         except Exception as exc:
-            print(f"[!] Detail enrichment failed for {post_url}: {exc}")
             enriched.append(post)
         finally:
             if detail_page is not None:
                 try:
                     detail_page.close()
-                except Exception:
+                except Exception as exc:
+                    print(f"[!] Failed to close detail page: {exc}")
                     pass
 
     return enriched
 
 
 def _scrape_with_browser(playwright, profile_url: str, max_posts: int, on_post, headless: bool, slow_mo_ms: int, proxy_cfg: dict | None) -> dict:
+    """Pipeline principal de scraping via Playwright.
+
+    Etapes:
+    1) Ouvrir un contexte navigateur (persistant ou temporaire).
+    2) Injecter headers/stealth/cookies selon la config.
+    3) Naviguer vers le profil et collecter les posts (DOM + reseau).
+    4) Gérer challenge/fallback HTTP si necessaire.
+    5) Enrichir et analyser les posts avant retour.
+    """
     browser = None
     user_data_dir = _build_user_data_dir()
     browser_args = [
@@ -584,12 +678,15 @@ def _scrape_with_browser(playwright, profile_url: str, max_posts: int, on_post, 
         "timezone_id": "Europe/Paris",
     }
 
+    # Log informatif si un proxy est actif pour cette tentative.
     if proxy_cfg:
-        print(f"[*] TikTok proxy enabled: {_describe_proxy(proxy_cfg)}")
+        pass
 
+    # Deux modes de contexte:
+    # - persistent_context: reutilise un profil navigateur reel
+    # - new_context: session propre, ephemere
     if user_data_dir:
         os.makedirs(user_data_dir, exist_ok=True)
-        print(f"[*] TikTok persistent profile mode: {user_data_dir}")
         launch_persistent_args = {
             "user_data_dir": user_data_dir,
             "headless": headless,
@@ -611,6 +708,7 @@ def _scrape_with_browser(playwright, profile_url: str, max_posts: int, on_post, 
         browser = playwright.chromium.launch(**launch_args)
         context = browser.new_context(**context_options)
 
+    # Headers additionnels pour mimer un trafic navigateur classique.
     context.set_extra_http_headers(
         {
             "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
@@ -623,25 +721,28 @@ def _scrape_with_browser(playwright, profile_url: str, max_posts: int, on_post, 
     if _should_apply_stealth(user_data_dir):
         _install_stealth_scripts(context)
     else:
-        print("[*] Stealth script disabled for persistent profile mode")
+        pass
 
+    # Injection de cookies si contexte non persistant, ou si forçage explicite.
     force_cookie_injection = _env_bool("TIKTOK_FORCE_COOKIE_INJECTION", False)
     if not user_data_dir or force_cookie_injection:
         cookies = load_cookies()
         if cookies:
             try:
                 context.add_cookies(cookies)
-                print(f"[+] Injected {len(cookies)} TikTok cookies")
             except Exception as e:
                 print(f"[!] Failed to inject cookies: {e}")
+                pass
     else:
-        print("[*] Cookies injection skipped (persistent profile mode)")
+        pass
 
     page = context.new_page()
 
     try:
         network_posts = []
 
+        # Capture passive des reponses JSON reseau pour recuperer des posts
+        # parfois absents du DOM rendu.
         def handle_response(response):
             rurl = response.url.lower()
             if not any(k in rurl for k in ("item_list", "aweme", "post/item", "user/post")):
@@ -659,7 +760,6 @@ def _scrape_with_browser(playwright, profile_url: str, max_posts: int, on_post, 
                 parsed = _extract_posts_from_json_payload(payload)
                 if parsed:
                     network_posts.extend(parsed)
-                    print(f"[*] TikTok network parsed +{len(parsed)} posts")
             except Exception:
                 pass
 
@@ -667,18 +767,20 @@ def _scrape_with_browser(playwright, profile_url: str, max_posts: int, on_post, 
 
         _warmup_and_open_profile(page, profile_url)
 
+        # Si challenge detecte, on laisse une fenetre de resolution manuelle.
         if _looks_like_tiktok_challenge(page):
-            print("[!] TikTok challenge suspected, retrying after warmup...")
             _manual_solve_wait_if_enabled(user_data_dir, headless)
             _wait_for_challenge_resolution(page, user_data_dir, headless)
             try:
                 _warmup_and_open_profile(page, profile_url)
             except Exception as retry_err:
                 print(f"[!] Challenge retry warmup failed: {retry_err}")
+                pass
 
         all_posts = []
         seen = set()
 
+        # Scroll progressif pour charger davantage de posts.
         for i in range(8):
             cards = _extract_video_cards(page, profile_url)
             batch = cards + network_posts
@@ -698,8 +800,8 @@ def _scrape_with_browser(playwright, profile_url: str, max_posts: int, on_post, 
 
             page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
             _human_pause(1.7, 1.0)
-            print(f"[*] TikTok scroll {i + 1}/8 | collected={len(all_posts)}")
 
+        # Fallback final si aucune video n'a pu etre extraite via navigateur.
         if not all_posts:
             http_posts = _extract_posts_from_html_fallback(profile_url)
             if http_posts:
@@ -709,24 +811,41 @@ def _scrape_with_browser(playwright, profile_url: str, max_posts: int, on_post, 
                 return {"posts": [], "total": 0, "error": "challenge_detected", "url": profile_url}
             return {"posts": [], "total": 0, "error": "no_posts_found", "url": profile_url}
 
+        # Post-traitements: enrichissement detail + analyse IA optionnelle.
         enriched_posts = _enrich_posts_from_video_pages(context, all_posts)
         analyzed_posts = _attach_video_analysis(enriched_posts, on_post=on_post)
-        return {"posts": analyzed_posts, "total": len(analyzed_posts), "url": profile_url}
+
+        return {
+            "posts": analyzed_posts,
+            "total": len(analyzed_posts),
+            "url": profile_url,
+            "page_report_docx": None,
+            "page_report_pdf": None,
+        }
     except Exception as e:
         return {"posts": [], "error": str(e), "url": profile_url}
     finally:
         try:
             context.close()
-        except Exception:
+        except Exception as exc:
+            print(f"[!] Failed to close browser context: {exc}")
             pass
         if browser is not None:
             try:
                 browser.close()
-            except Exception:
+            except Exception as exc:
+                print(f"[!] Failed to close browser: {exc}")
                 pass
 
 
 def _extract_video_cards(page, profile_url: str) -> list:
+    """Extrait les cartes video depuis le DOM et les etats JS de la page profil.
+
+    La logique JS fusionne plusieurs sources pour limiter les trous de donnees:
+    - liens /video/ visibles
+    - `window.SIGI_STATE`
+    - payload `__UNIVERSAL_DATA_FOR_REHYDRATION__`
+    """
     data = page.evaluate(
         r"""
         () => {
@@ -887,6 +1006,11 @@ def _extract_video_cards(page, profile_url: str) -> list:
 
 
 def _extract_posts_from_json_payload(payload: object) -> list:
+    """Parcourt recursivement un JSON TikTok et extrait les objets posts.
+
+    Supporte les variantes frequentes de structure (`itemStruct`, `item`,
+    `aweme_info`).
+    """
     posts = []
     seen_ids = set()
 
@@ -940,6 +1064,14 @@ def _extract_posts_from_json_payload(payload: object) -> list:
 
 
 def _looks_like_tiktok_challenge(page) -> bool:
+    """Heuristique de detection challenge/captcha TikTok.
+
+    Verifie:
+    - presence normale de signaux de posts
+    - URL challenge/captcha/checkpoint
+    - mots-cles dans le body
+    - selecteurs captcha courants
+    """
     try:
         has_posts_signal = page.evaluate(
             r"""
@@ -962,7 +1094,8 @@ def _looks_like_tiktok_challenge(page) -> bool:
         body_text = ""
         try:
             body_text = (page.locator("body").inner_text(timeout=2000) or "").lower()
-        except Exception:
+        except Exception as exc:
+            print(f"[!] Failed to read page body text: {exc}")
             pass
 
         if any(token in body_text for token in ("verify to continue", "security check", "unusual traffic", "complete the captcha")):
@@ -987,6 +1120,7 @@ def _looks_like_tiktok_challenge(page) -> bool:
 
 
 def _dismiss_cookie_banner(page):
+    """Ferme la banniere cookies si elle apparait."""
     selectors = [
         'button:has-text("Accept all")',
         'button:has-text("Allow all")',
@@ -997,13 +1131,17 @@ def _dismiss_cookie_banner(page):
             btn = page.locator(selector).first
             if btn.is_visible(timeout=1500):
                 btn.click(timeout=2000)
-                print("[*] Cookie banner dismissed")
                 return
         except Exception:
             continue
 
 
 def _warmup_and_open_profile(page, profile_url: str):
+    """Fait un warmup TikTok puis ouvre le profil cible.
+
+    Le passage par la homepage peut aider certaines sessions a etre plus stables
+    avant l'ouverture de la page profil.
+    """
     page.goto("https://www.tiktok.com/", wait_until="domcontentloaded", timeout=60000)
     _dismiss_cookie_banner(page)
     _human_pause(1.2, 0.8)
@@ -1013,6 +1151,14 @@ def _warmup_and_open_profile(page, profile_url: str):
 
 
 def scrape_tiktok_page(url: str, max_posts: int = 20, on_post=None, headless_override: bool | None = None) -> dict:
+    """Point d'entree public: scrape une page TikTok et retourne un resultat.
+
+    Orchestration:
+    - normalise l'URL
+    - decide headless/headed
+    - prepare les candidats proxy
+    - tente le scraping sur chaque candidat jusqu'au succes
+    """
     profile_url = _normalize_profile_url(url)
     if headless_override is None:
         headless = _env_bool("TIKTOK_HEADLESS", True)
@@ -1021,11 +1167,10 @@ def scrape_tiktok_page(url: str, max_posts: int = 20, on_post=None, headless_ove
     slow_mo_ms = 0 if headless else 150
     proxy_candidates = _load_proxy_candidates()
 
-    print(f"[*] TikTok browser mode: {'headless' if headless else 'headed'}")
     with sync_playwright() as p:
         last_result = None
         for attempt_index, proxy_cfg in enumerate(proxy_candidates, start=1):
-            print(f"[*] TikTok attempt {attempt_index}/{len(proxy_candidates)} via {_describe_proxy(proxy_cfg)}")
+            # Rotation proxy: si challenge detecte, on passe au candidat suivant.
             result = _scrape_with_browser(
                 p,
                 profile_url,
@@ -1039,6 +1184,6 @@ def scrape_tiktok_page(url: str, max_posts: int = 20, on_post=None, headless_ove
             if result.get("error") != "challenge_detected":
                 return result
             if attempt_index < len(proxy_candidates):
-                print("[!] Challenge detected, rotating to next proxy candidate...")
+                pass
 
         return last_result or {"posts": [], "total": 0, "error": "challenge_detected", "url": profile_url}

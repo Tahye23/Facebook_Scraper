@@ -19,6 +19,7 @@ import queue
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from html import escape
@@ -31,7 +32,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from logging_setup import get_logger, with_context
 from scraper import scrape_tiktok_page
-from video_analysis import build_session_json_report
+from video_analysis import analyze_tiktok_video, build_session_json_report, build_small_video_report
 
 
 LOGGER = get_logger(__name__, platform="tiktok", service="worker")
@@ -308,6 +309,62 @@ def publish_completion(channel, scrape_id: str):
     )
 
 
+def publish_enrichment_update(
+    channel,
+    scrape_id: str,
+    url: str,
+    post: dict,
+    event_type: str,
+    success: bool,
+    error_message: str | None = None,
+):
+    payload = normalize_post(scrape_id, url, post)
+    post_id = str(payload.get("postId") or "").strip()
+    payload.update(
+        {
+            "eventType": event_type,
+            "status": "PARTIAL",
+            "success": success,
+            "errorMessage": error_message,
+            "scrapedAt": datetime.now(tz=timezone.utc).isoformat(),
+            "enrichment": {
+                "state": "DONE" if success else "FAILED",
+            },
+        }
+    )
+    with_context(LOGGER, scrape_id=scrape_id, url=url, post_id=post_id).info(
+        "Publishing enrichment update",
+        extra={"service": "worker"},
+    )
+    channel.basic_publish(
+        exchange=EXCHANGE,
+        routing_key=ROUTING_RESULT,
+        body=json.dumps(payload, ensure_ascii=False),
+        properties=pika.BasicProperties(content_type="application/json", delivery_mode=2),
+    )
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _enrich_post_video(post: dict, output_dir: str) -> dict:
+    post_copy = dict(post)
+    post_url = str(post_copy.get("post_url") or "").strip()
+    if not post_url or "/video/" not in post_url:
+        return post_copy
+
+    report = analyze_tiktok_video(video_url=post_url, output_dir=output_dir, save_json_report=True)
+    post_copy["source_media_url"] = report.get("video_metadata", {}).get("media_url")
+    post_copy["media_path"] = report.get("artifacts", {}).get("video_path")
+    post_copy["video_report"] = build_small_video_report(report)
+    post_copy["message"] = post_copy.get("message") or report.get("transcript_excerpt") or ""
+    return post_copy
+
+
 def on_message(channel, method, properties, body):
     """Callback RabbitMQ pour traiter un message de tache TikTok.
 
@@ -350,7 +407,12 @@ def on_message(channel, method, properties, body):
         def run_scrape():
             try:
                 scoped_logger.info("Starting scrape thread")
-                worker_result["value"] = scrape_tiktok_page(url=url, max_posts=max_posts, on_post=on_post)
+                worker_result["value"] = scrape_tiktok_page(
+                    url=url,
+                    max_posts=max_posts,
+                    on_post=on_post,
+                    analyze_video_content=False,
+                )
             except Exception as exc:
                 scoped_logger.exception("Scrape thread failed")
                 worker_result["error"] = exc
@@ -359,18 +421,34 @@ def on_message(channel, method, properties, body):
 
         threading.Thread(target=run_scrape, daemon=True).start()
 
-        published_sigs = set()
+        published_snapshots = {}
         published_count = 0
+
+        def _payload_snapshot(payload: dict):
+            metrics = payload.get("metrics") or {}
+            return (
+                payload.get("author") or "",
+                payload.get("textContent") or "",
+                metrics.get("likes"),
+                metrics.get("comments"),
+                metrics.get("shares"),
+                metrics.get("views"),
+                payload.get("sourceMediaUrl"),
+                payload.get("mediaPath"),
+                bool(payload.get("videoReport")),
+            )
 
         while True:
             try:
                 post = post_queue.get(timeout=0.5)
                 sig = _post_signature(post)
-                if sig in published_sigs:
-                    continue
-                published_sigs.add(sig)
-                publish_result(channel, normalize_post(scrape_id, url, post))
-                published_count += 1
+                payload = normalize_post(scrape_id, url, post)
+                snapshot = _payload_snapshot(payload)
+                previous = published_snapshots.get(sig)
+                if previous is None or snapshot != previous:
+                    published_snapshots[sig] = snapshot
+                    publish_result(channel, payload)
+                    published_count += 1
             except queue.Empty:
                 if done_event.is_set():
                     break
@@ -394,23 +472,63 @@ def on_message(channel, method, properties, body):
 
         for post in posts:
             sig = _post_signature(post)
-            if sig in published_sigs:
-                continue
-            published_sigs.add(sig)
-            publish_result(channel, normalize_post(scrape_id, url, post))
-            published_count += 1
+            payload = normalize_post(scrape_id, url, post)
+            snapshot = _payload_snapshot(payload)
+            previous = published_snapshots.get(sig)
+            if previous is None or snapshot != previous:
+                published_snapshots[sig] = snapshot
+                publish_result(channel, payload)
+                published_count += 1
+
+        enriched_posts = []
+        enrichment_enabled = _env_bool("TIKTOK_ASYNC_ENRICHMENT_ENABLED", True)
+        enrichment_workers = max(1, int((os.getenv("TIKTOK_ENRICHMENT_WORKERS") or "2").strip()))
+        output_dir = os.getenv("VIDEO_ANALYSIS_OUTPUT_DIR") or "video_reports"
+
+        if enrichment_enabled and posts:
+            scoped_logger.info("Starting async enrichment", extra={"post_id": None})
+            with ThreadPoolExecutor(max_workers=enrichment_workers) as executor:
+                futures = {executor.submit(_enrich_post_video, post, output_dir): post for post in posts}
+                for future in as_completed(futures):
+                    base_post = futures[future]
+                    try:
+                        enriched = future.result()
+                        enriched_posts.append(enriched)
+                        if enriched.get("video_report"):
+                            publish_enrichment_update(
+                                channel=channel,
+                                scrape_id=scrape_id,
+                                url=url,
+                                post=enriched,
+                                event_type="POST_ENRICHED",
+                                success=True,
+                                error_message=None,
+                            )
+                    except Exception as exc:
+                        scoped_logger.warning("Post enrichment failed", exc_info=True)
+                        publish_enrichment_update(
+                            channel=channel,
+                            scrape_id=scrape_id,
+                            url=url,
+                            post=base_post,
+                            event_type="POST_ENRICHMENT_FAILED",
+                            success=False,
+                            error_message=str(exc),
+                        )
+        else:
+            enriched_posts = posts
 
         session_json_path = None
         session_html_path = None
         session_pdf_path = None
 
         try:
-            output_dir = Path(os.getenv("VIDEO_ANALYSIS_OUTPUT_DIR") or "video_reports")
-            raw_posts = result.get("posts", [])
-            session_json = build_session_json_report(page_url=url, posts=raw_posts, output_dir=str(output_dir))
+            session_output_dir = Path(os.getenv("VIDEO_ANALYSIS_OUTPUT_DIR") or "video_reports")
+            raw_posts = enriched_posts if enriched_posts else result.get("posts", [])
+            session_json = build_session_json_report(page_url=url, posts=raw_posts, output_dir=str(session_output_dir))
             session_json_path = session_json.get("json_path")
-            session_html_path = _build_session_html_report(page_url=url, posts=raw_posts, output_dir=output_dir)
-            session_pdf_path = _build_session_pdf_report(posts=raw_posts, output_dir=output_dir)
+            session_html_path = _build_session_html_report(page_url=url, posts=raw_posts, output_dir=session_output_dir)
+            session_pdf_path = _build_session_pdf_report(posts=raw_posts, output_dir=session_output_dir)
         except Exception:
             scoped_logger.exception("Failed to generate session reports")
 

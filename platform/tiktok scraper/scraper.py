@@ -649,7 +649,16 @@ def _enrich_posts_from_video_pages(context, posts: list[dict]) -> list[dict]:
     return enriched
 
 
-def _scrape_with_browser(playwright, profile_url: str, max_posts: int, on_post, headless: bool, slow_mo_ms: int, proxy_cfg: dict | None) -> dict:
+def _scrape_with_browser(
+    playwright,
+    profile_url: str,
+    max_posts: int,
+    on_post,
+    headless: bool,
+    slow_mo_ms: int,
+    proxy_cfg: dict | None,
+    analyze_video_content: bool,
+) -> dict:
     """Pipeline principal de scraping via Playwright.
 
     Etapes:
@@ -786,6 +795,11 @@ def _scrape_with_browser(playwright, profile_url: str, max_posts: int, on_post, 
                     continue
                 seen.add(sig)
                 all_posts.append(card)
+                if on_post is not None:
+                    try:
+                        on_post(dict(card))
+                    except Exception:
+                        LOGGER.warning("on_post callback error", exc_info=True)
                 if len(all_posts) >= max_posts:
                     break
 
@@ -799,6 +813,12 @@ def _scrape_with_browser(playwright, profile_url: str, max_posts: int, on_post, 
         if not all_posts:
             http_posts = _extract_posts_from_html_fallback(profile_url)
             if http_posts:
+                if on_post is not None:
+                    for post in http_posts[:max_posts]:
+                        try:
+                            on_post(dict(post))
+                        except Exception:
+                            LOGGER.warning("on_post callback error", exc_info=True)
                 return {"posts": http_posts[:max_posts], "total": min(len(http_posts), max_posts), "url": profile_url}
             if _looks_like_tiktok_challenge(page):
                 _save_challenge_artifacts(page)
@@ -807,7 +827,10 @@ def _scrape_with_browser(playwright, profile_url: str, max_posts: int, on_post, 
 
         # Post-traitements: enrichissement detail + analyse IA optionnelle.
         enriched_posts = _enrich_posts_from_video_pages(context, all_posts)
-        analyzed_posts = _attach_video_analysis(enriched_posts, on_post=on_post)
+        if analyze_video_content:
+            analyzed_posts = _attach_video_analysis(enriched_posts, on_post=None)
+        else:
+            analyzed_posts = enriched_posts
 
         return {
             "posts": analyzed_posts,
@@ -1142,7 +1165,13 @@ def _warmup_and_open_profile(page, profile_url: str):
     _human_pause(1.8, 0.9)
 
 
-def scrape_tiktok_page(url: str, max_posts: int = 20, on_post=None, headless_override: bool | None = None) -> dict:
+def scrape_tiktok_page(
+    url: str,
+    max_posts: int = 20,
+    on_post=None,
+    headless_override: bool | None = None,
+    analyze_video_content: bool | None = None,
+) -> dict:
     """Point d'entree public: scrape une page TikTok et retourne un resultat.
 
     Orchestration:
@@ -1157,6 +1186,8 @@ def scrape_tiktok_page(url: str, max_posts: int = 20, on_post=None, headless_ove
         headless = _env_bool("TIKTOK_HEADLESS", True)
     else:
         headless = bool(headless_override)
+    if analyze_video_content is None:
+        analyze_video_content = _env_bool("TIKTOK_ANALYZE_VIDEO_CONTENT", False)
     slow_mo_ms = 0 if headless else 150
     proxy_candidates = _load_proxy_candidates()
 
@@ -1173,6 +1204,7 @@ def scrape_tiktok_page(url: str, max_posts: int = 20, on_post=None, headless_ove
                 headless,
                 slow_mo_ms,
                 proxy_cfg,
+                analyze_video_content,
             )
             last_result = result
             if result.get("error") != "challenge_detected":

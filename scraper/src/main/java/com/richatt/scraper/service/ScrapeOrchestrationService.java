@@ -68,6 +68,47 @@ public class ScrapeOrchestrationService {
         return job;
     }
 
+    public ScrapeJob enqueueTikTokCsvBatch(List<String> urls, int maxPostsPerPage) {
+        if (urls == null || urls.isEmpty()) {
+            throw new IllegalArgumentException("No TikTok profile URLs found in uploaded CSV");
+        }
+
+        Instant now = Instant.now();
+        String scrapeId = UUID.randomUUID().toString();
+
+        ScrapeJob job = ScrapeJob.builder()
+                .scrapeId(scrapeId)
+                .url("csv-batch:" + urls.size())
+                .platform(Platform.TIKTOK)
+                .status(ScrapeStatus.QUEUED)
+                .createdAt(now)
+                .updatedAt(now)
+                .build();
+
+        jobRepository.save(job);
+
+        try {
+            taskPublisher.publish(ScrapeTaskMessage.builder()
+                    .scrapeId(scrapeId)
+                    .url(urls.get(0))
+                    .urls(urls)
+                    .platform("tiktok")
+                    .maxPosts(maxPostsPerPage)
+                    .reportMode(true)
+                    .reportType("csv")
+                    .requestedAt(now.toString())
+                    .build());
+        } catch (RuntimeException ex) {
+            job.setStatus(ScrapeStatus.FAILED);
+            job.setErrorMessage("Failed to publish task: " + ex.getMessage());
+            job.setUpdatedAt(Instant.now());
+            jobRepository.save(job);
+            throw ex;
+        }
+
+        return job;
+    }
+
     public Optional<ScrapeJob> getJob(String scrapeId) {
         return jobRepository.findByScrapeId(scrapeId);
     }

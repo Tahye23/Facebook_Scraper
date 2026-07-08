@@ -2,14 +2,17 @@ package com.richatt.scraper.api;
 
 import com.richatt.scraper.api.dto.ScrapeRequest;
 import com.richatt.scraper.api.dto.ScrapeResponse;
+import com.richatt.scraper.api.dto.CsvReportEnqueueResponse;
 import com.richatt.scraper.model.ScrapeJob;
 import com.richatt.scraper.model.Platform;
 import com.richatt.scraper.model.ScrapeResult;
 import com.richatt.scraper.model.ScrapeStatus;
+import com.richatt.scraper.service.CsvUrlExtractor;
 import com.richatt.scraper.service.ScrapeOrchestrationService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -18,6 +21,8 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.RequestPart;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
 import java.util.Map;
@@ -38,6 +43,39 @@ public class ScrapeController {
         return ResponseEntity.accepted().body(
                 new ScrapeResponse(job.getScrapeId(), job.getStatus().name())
         );
+    }
+
+    @PostMapping(value = "/csv-report", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<?> enqueueCsvReport(
+            @RequestPart("file") MultipartFile file,
+            @RequestParam(name = "maxPostsPerPage", defaultValue = "3") int maxPostsPerPage
+    ) {
+        if (maxPostsPerPage < 1 || maxPostsPerPage > 20) {
+            return ResponseEntity.badRequest().body(Map.of("error", "maxPostsPerPage must be between 1 and 20"));
+        }
+
+        List<String> urls;
+        try {
+            urls = CsvUrlExtractor.extractTikTokProfileUrls(file);
+        } catch (IllegalArgumentException ex) {
+            return ResponseEntity.badRequest().body(Map.of("error", ex.getMessage()));
+        }
+
+        if (urls.isEmpty()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "No TikTok profile URLs found in CSV"));
+        }
+
+        try {
+            ScrapeJob job = orchestrationService.enqueueTikTokCsvBatch(urls, maxPostsPerPage);
+            return ResponseEntity.accepted().body(new CsvReportEnqueueResponse(
+                    job.getScrapeId(),
+                    job.getStatus() != null ? job.getStatus().name() : "QUEUED",
+                    urls.size(),
+                    maxPostsPerPage
+            ));
+        } catch (IllegalArgumentException ex) {
+            return ResponseEntity.badRequest().body(Map.of("error", ex.getMessage()));
+        }
     }
 
     @GetMapping("/{scrapeId}")

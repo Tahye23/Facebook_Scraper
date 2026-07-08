@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>__REPORT_TITLE__</title>
+  <style>
+    :root {
+      --navy: #16304d;
+      --navy-soft: #2c5d8a;
+      --line: #c7ced9;
+      --text: #1e2430;
+      --muted: #6b7788;
+      --row-alt: #f5f7fb;
+      --bg: #f2f4f7;
+      --white: #ffffff;
+    }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Noto Naskh Arabic", Tahoma, Arial, sans-serif;
+      line-height: 1.75;
+    }
+    .page {
+      max-width: 960px;
+      margin: 0 auto;
+      background: var(--white);
+      min-height: 100vh;
+      padding: 32px 44px 36px;
+      box-sizing: border-box;
+    }
+    .title { text-align: center; font-size: 46px; color: var(--navy); margin: 8px 0 2px; font-weight: 700; }
+    .subtitle { text-align: center; font-size: 26px; color: #68778b; margin: 0; }
+    .date { text-align: center; font-size: 22px; color: #778497; margin: 0 0 14px; }
+    .rule { height: 1px; background: var(--line); margin: 10px 0 26px; }
+
+    h2 {
+      color: var(--navy);
+      font-size: 34px;
+      margin: 18px 0 6px;
+      font-weight: 700;
+    }
+    p { margin: 0 0 10px; font-size: 24px; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 10px 0 18px;
+      font-size: 21px;
+    }
+    th, td {
+      border: 1px solid #a9b5c6;
+      padding: 8px 10px;
+      vertical-align: middle;
+    }
+    th {
+      background: var(--navy);
+      color: #fff;
+      font-weight: 700;
+    }
+    tbody tr:nth-child(even) td {
+      background: var(--row-alt);
+    }
+    .dot {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      vertical-align: middle;
+    }
+    .appendix-title {
+      color: var(--navy);
+      font-size: 38px;
+      margin-top: 30px;
+      margin-bottom: 6px;
+      font-weight: 700;
+    }
+    .small-note {
+      color: var(--muted);
+      font-size: 18px;
+      margin-top: 8px;
+    }
+    @media print {
+      .page { padding: 20px 24px; }
+      .title { font-size: 32px; }
+      .subtitle, .date { font-size: 17px; }
+      h2 { font-size: 23px; }
+      p { font-size: 15px; }
+      table { font-size: 13px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <h1 class="title">__REPORT_TITLE__</h1>
+    <p class="subtitle">تقرير تحليلي لوسائل التواصل الاجتماعي</p>
+    <p class="date">__REPORT_DATE__</p>
+    <div class="rule"></div>
+
+    <h2>أولا: نظرة عامة على النشاط الرقمي</h2>
+    <p>__OVERVIEW__</p>
+    <p>__SUMMARY_LINE__</p>
+
+    <h2>ثانيا: أبرز المحاور الموضوعية وحجم التفاعل</h2>
+    <table>
+      <thead>
+        <tr>
+          <th></th>
+          <th>مؤشر الإعجاب/المشاهدة</th>
+          <th>مستوى الجودة</th>
+          <th>إجمالي التفاعلات</th>
+          <th>المنشورات</th>
+          <th>الموضوع</th>
+        </tr>
+      </thead>
+      <tbody>
+        __TOPIC_ROWS__
+      </tbody>
+    </table>
+
+    <h2>ثالثا: أكثر المنشورات تفاعلا في الـ 24 ساعة الأخيرة</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>المشاركات</th>
+          <th>التعليقات</th>
+          <th>التفاعلات</th>
+          <th>الوصف</th>
+          <th>المصدر</th>
+          <th>نسبة الإعجاب/المشاهدة</th>
+        </tr>
+      </thead>
+      <tbody>
+        __TOP_POST_ROWS__
+      </tbody>
+    </table>
+
+    <h2>سادسا: الخلاصة والاستنتاجات</h2>
+    <p>__CONCLUSION__</p>
+
+    <h2 class="appendix-title">ملحق – جداول الأداء والرصد</h2>
+
+    <h2>جدول ملخص: أداء المصادر في الـ 24 ساعة الأخيرة</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>المشاركات</th>
+          <th>التعليقات</th>
+          <th>التفاعلات</th>
+          <th>المنشورات</th>
+          <th>الصفحة / المصدر</th>
+        </tr>
+      </thead>
+      <tbody>
+        __SOURCE_ROWS__
+      </tbody>
+    </table>
+
+    <h2>جدول المواضيع الأكثر تفاعلا</h2>
+    <table>
+      <thead>
+        <tr>
+          <th></th>
+          <th>مؤشر الإعجاب/المشاهدة</th>
+          <th>مستوى الجودة</th>
+          <th>إجمالي التفاعلات</th>
+          <th>المنشورات</th>
+          <th>الموضوع</th>
+        </tr>
+      </thead>
+      <tbody>
+        __TOPIC_APPENDIX_ROWS__
+      </tbody>
+    </table>
+
+    <h2>أداء الصفحات الأكثر نشاطاً</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>المشاركات</th>
+          <th>التعليقات</th>
+          <th>التفاعلات</th>
+          <th>المنشورات</th>
+          <th>الصفحة</th>
+        </tr>
+      </thead>
+      <tbody>
+        __ACTIVE_ROWS__
+      </tbody>
+    </table>
+
+    <p class="small-note">تم إنشاء هذا التقرير آليا من نتائج سكرابينغ تيك توك.</p>
+  </main>
+</body>
+</html>

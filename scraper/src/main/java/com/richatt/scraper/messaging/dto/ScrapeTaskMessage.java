@@ -5,6 +5,8 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+import java.util.List;
+
 @Data
 @Builder
 @NoArgsConstructor
@@ -12,7 +14,10 @@ import lombok.NoArgsConstructor;
 public class ScrapeTaskMessage {
     private String scrapeId;
     private String url;
+    private List<String> urls;
     private String platform;
     private Integer maxPosts;
+    private Boolean reportMode;
+    private String reportType;
     private String requestedAt;
 }

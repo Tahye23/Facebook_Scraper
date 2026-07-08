@@ -9,6 +9,7 @@ import org.springframework.data.mongodb.core.index.Indexed;
 import org.springframework.data.mongodb.core.mapping.Document;
 
 import java.time.Instant;
+import java.util.Map;
 
 @Data
 @Builder
@@ -26,6 +27,7 @@ public class ScrapeJob {
     private Platform platform;
     private ScrapeStatus status;
     private String errorMessage;
+    private Map<String, Object> metadata;
     private Instant createdAt;
     private Instant updatedAt;
 }

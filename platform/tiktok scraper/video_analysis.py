@@ -475,8 +475,264 @@ def _analyze_video_with_gemini_sdk(video_path: str) -> dict:
     }
 
 
-def analyze_tiktok_video(video_url: str, output_dir: str | None = None, save_json_report: bool = True) -> dict:
-    """Pipeline complet: telecharger la video TikTok puis l'analyser avec Gemini.
+def _analyze_description_with_gemini_sdk(description_text: str) -> dict:
+    """Analyse uniquement la description texte d'un post TikTok avec Gemini."""
+    api_key = os.getenv("GEMINI_API_KEY", "").strip().strip('"').strip("'")
+    model_name = _resolve_gemini_model_name()
+
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY manquante")
+
+    try:
+        genai = importlib.import_module("google.genai")
+        types = genai.types
+    except Exception as exc:
+        raise RuntimeError(f"google-genai indisponible: {exc}") from exc
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "executive_summary": {"type": "array", "items": {"type": "string"}},
+            "transcript_excerpt": {"type": "string"},
+            "transcript_full": {"type": "string"},
+            "themes": {"type": "array", "items": {"type": "string"}},
+            "visual_elements_detected": {"type": "array", "items": {"type": "string"}},
+            "keywords": {"type": "array", "items": {"type": "string"}},
+            "confidence_and_limits": {
+                "type": "object",
+                "properties": {
+                    "score": {"type": "number"},
+                    "level": {"type": "string"},
+                    "limits": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["score", "level", "limits"],
+            },
+            "audio_language": {"type": "string"},
+            "on_screen_text": {"type": "array", "items": {"type": "string"}},
+            "sentiment": {"type": "string"},
+            "safety_flags": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": [
+            "executive_summary",
+            "transcript_excerpt",
+            "transcript_full",
+            "themes",
+            "visual_elements_detected",
+            "keywords",
+            "confidence_and_limits",
+        ],
+    }
+
+    prompt = (
+        "Tu es un analyste TikTok. Analyse uniquement la description texte fournie et retourne UNIQUEMENT un JSON valide. "
+        "Ne suppose pas l'audio/visuel reel, indique les limites d'analyse basee sur texte. "
+        "Pour confidence_and_limits.level, utilise uniquement: low, medium, high. "
+        "Description: \n" + (description_text or "")
+    )
+
+    client = genai.Client(api_key=api_key)
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_json_schema=schema,
+        temperature=0.2,
+    )
+
+    try:
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[prompt],
+            config=config,
+        )
+    except Exception as exc:
+        msg = str(exc)
+        if "404" in msg and "not found" in msg.lower() and model_name != "gemini-2.5-flash":
+            fallback_model = "gemini-2.5-flash"
+            LOGGER.warning("Gemini model indisponible, retry avec fallback")
+            response = client.models.generate_content(
+                model=fallback_model,
+                contents=[prompt],
+                config=config,
+            )
+            model_name = fallback_model
+        else:
+            raise
+
+    raw_text = getattr(response, "text", "") or ""
+    parsed = _extract_json_from_text(raw_text)
+
+    if not isinstance(parsed, dict):
+        try:
+            candidate = response.candidates[0].content.parts[0].text
+            parsed = _extract_json_from_text(candidate)
+        except Exception:
+            parsed = None
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Gemini n'a pas retourne un JSON exploitable")
+
+    return {
+        "analysis": parsed,
+        "raw": raw_text,
+        "model_name": model_name,
+    }
+
+
+def analyze_videos_json_with_gemini(videos_json_path: str, output_dir: str | None = None) -> dict:
+    """Analyse un JSON consolide de videos TikTok et retourne un rapport arabe.
+
+    Le JSON d'entree doit contenir une liste de videos avec au minimum:
+    - source/page
+    - post_url
+    - description
+    - metrics
+    """
+    input_path = Path(videos_json_path)
+    if not input_path.exists():
+        raise FileNotFoundError(f"Fichier JSON introuvable: {videos_json_path}")
+
+    payload = json.loads(input_path.read_text(encoding="utf-8"))
+    videos = payload.get("videos") if isinstance(payload, dict) else None
+    if not isinstance(videos, list):
+        raise ValueError("Le JSON consolide doit contenir une liste 'videos'")
+
+    # Compacte le payload pour limiter la charge token Gemini.
+    compact_videos = []
+    for item in videos[:300]:
+        if not isinstance(item, dict):
+            continue
+        compact_videos.append(
+            {
+                "source": _safe_text(item.get("source")),
+                "post_url": _safe_text(item.get("post_url") or item.get("sourceUrl")),
+                "author": _safe_text(item.get("author")),
+                "description": _safe_text(item.get("description") or item.get("textContent"))[:700],
+                "likes": item.get("likes"),
+                "comments": item.get("comments"),
+                "shares": item.get("shares"),
+                "views": item.get("views"),
+            }
+        )
+
+    api_key = os.getenv("GEMINI_API_KEY", "").strip().strip('"').strip("'")
+    model_name = _resolve_gemini_model_name()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY manquante")
+
+    try:
+        genai = importlib.import_module("google.genai")
+        types = genai.types
+    except Exception as exc:
+        raise RuntimeError(f"google-genai indisponible: {exc}") from exc
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "report_title_ar": {"type": "string"},
+            "report_date_ar": {"type": "string"},
+            "overview_ar": {"type": "string"},
+            "top_topics_ar": {"type": "array", "items": {"type": "string"}},
+            "videos": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "post_url": {"type": "string"},
+                        "source": {"type": "string"},
+                        "author": {"type": "string"},
+                        "description_ar": {"type": "string"},
+                        "sentiment_ar": {"type": "string"},
+                        "topic_ar": {"type": "string"},
+                    },
+                    "required": ["post_url", "description_ar", "sentiment_ar", "topic_ar"],
+                },
+            },
+            "conclusion_ar": {"type": "string"},
+        },
+        "required": [
+            "report_title_ar",
+            "report_date_ar",
+            "overview_ar",
+            "top_topics_ar",
+            "videos",
+            "conclusion_ar",
+        ],
+    }
+
+    compact_json = json.dumps(compact_videos, ensure_ascii=False)
+    prompt = (
+        "حلل بيانات فيديوهات تيك توك التالية وارجع JSON فقط مطابقا للمخطط المطلوب. "
+        "اكتب كل النصوص باللغة العربية الفصحى. "
+        "لكل فيديو قدم وصفا عربيا موجزا ودقيقا بناء على الوصف النصي فقط. "
+        "تجنب الاختلاق، وإذا كانت البيانات ناقصة اذكر ذلك ضمن الوصف. "
+        "بيانات الفيديوهات:\n" + compact_json
+    )
+
+    client = genai.Client(api_key=api_key)
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_json_schema=schema,
+        temperature=0.2,
+    )
+
+    try:
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[prompt],
+            config=config,
+        )
+    except Exception as exc:
+        msg = str(exc)
+        if "404" in msg and "not found" in msg.lower() and model_name != "gemini-2.5-flash":
+            fallback_model = "gemini-2.5-flash"
+            LOGGER.warning("Gemini model indisponible, retry avec fallback")
+            response = client.models.generate_content(
+                model=fallback_model,
+                contents=[prompt],
+                config=config,
+            )
+            model_name = fallback_model
+        else:
+            raise
+
+    raw_text = getattr(response, "text", "") or ""
+    parsed = _extract_json_from_text(raw_text)
+    if not isinstance(parsed, dict):
+        try:
+            candidate = response.candidates[0].content.parts[0].text
+            parsed = _extract_json_from_text(candidate)
+        except Exception:
+            parsed = None
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Gemini n'a pas retourne un JSON exploitable pour le rapport batch")
+
+    base_output = Path(output_dir or os.getenv("VIDEO_ANALYSIS_OUTPUT_DIR", "video_reports"))
+    base_output.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+    out_path = base_output / f"mauritanie_24h_gemini_{ts}.json"
+    output_payload = {
+        "generated_at": datetime.now(tz=timezone.utc).isoformat(),
+        "model_name": model_name,
+        "input_videos_count": len(compact_videos),
+        "report": parsed,
+        "raw": raw_text,
+    }
+    out_path.write_text(json.dumps(output_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return {
+        "report": parsed,
+        "report_path": str(out_path),
+        "model_name": model_name,
+    }
+
+
+def analyze_tiktok_video(
+    video_url: str,
+    output_dir: str | None = None,
+    save_json_report: bool = True,
+    description_text: str | None = None,
+) -> dict:
+    """Pipeline d'analyse TikTok base sur la description (mode leger).
 
     Retourne un rapport riche pret a etre exploite par worker/scraper.
     """
@@ -487,12 +743,15 @@ def analyze_tiktok_video(video_url: str, output_dir: str | None = None, save_jso
     base_output = Path(output_dir or os.getenv("VIDEO_ANALYSIS_OUTPUT_DIR", "video_reports"))
     base_output.mkdir(parents=True, exist_ok=True)
 
-    # 1) Telechargement local de la video.
-    download_info = _download_video(video_url, base_output)
-    video_path = download_info["video_path"]
+    # LEGACY (temporairement desactive): telechargement video + upload Gemini fichier.
+    # On conserve ce bloc pour reactivation future si necessaire.
+    # download_info = _download_video(video_url, base_output)
+    # video_path = download_info["video_path"]
+    # gemini_result = _analyze_video_with_gemini_sdk(video_path)
 
-    # 2) Analyse IA du fichier video.
-    gemini_result = _analyze_video_with_gemini_sdk(video_path)
+    # Mode rapide: analyse uniquement le texte (description/caption).
+    safe_description = _safe_text(description_text)
+    gemini_result = _analyze_description_with_gemini_sdk(safe_description)
     analysis = gemini_result["analysis"]
 
     # 3) Construction d'un rapport normalise.
@@ -508,18 +767,20 @@ def analyze_tiktok_video(video_url: str, output_dir: str | None = None, save_jso
             {"score": 0.0, "level": "low", "limits": ["missing_confidence_from_model"]},
         ),
         "video_metadata": {
-            "title": download_info.get("title"),
-            "uploader": download_info.get("uploader"),
-            "duration_seconds": download_info.get("duration_seconds"),
-            "webpage_url": download_info.get("webpage_url"),
-            "media_url": download_info.get("media_url"),
-            "tags": download_info.get("tags"),
+            "title": "",
+            "uploader": "",
+            "duration_seconds": None,
+            "webpage_url": video_url,
+            "media_url": "",
+            "tags": [],
+            "description_used": safe_description,
         },
         "artifacts": {
-            "video_path": video_path,
+            "video_path": "",
             "analyzed_at": datetime.now(tz=timezone.utc).isoformat(),
             "model_provider": "google-genai",
             "model_name": gemini_result.get("model_name") or _resolve_gemini_model_name(),
+            "analysis_mode": "description_only",
         },
         "gemini_analysis": analysis,
         "gemini_raw": gemini_result.get("raw"),
@@ -533,7 +794,7 @@ def analyze_tiktok_video(video_url: str, output_dir: str | None = None, save_jso
 
     if save_json_report:
         # Sauvegarde JSON du rapport sur disque avec nom horodate.
-        report_name = _slugify(download_info.get("title") or video_url.split("/")[-1])
+        report_name = _slugify(video_url.split("/")[-1])
         report_path = base_output / f"report_{report_name}_{datetime.now(tz=timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
         with report_path.open("w", encoding="utf-8") as f:
             json.dump(report, f, ensure_ascii=False, indent=2)

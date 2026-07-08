@@ -35,6 +35,17 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def _env_int(name: str, default: int) -> int:
+    """Lit une variable d'environnement entiere avec valeur de secours."""
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        return default
+
+
 def load_cookies() -> list:
     """Charge et normalise les cookies TikTok depuis `tiktok_cookies.json`.
 
@@ -394,16 +405,17 @@ def _extract_posts_from_html_fallback(profile_url: str) -> list:
 def _manual_solve_wait_if_enabled(user_data_dir: str, headless: bool):
     """Pause volontaire pour laisser l'utilisateur resoudre un challenge.
 
-    Active seulement en mode non-headless + profil persistant.
+    Active en mode non-headless. Un profil persistant reste recommande,
+    mais n'est plus strictement requis pour laisser le temps de resoudre
+    le challenge visible dans la fenetre navigateur.
     """
-    if headless or not user_data_dir:
+    if headless:
         return
 
-    raw = (os.getenv("TIKTOK_MANUAL_SOLVE_WAIT_SECONDS") or "0").strip()
-    try:
-        seconds = int(raw)
-    except ValueError:
-        seconds = 0
+    seconds = _env_int("TIKTOK_MANUAL_SOLVE_WAIT_SECONDS", 12)
+
+    if seconds <= 0 and not user_data_dir:
+        seconds = 12
 
     if seconds <= 0:
         return
@@ -413,14 +425,13 @@ def _manual_solve_wait_if_enabled(user_data_dir: str, headless: bool):
 
 def _wait_for_challenge_resolution(page, user_data_dir: str, headless: bool):
     """Attend une resolution manuelle du challenge jusqu'au timeout configure."""
-    if headless or not user_data_dir:
+    if headless:
         return
 
-    raw = (os.getenv("TIKTOK_WAIT_CHALLENGE_RESOLVE_SECONDS") or "0").strip()
-    try:
-        max_seconds = int(raw)
-    except ValueError:
-        max_seconds = 0
+    max_seconds = _env_int("TIKTOK_WAIT_CHALLENGE_RESOLVE_SECONDS", 90)
+
+    if max_seconds <= 0 and not user_data_dir:
+        max_seconds = 90
 
     if max_seconds <= 0:
         return
@@ -495,7 +506,12 @@ def _attach_video_analysis(posts: list[dict], on_post=None) -> list[dict]:
             continue
 
         try:
-            report = analyze_tiktok_video(video_url=post_url, output_dir=output_dir, save_json_report=True)
+            report = analyze_tiktok_video(
+                video_url=post_url,
+                output_dir=output_dir,
+                save_json_report=True,
+                description_text=str(post_copy.get("message") or ""),
+            )
             post_copy["source_media_url"] = report.get("video_metadata", {}).get("media_url")
             post_copy["media_path"] = report.get("artifacts", {}).get("video_path")
             post_copy["video_report"] = build_small_video_report(report)
@@ -1113,7 +1129,17 @@ def _looks_like_tiktok_challenge(page) -> bool:
         except Exception as exc:
             LOGGER.debug("Failed to read page body text", exc_info=True)
 
-        if any(token in body_text for token in ("verify to continue", "security check", "unusual traffic", "complete the captcha")):
+        if any(
+            token in body_text
+            for token in (
+                "verify to continue",
+                "security check",
+                "unusual traffic",
+                "complete the captcha",
+                "something went wrong",
+                "something went wrong. please try again",
+            )
+        ):
             return True
 
         for selector in (

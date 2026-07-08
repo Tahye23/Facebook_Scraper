@@ -48,6 +48,14 @@ public class ScrapeResultListener {
         }
 
         if ("COMPLETED".equalsIgnoreCase(eventType)) {
+            Map<String, Object> sessionReports = getObjectMap(message, "sessionReports", "session_reports");
+            Map<String, Object> batchSummary = getObjectMap(message, "batchSummary", "batch_summary");
+            Map<String, Object> metadata = mergeObjectMaps(sessionReports, batchSummary);
+            if (metadata != null && !metadata.isEmpty()) {
+                job.setMetadata(mergeObjectMaps(job.getMetadata(), metadata));
+                job.setUpdatedAt(Instant.now());
+                jobRepository.save(job);
+            }
             updateJobStatus(job, ScrapeStatus.SUCCESS, null);
             return;
         }

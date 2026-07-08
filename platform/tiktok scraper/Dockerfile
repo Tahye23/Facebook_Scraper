@@ -3,6 +3,8 @@ FROM python:3.12-slim
 WORKDIR /app
 
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y \
     wget curl gnupg ca-certificates \
@@ -10,7 +12,7 @@ RUN apt-get update && apt-get install -y \
     libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
     libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
     libgbm1 libasound2 libpango-1.0-0 libcairo2 libatspi2.0-0 \
-    fonts-liberation fonts-noto-color-emoji \
+    fonts-liberation fonts-noto-color-emoji fonts-dejavu-core fonts-noto-core fonts-noto-extra \
     --no-install-recommends && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

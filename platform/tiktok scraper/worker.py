@@ -32,7 +32,12 @@ if str(REPO_ROOT) not in sys.path:
 
 from logging_setup import get_logger, with_context
 from scraper import scrape_tiktok_page
-from video_analysis import analyze_tiktok_video, build_session_json_report, build_small_video_report
+from video_analysis import (
+    analyze_tiktok_video,
+    analyze_videos_json_with_gemini,
+    build_session_json_report,
+    build_small_video_report,
+)
 
 
 LOGGER = get_logger(__name__, platform="tiktok", service="worker")
@@ -82,6 +87,21 @@ EXCHANGE = os.getenv("RABBITMQ_EXCHANGE", "scrape.exchange")
 QUEUE_CONSUME = os.getenv("RABBITMQ_QUEUE", "scraping_queue_tiktok")
 QUEUE_RESULT = os.getenv("RABBITMQ_RESULT_QUEUE", "scrape_result_queue")
 ROUTING_RESULT = "scrape.result"
+TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
+
+
+def _load_html_template(template_name: str) -> str:
+    """Charge un template HTML depuis le dossier templates du worker."""
+    template_path = TEMPLATE_DIR / template_name
+    return template_path.read_text(encoding="utf-8")
+
+
+def _render_html_template(template_name: str, replacements: dict[str, str]) -> str:
+    """Rend un template HTML par remplacement de placeholders simples."""
+    html = _load_html_template(template_name)
+    for key, value in replacements.items():
+        html = html.replace(key, value)
+    return html
 
 
 def _to_int(value) -> int:
@@ -133,19 +153,18 @@ def _build_session_html_report(page_url: str, posts: list[dict], output_dir: Pat
             "</tr>"
         )
 
-    template_path = Path(__file__).resolve().parent / "templates" / "session_report.html"
-    template_html = template_path.read_text(encoding="utf-8")
-
-    html = (
-        template_html
-        .replace("__PAGE_URL__", escape(page_url))
-        .replace("__GENERATED_AT__", datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
-        .replace("__TOTAL_POSTS__", str(total_posts))
-        .replace("__TOTAL_LIKES__", str(total_likes))
-        .replace("__TOTAL_COMMENTS__", str(total_comments))
-        .replace("__TOTAL_SHARES__", str(total_shares))
-        .replace("__TOTAL_VIEWS__", str(total_views))
-        .replace("__ROWS__", "".join(rows))
+    html = _render_html_template(
+        "session_report.html",
+        {
+            "__PAGE_URL__": escape(page_url),
+            "__GENERATED_AT__": datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "__TOTAL_POSTS__": str(total_posts),
+            "__TOTAL_LIKES__": str(total_likes),
+            "__TOTAL_COMMENTS__": str(total_comments),
+            "__TOTAL_SHARES__": str(total_shares),
+            "__TOTAL_VIEWS__": str(total_views),
+            "__ROWS__": "".join(rows),
+        },
     )
 
     out_path.write_text(html, encoding="utf-8")
@@ -354,15 +373,1008 @@ def _env_bool(name: str, default: bool) -> bool:
 def _enrich_post_video(post: dict, output_dir: str) -> dict:
     post_copy = dict(post)
     post_url = str(post_copy.get("post_url") or "").strip()
+    post_description = str(post_copy.get("message") or "").strip()
     if not post_url or "/video/" not in post_url:
         return post_copy
 
-    report = analyze_tiktok_video(video_url=post_url, output_dir=output_dir, save_json_report=True)
+    report = analyze_tiktok_video(
+        video_url=post_url,
+        output_dir=output_dir,
+        save_json_report=True,
+        description_text=post_description,
+    )
     post_copy["source_media_url"] = report.get("video_metadata", {}).get("media_url")
     post_copy["media_path"] = report.get("artifacts", {}).get("video_path")
     post_copy["video_report"] = build_small_video_report(report)
     post_copy["message"] = post_copy.get("message") or report.get("transcript_excerpt") or ""
     return post_copy
+
+
+def _build_batch_pages_report(scrape_id: str, source_rows: list[dict], failed_pages: list[dict], output_dir: Path) -> str:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+    out_path = output_dir / f"csv_pages_report_{scrape_id}_{ts}.json"
+
+    payload = {
+        "scrape_id": scrape_id,
+        "generated_at": datetime.now(tz=timezone.utc).isoformat(),
+        "pages_total": len(source_rows) + len(failed_pages),
+        "pages_succeeded": len(source_rows),
+        "pages_failed": len(failed_pages),
+        "pages": source_rows,
+        "failed_pages": failed_pages,
+    }
+
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(out_path)
+
+
+def _save_batch_videos_json(scrape_id: str, videos: list[dict], output_dir: Path) -> str:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+    out_path = output_dir / f"batch_videos_{scrape_id}_{ts}.json"
+    payload = {
+        "scrape_id": scrape_id,
+        "generated_at": datetime.now(tz=timezone.utc).isoformat(),
+        "videos_count": len(videos),
+        "videos": videos,
+    }
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(out_path)
+
+
+def _build_mauritanie_24h_html_report(
+    scrape_id: str,
+    source_rows: list[dict],
+    gemini_report: dict,
+    videos_payload: list[dict] | None,
+    output_dir: Path,
+) -> str | None:
+    """Genere une version HTML stylisee du rapport Mauritanie 24h via template externe."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+    out_path = output_dir / f"mauritanie_24h_{scrape_id}_{ts}.html"
+
+    def _int_value(value) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    def _ratio_color(ratio: float | None) -> str:
+        if ratio is None:
+            return "#9AA5B1"
+        if ratio >= 0.08:
+            return "#58A65C"
+        if ratio >= 0.03:
+            return "#F2C94C"
+        return "#E35D5D"
+
+    def _ratio_label(ratio: float | None) -> str:
+        if ratio is None:
+            return "غير متاح"
+        if ratio >= 0.08:
+            return "مرتفع"
+        if ratio >= 0.03:
+            return "متوسط"
+        return "ضعيف"
+
+    def _source_label(url: str) -> str:
+        raw = str(url or "").strip()
+        if not raw:
+            return "مصدر غير معروف"
+        if "share" in raw.lower() and "/video/" not in raw.lower():
+            return "منشورات مشتركة"
+        try:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(raw)
+            if parsed.netloc:
+                return parsed.netloc.replace("www.", "")
+        except Exception:
+            pass
+        return raw[:48]
+
+    def _normalize_date(text: str) -> str:
+        raw = str(text or "").strip()
+        if len(raw) >= 10 and raw[4] == "-" and raw[7] == "-":
+            month_names = {
+                "01": "يناير",
+                "02": "فبراير",
+                "03": "مارس",
+                "04": "أبريل",
+                "05": "مايو",
+                "06": "يونيو",
+                "07": "يوليو",
+                "08": "أغسطس",
+                "09": "سبتمبر",
+                "10": "أكتوبر",
+                "11": "نوفمبر",
+                "12": "ديسمبر",
+            }
+            return f"{int(raw[8:10])} {month_names.get(raw[5:7], raw[5:7])} {raw[:4]}"
+        return raw or datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+
+    videos_payload = videos_payload or []
+    source_rows = source_rows or []
+    video_items = gemini_report.get("videos") or []
+
+    total_posts = sum(_int_value(row.get("posts")) for row in source_rows)
+    total_likes = sum(_int_value(row.get("likes")) for row in source_rows)
+    total_comments = sum(_int_value(row.get("comments")) for row in source_rows)
+    total_shares = sum(_int_value(row.get("shares")) for row in source_rows)
+    total_interactions = total_likes + total_comments + total_shares
+
+    metrics_by_post = {}
+    for item in videos_payload:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("post_url") or item.get("sourceUrl") or "").strip()
+        if key:
+            metrics_by_post[key] = item
+
+    topic_rows = []
+    grouped = {}
+    for item in video_items:
+        if not isinstance(item, dict):
+            continue
+        topic_name = str(item.get("topic_ar") or "محتوى عام").strip() or "محتوى عام"
+        post_key = str(item.get("post_url") or "").strip()
+        joined = metrics_by_post.get(post_key, {})
+        likes = _int_value(joined.get("likes"))
+        views = _int_value(joined.get("views"))
+        comments = _int_value(joined.get("comments"))
+        shares = _int_value(joined.get("shares"))
+
+        bucket = grouped.setdefault(topic_name, {"posts": 0, "interactions": 0, "likes": 0, "views": 0})
+        bucket["posts"] += 1
+        bucket["interactions"] += likes + comments + shares
+        bucket["likes"] += likes
+        bucket["views"] += views
+
+    for topic_name, stats in sorted(grouped.items(), key=lambda pair: pair[1]["interactions"], reverse=True):
+        ratio = (stats["likes"] / stats["views"]) if stats["views"] > 0 else None
+        ratio_text = f"{ratio * 100:.1f}%" if ratio is not None else "N/A"
+        topic_rows.append(
+            "<tr>"
+            f"<td><span class='dot' style='background:{_ratio_color(ratio)}'></span></td>"
+            f"<td>{escape(ratio_text)}</td>"
+            f"<td>{escape(_ratio_label(ratio))}</td>"
+            f"<td>{stats['interactions']:,}</td>"
+            f"<td>{stats['posts']:,}</td>"
+            f"<td>{escape(topic_name)}</td>"
+            "</tr>"
+        )
+
+    top_posts_rows = []
+    ranked_posts = []
+    for item in videos_payload:
+        if not isinstance(item, dict):
+            continue
+        likes = _int_value(item.get("likes"))
+        comments = _int_value(item.get("comments"))
+        shares = _int_value(item.get("shares"))
+        views = _int_value(item.get("views"))
+        ratio = (likes / views) if views > 0 else None
+        ranked_posts.append(
+            {
+                "source": _source_label(item.get("source") or item.get("post_url") or ""),
+                "description": str(item.get("description") or "").strip(),
+                "interactions": likes + comments + shares,
+                "comments": comments,
+                "shares": shares,
+                "ratio": ratio,
+            }
+        )
+
+    ranked_posts.sort(key=lambda row: row["interactions"], reverse=True)
+    for row in ranked_posts[:5]:
+        ratio_text = f"{row['ratio'] * 100:.1f}%" if row["ratio"] is not None else "N/A"
+        top_posts_rows.append(
+            "<tr>"
+            f"<td>{row['shares']:,}</td>"
+            f"<td>{row['comments']:,}</td>"
+            f"<td>{row['interactions']:,}</td>"
+            f"<td>{escape((row['description'][:120] + '…') if len(row['description']) > 120 else row['description'] or '—')}</td>"
+            f"<td>{escape(row['source'])}</td>"
+            f"<td><span class='dot' style='background:{_ratio_color(row['ratio'])}'></span> {escape(ratio_text)}</td>"
+            "</tr>"
+        )
+
+    source_rows_html = []
+    for row in sorted(source_rows, key=lambda r: (_int_value(r.get("likes")) + _int_value(r.get("comments")) + _int_value(r.get("shares"))), reverse=True):
+        interactions = _int_value(row.get("likes")) + _int_value(row.get("comments")) + _int_value(row.get("shares"))
+        source_rows_html.append(
+            "<tr>"
+            f"<td>{_int_value(row.get('shares')):,}</td>"
+            f"<td>{_int_value(row.get('comments')):,}</td>"
+            f"<td>{interactions:,}</td>"
+            f"<td>{_int_value(row.get('posts')):,}</td>"
+            f"<td>{escape(_source_label(row.get('source')))}</td>"
+            "</tr>"
+        )
+
+    html = _render_html_template(
+        "mauritanie_24h_report.html",
+        {
+            "__REPORT_TITLE__": escape(str(gemini_report.get("report_title_ar") or "موريتانيا في الـ 24 ساعة الماضية")),
+            "__REPORT_DATE__": escape(_normalize_date(datetime.now(tz=timezone.utc).strftime("%Y-%m-%d"))),
+            "__OVERVIEW__": escape(str(gemini_report.get("overview_ar") or "")),
+            "__SUMMARY_LINE__": escape(
+                f"رصد هذا التقرير {total_posts:,} منشورا من {len(source_rows)} مصادر، بإجمالي {total_interactions:,} تفاعلا و{total_comments:,} تعليقا و{total_shares:,} مشاركة."
+            ),
+            "__TOPIC_ROWS__": "".join(topic_rows) or "<tr><td colspan='6'>لا توجد بيانات كافية</td></tr>",
+            "__TOP_POST_ROWS__": "".join(top_posts_rows) or "<tr><td colspan='6'>لا توجد بيانات كافية</td></tr>",
+            "__CONCLUSION__": escape(str(gemini_report.get("conclusion_ar") or "")),
+            "__SOURCE_ROWS__": "".join(source_rows_html) or "<tr><td colspan='5'>لا توجد بيانات كافية</td></tr>",
+            "__TOPIC_APPENDIX_ROWS__": "".join(topic_rows) or "<tr><td colspan='6'>لا توجد بيانات كافية</td></tr>",
+            "__ACTIVE_ROWS__": "".join(source_rows_html) or "<tr><td colspan='5'>لا توجد بيانات كافية</td></tr>",
+        },
+    )
+
+    out_path.write_text(html, encoding="utf-8")
+    return str(out_path)
+
+
+def _build_mauritanie_24h_pdf(
+    scrape_id: str,
+    source_rows: list[dict],
+    gemini_report: dict,
+    videos_payload: list[dict] | None,
+    output_dir: Path,
+) -> str | None:
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from reportlab.platypus import Flowable
+        from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+        from reportlab.platypus.flowables import HRFlowable
+    except Exception:
+        return None
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+    out_path = output_dir / f"mauritanie_24h_{scrape_id}_{ts}.pdf"
+
+    def _shape_ar(text: str) -> str:
+        base = str(text or "")
+        try:
+            import arabic_reshaper
+            from bidi.algorithm import get_display
+
+            return get_display(arabic_reshaper.reshape(base))
+        except Exception:
+            return base
+
+    def _normalize_date(text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return datetime.now(tz=timezone.utc).strftime("%d %B %Y")
+
+        month_names = {
+            "01": "يناير",
+            "02": "فبراير",
+            "03": "مارس",
+            "04": "أبريل",
+            "05": "مايو",
+            "06": "يونيو",
+            "07": "يوليو",
+            "08": "أغسطس",
+            "09": "سبتمبر",
+            "10": "أكتوبر",
+            "11": "نوفمبر",
+            "12": "ديسمبر",
+        }
+        if len(raw) >= 10 and raw[4] == "-" and raw[7] == "-":
+            try:
+                day = str(int(raw[8:10]))
+                month = month_names.get(raw[5:7], raw[5:7])
+                year = raw[:4]
+                return f"{day} {month} {year}"
+            except Exception:
+                return raw
+        return raw
+
+    def _int_value(value) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    def _source_label(url: str) -> str:
+        raw = str(url or "").strip()
+        if not raw:
+            return "مصدر غير معروف"
+        if "share" in raw.lower() and "/video/" not in raw.lower():
+            return "منشورات مشتركة"
+        try:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(raw)
+            if parsed.netloc:
+                return parsed.netloc.replace("www.", "")
+        except Exception:
+            pass
+        return raw[:42]
+
+    def _truncate(text: str, limit: int = 120) -> str:
+        raw = str(text or "").strip()
+        if len(raw) <= limit:
+            return raw
+        return raw[: limit - 1].rstrip() + "…"
+
+    def _make_para(text: str, style: ParagraphStyle) -> Paragraph:
+        return Paragraph(_shape_ar(text), style)
+
+    class RTLTextBlock(Flowable):
+        def __init__(self, text: str, style: ParagraphStyle, width: float):
+            super().__init__()
+            self.text = str(text or "")
+            self.style = style
+            self.width = width
+            self.leading = getattr(style, "leading", style.fontSize * 1.35)
+            self.font_name = style.fontName
+            self.font_size = style.fontSize
+            self.text_color = style.textColor
+            self.space_before = getattr(style, "spaceBefore", 0)
+            self.space_after = getattr(style, "spaceAfter", 0)
+            self.alignment = getattr(style, "alignment", TA_RIGHT)
+            self.lines = []
+
+        def wrap(self, availWidth, availHeight):
+            usable_width = min(self.width, availWidth)
+            words = self.text.split()
+            if not words:
+                self.lines = [""]
+                return usable_width, self.leading + self.space_before + self.space_after
+
+            lines = []
+            current_words = []
+
+            def line_width(line_text: str) -> float:
+                shaped = _shape_ar(line_text)
+                return pdfmetrics.stringWidth(shaped, self.font_name, self.font_size)
+
+            for word in words:
+                trial_words = current_words + [word]
+                trial_text = " ".join(trial_words)
+                if current_words and line_width(trial_text) > usable_width:
+                    lines.append(" ".join(current_words))
+                    current_words = [word]
+                else:
+                    current_words.append(word)
+
+            if current_words:
+                lines.append(" ".join(current_words))
+
+            self.lines = lines or [self.text]
+            height = self.space_before + self.space_after + len(self.lines) * self.leading
+            return usable_width, height
+
+        def draw(self):
+            self.canv.saveState()
+            self.canv.setFont(self.font_name, self.font_size)
+            self.canv.setFillColor(self.text_color)
+            width = self.width
+            y = (len(self.lines) - 1) * self.leading
+            for line in self.lines:
+                shaped = _shape_ar(line)
+                if self.alignment == TA_CENTER:
+                    self.canv.drawCentredString(width / 2, y, shaped)
+                else:
+                    self.canv.drawRightString(width, y, shaped)
+                y -= self.leading
+            self.canv.restoreState()
+
+    def _metric_total(row: dict) -> int:
+        return _int_value(row.get("likes")) + _int_value(row.get("comments")) + _int_value(row.get("shares"))
+
+    videos_payload = videos_payload or []
+    source_rows = source_rows or []
+
+    font_name = "Helvetica"
+    font_env = (os.getenv("TIKTOK_ARABIC_FONT_PATH") or "").strip()
+    font_candidates = [
+        Path(font_env) if font_env else None,
+        Path("C:/Windows/Fonts/arial.ttf"),
+        Path("C:/Windows/Fonts/tahoma.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+    ]
+    for candidate in font_candidates:
+        if candidate and candidate.exists():
+            try:
+                pdfmetrics.registerFont(TTFont("ArabicUI", str(candidate)))
+                font_name = "ArabicUI"
+                break
+            except Exception:
+                continue
+
+    report_title = gemini_report.get("report_title_ar") or "موريتانيا في الـ 24 ساعة الماضية"
+    report_date = _normalize_date(datetime.now(tz=timezone.utc).strftime("%Y-%m-%d"))
+    overview = gemini_report.get("overview_ar") or ""
+    top_topics = gemini_report.get("top_topics_ar") or []
+    video_items = gemini_report.get("videos") or []
+    conclusion = gemini_report.get("conclusion_ar") or ""
+
+    doc = SimpleDocTemplate(
+        str(out_path),
+        pagesize=A4,
+        leftMargin=36,
+        rightMargin=36,
+        topMargin=34,
+        bottomMargin=28,
+    )
+    page_width = doc.width
+
+    colors_map = {
+        "navy": colors.HexColor("#173F67"),
+        "navy_dark": colors.HexColor("#16304D"),
+        "navy_mid": colors.HexColor("#2C5D8A"),
+        "steel": colors.HexColor("#7A8798"),
+        "line": colors.HexColor("#C7CED9"),
+        "row_alt": colors.HexColor("#F5F7FB"),
+        "row_alt2": colors.HexColor("#EEF3F9"),
+        "green": colors.HexColor("#58A65C"),
+        "yellow": colors.HexColor("#F2C94C"),
+        "red": colors.HexColor("#E35D5D"),
+        "text": colors.HexColor("#1E2430"),
+    }
+
+    styles = {
+        "title": ParagraphStyle(
+            "title",
+            fontName=font_name,
+            fontSize=21,
+            leading=25,
+            alignment=TA_CENTER,
+            textColor=colors_map["navy_dark"],
+            spaceAfter=2,
+        ),
+        "subtitle": ParagraphStyle(
+            "subtitle",
+            fontName=font_name,
+            fontSize=11,
+            leading=14,
+            alignment=TA_CENTER,
+            textColor=colors_map["steel"],
+            spaceAfter=1,
+        ),
+        "date": ParagraphStyle(
+            "date",
+            fontName=font_name,
+            fontSize=10,
+            leading=12,
+            alignment=TA_CENTER,
+            textColor=colors_map["steel"],
+            spaceAfter=6,
+        ),
+        "section": ParagraphStyle(
+            "section",
+            fontName=font_name,
+            fontSize=13,
+            leading=16,
+            alignment=TA_RIGHT,
+            textColor=colors_map["navy_dark"],
+            spaceBefore=8,
+            spaceAfter=5,
+            bold=True,
+        ),
+        "subsection": ParagraphStyle(
+            "subsection",
+            fontName=font_name,
+            fontSize=11.5,
+            leading=14,
+            alignment=TA_RIGHT,
+            textColor=colors_map["navy_mid"],
+            spaceBefore=5,
+            spaceAfter=3,
+            bold=True,
+        ),
+        "body": ParagraphStyle(
+            "body",
+            fontName=font_name,
+            fontSize=10.5,
+            leading=16,
+            alignment=TA_RIGHT,
+            textColor=colors_map["text"],
+            spaceAfter=6,
+        ),
+        "small": ParagraphStyle(
+            "small",
+            fontName=font_name,
+            fontSize=9,
+            leading=12,
+            alignment=TA_RIGHT,
+            textColor=colors_map["text"],
+        ),
+        "table_header": ParagraphStyle(
+            "table_header",
+            fontName=font_name,
+            fontSize=9,
+            leading=11,
+            alignment=TA_CENTER,
+            textColor=colors.white,
+        ),
+        "table_cell": ParagraphStyle(
+            "table_cell",
+            fontName=font_name,
+            fontSize=8.6,
+            leading=11,
+            alignment=TA_RIGHT,
+            textColor=colors_map["text"],
+        ),
+        "table_cell_center": ParagraphStyle(
+            "table_cell_center",
+            fontName=font_name,
+            fontSize=8.6,
+            leading=11,
+            alignment=TA_CENTER,
+            textColor=colors_map["text"],
+        ),
+    }
+
+    total_posts = sum(_int_value(row.get("posts")) for row in source_rows)
+    total_likes = sum(_int_value(row.get("likes")) for row in source_rows)
+    total_comments = sum(_int_value(row.get("comments")) for row in source_rows)
+    total_shares = sum(_int_value(row.get("shares")) for row in source_rows)
+    total_interactions = total_likes + total_comments + total_shares
+    total_sources = len(source_rows)
+
+    video_join = {}
+    for item in videos_payload:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("post_url") or item.get("sourceUrl") or "").strip()
+        if key:
+            video_join[key] = item
+
+    topic_groups: dict[str, dict] = {}
+    for item in video_items:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("topic_ar") or "محتوى عام").strip() or "محتوى عام"
+        joined = video_join.get(str(item.get("post_url") or "").strip(), {})
+        bucket = topic_groups.setdefault(
+            key,
+            {
+                "posts": 0,
+                "interactions": 0,
+                "likes": 0,
+                "views": 0,
+            },
+        )
+        likes = _int_value(joined.get("likes"))
+        comments = _int_value(joined.get("comments"))
+        shares = _int_value(joined.get("shares"))
+        views = _int_value(joined.get("views"))
+        bucket["posts"] += 1
+        bucket["interactions"] += likes + comments + shares
+        bucket["likes"] += likes
+        bucket["views"] += views
+
+    topic_rows = []
+    for topic_name, stats in sorted(topic_groups.items(), key=lambda item: item[1]["interactions"], reverse=True):
+        likes_views_ratio = (stats["likes"] / stats["views"]) if stats["views"] > 0 else None
+        if likes_views_ratio is None:
+            dot_color = colors_map["steel"]
+            quality_label = "غير متاح"
+        elif likes_views_ratio >= 0.08:
+            dot_color = colors_map["green"]
+            quality_label = "مرتفع"
+        elif likes_views_ratio >= 0.03:
+            dot_color = colors_map["yellow"]
+            quality_label = "متوسط"
+        else:
+            dot_color = colors_map["red"]
+            quality_label = "ضعيف"
+
+        trend_text = f"{likes_views_ratio * 100:.1f}%" if likes_views_ratio is not None else "N/A"
+        topic_rows.append(
+            [
+                _make_para(f'<font color="#{dot_color.hexval()[2:]}">●</font>', styles["table_cell_center"]),
+                _make_para(trend_text, styles["table_cell_center"]),
+                _make_para(quality_label, styles["table_cell_center"]),
+                _make_para(f'{stats["interactions"]:,}', styles["table_cell_center"]),
+                _make_para(f'{stats["posts"]:,}', styles["table_cell_center"]),
+                _make_para(topic_name, styles["table_cell"]),
+            ]
+        )
+
+    def _build_table(data: list[list], col_widths: list[float], header_fill=colors_map["navy_dark"], row_heights=None):
+        table = Table(data, colWidths=col_widths, repeatRows=1, rowHeights=row_heights)
+        style_cmds = [
+            ("BACKGROUND", (0, 0), (-1, 0), header_fill),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, -1), font_name),
+            ("FONTSIZE", (0, 0), (-1, -1), 8.6),
+            ("LEADING", (0, 0), (-1, -1), 11),
+            ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#A9B5C6")),
+            ("BOX", (0, 0), (-1, -1), 0.7, colors.HexColor("#A9B5C6")),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]
+        for row_index in range(1, len(data)):
+            bg = colors_map["row_alt"] if row_index % 2 else colors.white
+            style_cmds.append(("BACKGROUND", (0, row_index), (-1, row_index), bg))
+        table.setStyle(TableStyle(style_cmds))
+        return table
+
+    def _source_interaction(row: dict) -> int:
+        return _int_value(row.get("likes")) + _int_value(row.get("comments")) + _int_value(row.get("shares"))
+
+    story = []
+    story.append(Spacer(1, 3))
+    story.append(_make_para(report_title, styles["title"]))
+    story.append(_make_para("تقرير تحليلي لوسائل التواصل الاجتماعي", styles["subtitle"]))
+    story.append(_make_para(report_date, styles["date"]))
+    story.append(Spacer(1, 4))
+    story.append(HRFlowable(width="100%", thickness=1, color=colors_map["line"], spaceBefore=0, spaceAfter=0))
+    story.append(Spacer(1, 10))
+
+    story.append(_make_para("أولا: نظرة عامة على النشاط الرقمي", styles["section"]))
+    story.append(RTLTextBlock(overview, styles["body"], doc.width))
+
+    summary_line = (
+        f"رصد هذا التقرير ما مجموعه {total_posts:,} منشورا خلال الـ 24 ساعة الماضية، "
+        f"صدرت عن {total_sources} مصادر متنوعة، وسجلت {total_interactions:,} تفاعلا، "
+        f"و{total_comments:,} تعليقا، و{total_shares:,} مشاركة."
+    )
+    story.append(RTLTextBlock(summary_line, styles["body"], doc.width))
+
+    story.append(_make_para("ثانيا: أبرز المحاور الموضوعية وحجم التفاعل", styles["section"]))
+    if topic_rows:
+        topic_table_data = [[
+            _make_para("", styles["table_header"]),
+            _make_para("مؤشر الإعجاب/المشاهدة", styles["table_header"]),
+            _make_para("مستوى الجودة", styles["table_header"]),
+            _make_para("إجمالي التفاعلات", styles["table_header"]),
+            _make_para("المنشورات", styles["table_header"]),
+            _make_para("الموضوع", styles["table_header"]),
+        ]]
+        topic_table_data.extend(topic_rows)
+        topic_widths = [16, 74, 76, 84, 58, max(160, page_width - 308)]
+        story.append(_build_table(topic_table_data, topic_widths))
+    else:
+        story.append(RTLTextBlock("لا توجد بيانات كافية لتوليد جدول المحاور الموضوعية.", styles["body"], doc.width))
+
+    story.append(_make_para("ثالثا: أبرز الأحداث والقضايا الساخنة", styles["section"]))
+    for idx, item in enumerate(video_items[:3], start=1):
+        topic_name = _truncate(item.get("topic_ar") or "محتوى عام", 70)
+        heading = f"{idx}. {topic_name}"
+        story.append(_make_para(heading, styles["subsection"]))
+        story.append(RTLTextBlock(item.get("description_ar") or item.get("description") or "لا توجد تفاصيل كافية.", styles["body"], doc.width))
+
+    top_posts = []
+    for item in videos_payload:
+        if not isinstance(item, dict):
+            continue
+        interactions = _metric_total(item)
+        top_posts.append(
+            {
+                "source": _source_label(item.get("source") or item.get("post_url") or ""),
+                "description": _truncate(item.get("description") or item.get("description_ar") or "", 110),
+                "likes": _int_value(item.get("likes")),
+                "comments": _int_value(item.get("comments")),
+                "shares": _int_value(item.get("shares")),
+                "interactions": interactions,
+            }
+        )
+    top_posts.sort(key=lambda row: row["interactions"], reverse=True)
+
+    story.append(_make_para("رابعا: أكثر المنشورات تفاعلا في الـ 24 ساعة الأخيرة", styles["section"]))
+    if top_posts:
+        top_post_data = [[
+            _make_para("المشاركات", styles["table_header"]),
+            _make_para("التعليقات", styles["table_header"]),
+            _make_para("التفاعلات", styles["table_header"]),
+            _make_para("الموضوع / الوصف", styles["table_header"]),
+            _make_para("الصفحة / المصدر", styles["table_header"]),
+        ]]
+        for row in top_posts[:5]:
+            top_post_data.append(
+                [
+                    _make_para(f"{row['shares']:,}", styles["table_cell_center"]),
+                    _make_para(f"{row['comments']:,}", styles["table_cell_center"]),
+                    _make_para(f"{row['interactions']:,}", styles["table_cell_center"]),
+                    _make_para(row["description"] or "—", styles["table_cell"]),
+                    _make_para(row["source"], styles["table_cell"]),
+                ]
+            )
+        top_post_widths = [52, 58, 68, max(130, page_width - 318), 110]
+        story.append(_build_table(top_post_data, top_post_widths, header_fill=colors_map["navy"]))
+
+    story.append(_make_para("خامسا: تحليل التفاعل والمؤشرات الرقمية", styles["section"]))
+    avg_interactions = (total_interactions / total_posts) if total_posts else 0
+    avg_comments = (total_comments / total_posts) if total_posts else 0
+    avg_shares = (total_shares / total_posts) if total_posts else 0
+    analysis_text = (
+        f"متوسط التفاعل لكل منشور بلغ نحو {avg_interactions:,.0f}، مع متوسط {avg_comments:,.0f} تعليق لكل منشور، "
+        f"و{avg_shares:,.0f} مشاركة. وتظهر البيانات أن التفاعل يتركز أساسا حول القضايا السياسية والاجتماعية ذات الأثر المباشر."
+    )
+    story.append(RTLTextBlock(analysis_text, styles["body"], doc.width))
+
+    story.append(_make_para("سادسا: الخلاصة والاستنتاجات", styles["section"]))
+    story.append(RTLTextBlock(conclusion, styles["body"], doc.width))
+
+    story.append(PageBreak())
+    story.append(_make_para("ملحق – جداول الأداء والرصد", styles["section"]))
+    story.append(_make_para("جدول ملخص: أداء المصادر في الـ 24 ساعة الأخيرة", styles["subsection"]))
+    if source_rows:
+        sorted_sources = sorted(source_rows, key=_source_interaction, reverse=True)
+        source_table = [[
+            _make_para("المشاركات", styles["table_header"]),
+            _make_para("التعليقات", styles["table_header"]),
+            _make_para("التفاعلات", styles["table_header"]),
+            _make_para("المنشورات", styles["table_header"]),
+            _make_para("الصفحة / المصدر", styles["table_header"]),
+        ]]
+        for row in sorted_sources:
+            source_table.append(
+                [
+                    _make_para(f"{_int_value(row.get('shares')):,}", styles["table_cell_center"]),
+                    _make_para(f"{_int_value(row.get('comments')):,}", styles["table_cell_center"]),
+                    _make_para(f"{_source_interaction(row):,}", styles["table_cell_center"]),
+                    _make_para(f"{_int_value(row.get('posts')):,}", styles["table_cell_center"]),
+                    _make_para(_source_label(row.get("source")), styles["table_cell"]),
+                ]
+            )
+        source_table.append(
+            [
+                _make_para(f"{total_shares:,}", styles["table_cell_center"]),
+                _make_para(f"{total_comments:,}", styles["table_cell_center"]),
+                _make_para(f"{total_interactions:,}", styles["table_cell_center"]),
+                _make_para(f"{total_posts:,}", styles["table_cell_center"]),
+                _make_para("الإجمالي", styles["table_cell"]),
+            ]
+        )
+        source_widths = [58, 62, 78, 62, max(150, page_width - 310)]
+        story.append(_build_table(source_table, source_widths, header_fill=colors_map["navy_dark"]))
+
+    story.append(Spacer(1, 12))
+    story.append(_make_para("جدول المواضيع الأكثر تفاعلا – أبريل 2026", styles["subsection"]))
+    if topic_rows:
+        appendix_topic_table = [[
+            _make_para("", styles["table_header"]),
+            _make_para("مؤشر الإعجاب/المشاهدة", styles["table_header"]),
+            _make_para("مستوى الجودة", styles["table_header"]),
+            _make_para("إجمالي التفاعلات", styles["table_header"]),
+            _make_para("المنشورات", styles["table_header"]),
+            _make_para("الموضوع", styles["table_header"]),
+        ]]
+        for row in topic_rows[:8]:
+            appendix_topic_table.append([row[0], row[1], row[2], row[3], row[4], row[5]])
+        topic_widths = [16, 74, 76, 84, 58, max(170, page_width - 318)]
+        story.append(_build_table(appendix_topic_table, topic_widths, header_fill=colors_map["navy"]))
+
+    if source_rows:
+        story.append(Spacer(1, 12))
+        story.append(_make_para("أداء الصفحات الأكثر نشاطاً – أبريل 2026", styles["subsection"]))
+        active_sources = sorted(source_rows, key=_source_interaction, reverse=True)
+        active_table = [[
+            _make_para("إجمالي التفاعل", styles["table_header"]),
+            _make_para("المشاركات", styles["table_header"]),
+            _make_para("التعليقات", styles["table_header"]),
+            _make_para("التفاعلات", styles["table_header"]),
+            _make_para("المنشورات", styles["table_header"]),
+            _make_para("الصفحة", styles["table_header"]),
+        ]]
+        for row in active_sources:
+            total_interaction = _source_interaction(row)
+            active_table.append(
+                [
+                    _make_para(f"{total_interaction:,}", styles["table_cell_center"]),
+                    _make_para(f"{_int_value(row.get('shares')):,}", styles["table_cell_center"]),
+                    _make_para(f"{_int_value(row.get('comments')):,}", styles["table_cell_center"]),
+                    _make_para(f"{_int_value(row.get('likes')):,}", styles["table_cell_center"]),
+                    _make_para(f"{_int_value(row.get('posts')):,}", styles["table_cell_center"]),
+                    _make_para(_source_label(row.get("source")), styles["table_cell"]),
+                ]
+            )
+        active_widths = [72, 58, 66, 70, 58, max(164, page_width - 388)]
+        story.append(_build_table(active_table, active_widths, header_fill=colors_map["navy_dark"]))
+
+    def _decorate(canvas, doc):
+        canvas.saveState()
+        canvas.setStrokeColor(colors_map["line"])
+        canvas.setLineWidth(0.5)
+        canvas.line(doc.leftMargin, doc.pagesize[1] - 18, doc.pagesize[0] - doc.rightMargin, doc.pagesize[1] - 18)
+        canvas.setFont(font_name, 8.5)
+        canvas.setFillColor(colors_map["steel"])
+        canvas.drawRightString(doc.pagesize[0] - doc.rightMargin, 14, f"{_shape_ar(report_title)}  |  {datetime.now(tz=timezone.utc).strftime('%Y-%m-%d')}")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=_decorate, onLaterPages=_decorate)
+    return str(out_path)
+
+
+def _build_fallback_ar_report_from_videos(videos_payload: list[dict]) -> dict:
+    """Construit un rapport arabe minimal quand Gemini est indisponible."""
+    top_topics = [
+        "الشأن السياسي",
+        "الاقتصاد والخدمات",
+        "قضايا المجتمع",
+        "الأمن والحوادث",
+    ]
+    videos = []
+    for item in videos_payload[:80]:
+        desc = str(item.get("description") or "").strip()
+        videos.append(
+            {
+                "post_url": str(item.get("post_url") or ""),
+                "source": str(item.get("source") or ""),
+                "author": str(item.get("author") or ""),
+                "description_ar": desc if desc else "لا توجد تفاصيل كافية في الوصف المتاح.",
+                "sentiment_ar": "محايد",
+                "topic_ar": "محتوى عام",
+            }
+        )
+
+    return {
+        "report_title_ar": "موريتانيا في الـ 24 ساعة الماضية",
+        "report_date_ar": datetime.now(tz=timezone.utc).strftime("%Y-%m-%d"),
+        "overview_ar": "تم إنشاء هذا التقرير بصيغة احتياطية بسبب تعذر الوصول إلى خدمة Gemini مؤقتا.",
+        "top_topics_ar": top_topics,
+        "videos": videos,
+        "conclusion_ar": "يستند هذا الإصدار إلى أوصاف المنشورات الخام، وسيتم تحسينه تلقائيا عند توفر Gemini.",
+    }
+
+
+def _process_csv_batch_task(channel, scrape_id: str, urls: list[str], max_posts_per_page: int):
+    scoped_logger = with_context(LOGGER, scrape_id=scrape_id)
+    output_dir = Path(os.getenv("VIDEO_ANALYSIS_OUTPUT_DIR") or "video_reports")
+
+    source_rows = []
+    failed_pages = []
+    videos_payload = []
+    published_count = 0
+    published_snapshots = {}
+
+    def _payload_snapshot(payload: dict):
+        metrics = payload.get("metrics") or {}
+        return (
+            payload.get("author") or "",
+            payload.get("textContent") or "",
+            metrics.get("likes"),
+            metrics.get("comments"),
+            metrics.get("shares"),
+            metrics.get("views"),
+        )
+
+    for page_url in urls:
+        page_logger = with_context(scoped_logger, url=page_url)
+        page_logger.info("Processing page from CSV batch")
+
+        result = scrape_tiktok_page(
+            url=page_url,
+            max_posts=max_posts_per_page,
+            analyze_video_content=False,
+        )
+
+        if result.get("error"):
+            failed_pages.append({"url": page_url, "error": str(result.get("error"))})
+            page_logger.warning("Page scrape failed")
+            continue
+
+        posts = (result.get("posts") or [])[:max_posts_per_page]
+        if not posts:
+            failed_pages.append({"url": page_url, "error": "no_posts_found"})
+            page_logger.warning("Page returned no posts")
+            continue
+        likes = sum(_to_int(p.get("likes")) for p in posts)
+        comments = sum(_to_int(p.get("comments_count")) for p in posts)
+        shares = sum(_to_int(p.get("shares")) for p in posts)
+        views = sum(_to_int(p.get("views")) for p in posts)
+
+        source_rows.append(
+            {
+                "source": page_url,
+                "posts": len(posts),
+                "likes": likes,
+                "comments": comments,
+                "shares": shares,
+                "views": views,
+            }
+        )
+
+        for post in posts:
+            sig = f"{page_url}|{_post_signature(post)}"
+            payload = normalize_post(scrape_id, page_url, post)
+            snapshot = _payload_snapshot(payload)
+            previous = published_snapshots.get(sig)
+            if previous is None or snapshot != previous:
+                published_snapshots[sig] = snapshot
+                publish_result(channel, payload)
+                published_count += 1
+
+            videos_payload.append(
+                {
+                    "source": page_url,
+                    "post_url": payload.get("sourceUrl"),
+                    "author": payload.get("author"),
+                    "description": payload.get("textContent"),
+                    "likes": (payload.get("metrics") or {}).get("likes"),
+                    "comments": (payload.get("metrics") or {}).get("comments"),
+                    "shares": (payload.get("metrics") or {}).get("shares"),
+                    "views": (payload.get("metrics") or {}).get("views"),
+                    "published_at": payload.get("publishedAt"),
+                }
+            )
+
+    report_json_path = _build_batch_pages_report(scrape_id, source_rows, failed_pages, output_dir)
+    videos_json_path = _save_batch_videos_json(scrape_id=scrape_id, videos=videos_payload, output_dir=output_dir)
+
+    gemini_report_path = None
+    mauritanie_html_path = None
+    mauritanie_pdf_path = None
+    gemini_report_obj = None
+    try:
+        if videos_payload:
+            gemini_result = analyze_videos_json_with_gemini(videos_json_path=videos_json_path, output_dir=str(output_dir))
+            gemini_report_path = gemini_result.get("report_path")
+            gemini_report_obj = gemini_result.get("report") or {}
+    except Exception:
+        scoped_logger.exception("Failed to build Gemini/PDF Mauritanie 24h report")
+
+    if videos_payload and not gemini_report_obj:
+        gemini_report_obj = _build_fallback_ar_report_from_videos(videos_payload)
+
+    if videos_payload and gemini_report_obj:
+        try:
+            mauritanie_html_path = _build_mauritanie_24h_html_report(
+                scrape_id=scrape_id,
+                source_rows=source_rows,
+                gemini_report=gemini_report_obj,
+                videos_payload=videos_payload,
+                output_dir=output_dir,
+            )
+            mauritanie_pdf_path = _build_mauritanie_24h_pdf(
+                scrape_id=scrape_id,
+                source_rows=source_rows,
+                gemini_report=gemini_report_obj,
+                videos_payload=videos_payload,
+                output_dir=output_dir,
+            )
+        except Exception:
+            scoped_logger.exception("Failed to generate fallback Mauritanie 24h PDF")
+
+    has_results = published_count > 0
+    completion_payload = {
+        "scrapeId": scrape_id,
+        "platform": "tiktok",
+        "eventType": "COMPLETED",
+        "success": has_results,
+        "errorMessage": None if has_results else "No posts extracted from CSV pages (TikTok challenge/no_posts_found)",
+        "sessionReports": {
+            "jsonPath": report_json_path,
+            "htmlPath": mauritanie_html_path,
+            "pdfPath": mauritanie_pdf_path,
+            "videosJsonPath": videos_json_path,
+            "geminiJsonPath": gemini_report_path,
+        },
+        "batchSummary": {
+            "pagesRequested": len(urls),
+            "pagesSucceeded": len(source_rows),
+            "pagesFailed": len(failed_pages),
+            "failedPages": failed_pages,
+        },
+        "count": published_count,
+    }
+    channel.basic_publish(
+        exchange=EXCHANGE,
+        routing_key=ROUTING_RESULT,
+        body=json.dumps(completion_payload, ensure_ascii=False),
+        properties=pika.BasicProperties(content_type="application/json", delivery_mode=2),
+    )
 
 
 def on_message(channel, method, properties, body):
@@ -380,6 +1392,9 @@ def on_message(channel, method, properties, body):
         task = json.loads(body)
         scrape_id = task.get("scrape_id") or task.get("scrapeId", "unknown")
         url = task.get("url", "")
+        urls = task.get("urls") if isinstance(task.get("urls"), list) else []
+        report_mode = bool(task.get("report_mode") if task.get("report_mode") is not None else task.get("reportMode"))
+        report_type = str(task.get("report_type") or task.get("reportType") or "").strip().lower()
         scoped_logger = with_context(LOGGER, scrape_id=scrape_id, url=url)
         raw_max_posts = task.get("max_posts", task.get("maxPosts", 20))
         try:
@@ -388,6 +1403,18 @@ def on_message(channel, method, properties, body):
             max_posts = 20
         if max_posts <= 0:
             max_posts = 20
+
+        if report_mode and report_type == "csv" and urls:
+            scoped_logger.info("CSV batch task received")
+            _process_csv_batch_task(
+                channel=channel,
+                scrape_id=scrape_id,
+                urls=urls,
+                max_posts_per_page=max_posts,
+            )
+            scoped_logger.info("CSV batch task completed")
+            channel.basic_ack(delivery_tag=method.delivery_tag)
+            return
 
         if not url:
             scoped_logger.error("Invalid task payload: URL missing")

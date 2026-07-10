@@ -197,6 +197,58 @@
       ]
     },
     {
+      "name": "Create CSV Batch Report TikTok 24h - POST /scrape/csv-report-24h",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "file",
+              "type": "file",
+              "src": "{{csv_file_path}}",
+              "description": "CSV file containing TikTok profile URLs"
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{base_url}}/scrape/csv-report-24h",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape",
+            "csv-report-24h"
+          ]
+        },
+        "description": "Cree un job batch CSV TikTok avec fenetre automatique 24h (sans maxPostsPerPage)."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 202', function () {",
+              "    pm.response.to.have.status(202);",
+              "});",
+              "const data = pm.response.json();",
+              "pm.test('Response contains scrape_id', function () {",
+              "    pm.expect(data.scrape_id).to.exist;",
+              "});",
+              "if (data.scrape_id) {",
+              "    pm.collectionVariables.set('scrape_id', data.scrape_id);",
+              "    pm.collectionVariables.set('scrape_id_tiktok', data.scrape_id);",
+              "    pm.collectionVariables.set('result_cursor', '');",
+              "    pm.collectionVariables.set('result_cursor_tiktok', '');",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
       "name": "Get Facebook Status - GET /scrape/{scrapeId}",
       "request": {
         "method": "GET",

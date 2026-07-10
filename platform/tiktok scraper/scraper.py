@@ -4,7 +4,7 @@ import random
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote, urlparse, urlsplit, urlunsplit
 
 import requests
@@ -44,6 +44,56 @@ def _env_int(name: str, default: int) -> int:
         return int(str(raw).strip())
     except ValueError:
         return default
+
+
+def _to_iso_datetime(raw_value) -> str | None:
+    """Normalise une date TikTok en ISO UTC si possible."""
+    if raw_value in (None, ""):
+        return None
+
+    if isinstance(raw_value, (int, float)):
+        ts = int(raw_value)
+        # TikTok peut parfois renvoyer en millisecondes.
+        if ts > 10_000_000_000:
+            ts = ts // 1000
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+        except (ValueError, OSError):
+            return None
+
+    text = str(raw_value).strip()
+    if not text:
+        return None
+
+    if text.isdigit():
+        return _to_iso_datetime(int(text))
+
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+    except ValueError:
+        return None
+
+
+def _is_post_within_hours(post: dict, hours: int) -> bool | None:
+    """Retourne True si le post est dans la fenetre temporelle, False sinon, None si inconnu."""
+    if hours <= 0:
+        return True
+
+    published_iso = _to_iso_datetime(post.get("published_at"))
+    if not published_iso:
+        return None
+
+    try:
+        published_dt = datetime.fromisoformat(published_iso)
+        cutoff_dt = datetime.now(tz=timezone.utc) - timedelta(hours=hours)
+        return published_dt >= cutoff_dt
+    except ValueError:
+        return None
 
 
 def load_cookies() -> list:
@@ -320,6 +370,7 @@ def _extract_posts_from_sigi_state(payload: object) -> list:
         author = str(item.get("author") or "").strip()
         stats = item.get("stats") if isinstance(item.get("stats"), dict) else {}
         desc = item.get("desc") or ""
+        published_at = _to_iso_datetime(item.get("createTime") or item.get("create_time") or item.get("create_time_stamp"))
         post_url = f"https://www.tiktok.com/@{author}/video/{post_id}" if author else ""
 
         posts.append(
@@ -328,7 +379,7 @@ def _extract_posts_from_sigi_state(payload: object) -> list:
                 "post_url": post_url,
                 "message": desc,
                 "author": author,
-                "published_at": None,
+                "published_at": published_at,
                 "scraped_at": datetime.now(tz=timezone.utc).isoformat(),
                 "likes": stats.get("diggCount"),
                 "comments_count": stats.get("commentCount"),
@@ -568,7 +619,9 @@ def _extract_video_detail_from_page(page) -> dict:
                 const exact = urlId && itemModule[urlId] ? itemModule[urlId] : null;
                 const candidate = exact || Object.values(itemModule)[0] || null;
                 if (candidate && typeof candidate === 'object') {
-                    return fromStats(candidate.stats || {}, candidate.author || '', candidate.desc || '');
+                    const enriched = fromStats(candidate.stats || {}, candidate.author || '', candidate.desc || '');
+                    enriched.published_at = candidate.createTime ?? candidate.create_time ?? null;
+                    return enriched;
                 }
             }
 
@@ -585,6 +638,7 @@ def _extract_video_detail_from_page(page) -> dict:
                             if (!urlId || itemId === urlId) {
                                 const author = item.author?.uniqueId || item.author?.nickname || '';
                                 found = fromStats(item.stats || {}, author, item.desc || '');
+                                found.published_at = item.createTime ?? item.create_time ?? null;
                                 return;
                             }
                         }
@@ -669,6 +723,7 @@ def _scrape_with_browser(
     playwright,
     profile_url: str,
     max_posts: int,
+    max_age_hours: int | None,
     on_post,
     headless: bool,
     slow_mo_ms: int,
@@ -761,6 +816,18 @@ def _scrape_with_browser(
     try:
         network_posts = []
 
+        def _build_partial_result(posts: list[dict], warning: str | None = None) -> dict:
+            payload = {
+                "posts": posts,
+                "total": len(posts),
+                "url": profile_url,
+                "page_report_docx": None,
+                "page_report_pdf": None,
+            }
+            if warning:
+                payload["warning"] = warning
+            return payload
+
         # Capture passive des reponses JSON reseau pour recuperer des posts
         # parfois absents du DOM rendu.
         def handle_response(response):
@@ -799,8 +866,20 @@ def _scrape_with_browser(
         all_posts = []
         seen = set()
 
+        stop_due_to_age = False
+
         # Scroll progressif pour charger davantage de posts.
         for i in range(8):
+            if _looks_like_tiktok_challenge(page):
+                if all_posts:
+                    LOGGER.warning("Challenge detected during scroll; returning partial posts")
+                    break
+                _manual_solve_wait_if_enabled(user_data_dir, headless)
+                _wait_for_challenge_resolution(page, user_data_dir, headless)
+                if _looks_like_tiktok_challenge(page):
+                    _save_challenge_artifacts(page)
+                    return {"posts": [], "total": 0, "error": "challenge_detected", "url": profile_url}
+
             cards = _extract_video_cards(page, profile_url)
             batch = cards + network_posts
             network_posts = []
@@ -809,6 +888,16 @@ def _scrape_with_browser(
                 sig = _video_signature(card)
                 if sig in seen:
                     continue
+
+                if max_age_hours is not None and max_age_hours > 0:
+                    in_window = _is_post_within_hours(card, max_age_hours)
+                    if in_window is False:
+                        stop_due_to_age = True
+                        break
+                    if in_window is None:
+                        # In time-window mode, skip posts with unknown publish timestamp.
+                        continue
+
                 seen.add(sig)
                 all_posts.append(card)
                 if on_post is not None:
@@ -819,16 +908,37 @@ def _scrape_with_browser(
                 if len(all_posts) >= max_posts:
                     break
 
+            if stop_due_to_age:
+                break
+
             if len(all_posts) >= max_posts:
                 break
 
             page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
             _human_pause(1.7, 1.0)
 
+            if _looks_like_tiktok_challenge(page):
+                if all_posts:
+                    LOGGER.warning("Challenge detected after scroll; stopping current page with partial posts")
+                    break
+                _save_challenge_artifacts(page)
+                return {"posts": [], "total": 0, "error": "challenge_detected", "url": profile_url}
+
         # Fallback final si aucune video n'a pu etre extraite via navigateur.
         if not all_posts:
             http_posts = _extract_posts_from_html_fallback(profile_url)
             if http_posts:
+                if max_age_hours is not None and max_age_hours > 0:
+                    filtered = []
+                    for post in http_posts:
+                        in_window = _is_post_within_hours(post, max_age_hours)
+                        if in_window is False:
+                            break
+                        if in_window is None:
+                            continue
+                        filtered.append(post)
+                    http_posts = filtered
+
                 if on_post is not None:
                     for post in http_posts[:max_posts]:
                         try:
@@ -848,13 +958,8 @@ def _scrape_with_browser(
         else:
             analyzed_posts = enriched_posts
 
-        return {
-            "posts": analyzed_posts,
-            "total": len(analyzed_posts),
-            "url": profile_url,
-            "page_report_docx": None,
-            "page_report_pdf": None,
-        }
+        warning = "challenge_detected_partial" if _looks_like_tiktok_challenge(page) else None
+        return _build_partial_result(analyzed_posts, warning=warning)
     except Exception as e:
         LOGGER.exception("Browser scraping pipeline failed")
         return {"posts": [], "error": str(e), "url": profile_url}
@@ -894,6 +999,7 @@ def _extract_video_cards(page, profile_url: str) -> list:
                     post_url: postUrl,
                     message: '',
                     author: '',
+                    published_at: null,
                     likes: null,
                     comments_count: null,
                     shares: null,
@@ -905,6 +1011,7 @@ def _extract_video_cards(page, profile_url: str) -> list:
                 current.post_url = pick(current.post_url, postUrl);
                 current.message = pick(current.message, raw.message || '');
                 current.author = pick(current.author, raw.author || '');
+                current.published_at = pick(current.published_at, raw.published_at ?? null);
                 current.likes = pick(current.likes, raw.likes ?? null);
                 current.comments_count = pick(current.comments_count, raw.comments_count ?? null);
                 current.shares = pick(current.shares, raw.shares ?? null);
@@ -935,6 +1042,7 @@ def _extract_video_cards(page, profile_url: str) -> list:
                     post_url: absUrl,
                     message: text,
                     author: '',
+                    published_at: null,
                     likes: null,
                     comments_count: null,
                     shares: null,
@@ -959,6 +1067,7 @@ def _extract_video_cards(page, profile_url: str) -> list:
                         post_url: absUrl,
                         message: desc,
                         author,
+                        published_at: item.createTime ?? item.create_time ?? null,
                         likes: stats.diggCount ?? null,
                         comments_count: stats.commentCount ?? null,
                         shares: stats.shareCount ?? null,
@@ -996,6 +1105,7 @@ def _extract_video_cards(page, profile_url: str) -> list:
                             post_url: absUrl,
                             message: desc,
                             author,
+                            published_at: item.createTime ?? item.create_time ?? null,
                             likes: stats.diggCount ?? null,
                             comments_count: stats.commentCount ?? null,
                             shares: stats.shareCount ?? null,
@@ -1026,7 +1136,7 @@ def _extract_video_cards(page, profile_url: str) -> list:
                 "post_url": post_url,
                 "message": item.get("message") or "",
                 "author": item.get("author") or "",
-                "published_at": None,
+                "published_at": _to_iso_datetime(item.get("published_at") or item.get("createTime") or item.get("create_time")),
                 "scraped_at": datetime.now(tz=timezone.utc).isoformat(),
                 "likes": item.get("likes"),
                 "comments_count": item.get("comments_count"),
@@ -1067,6 +1177,7 @@ def _extract_posts_from_json_payload(payload: object) -> list:
 
                     stats = item.get("stats") if isinstance(item.get("stats"), dict) else {}
                     desc = item.get("desc") or item.get("description") or ""
+                    published_at = _to_iso_datetime(item.get("createTime") or item.get("create_time") or item.get("create_time_stamp"))
                     post_url = f"https://www.tiktok.com/@{author}/video/{post_id}" if author else ""
 
                     posts.append(
@@ -1075,7 +1186,7 @@ def _extract_posts_from_json_payload(payload: object) -> list:
                             "post_url": post_url,
                             "message": desc,
                             "author": author,
-                            "published_at": None,
+                            "published_at": published_at,
                             "scraped_at": datetime.now(tz=timezone.utc).isoformat(),
                             "likes": stats.get("diggCount"),
                             "comments_count": stats.get("commentCount"),
@@ -1194,6 +1305,7 @@ def _warmup_and_open_profile(page, profile_url: str):
 def scrape_tiktok_page(
     url: str,
     max_posts: int = 20,
+    max_age_hours: int | None = None,
     on_post=None,
     headless_override: bool | None = None,
     analyze_video_content: bool | None = None,
@@ -1226,6 +1338,7 @@ def scrape_tiktok_page(
                 p,
                 profile_url,
                 max_posts,
+                max_age_hours,
                 on_post,
                 headless,
                 slow_mo_ms,

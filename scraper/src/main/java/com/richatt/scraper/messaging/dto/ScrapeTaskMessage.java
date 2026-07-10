@@ -17,6 +17,7 @@ public class ScrapeTaskMessage {
     private List<String> urls;
     private String platform;
     private Integer maxPosts;
+    private Integer timeWindowHours;
     private Boolean reportMode;
     private String reportType;
     private String requestedAt;

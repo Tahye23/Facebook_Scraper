@@ -81,6 +81,11 @@
       font-size: 18px;
       margin-top: 8px;
     }
+    .description-cell {
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-width: 460px;
+    }
     @media print {
       .page { padding: 20px 24px; }
       .title { font-size: 32px; }
@@ -136,7 +141,21 @@
       </tbody>
     </table>
 
-    <h2>سادسا: الخلاصة والاستنتاجات</h2>
+    <h2>رابعا: الصفحات التي فشل جمعها</h2>
+    <p>عدد الصفحات الفاشلة: __FAILED_PAGES_COUNT__</p>
+    <table>
+      <thead>
+        <tr>
+          <th>الصفحة / المصدر</th>
+          <th>سبب الفشل</th>
+        </tr>
+      </thead>
+      <tbody>
+        __FAILED_ROWS__
+      </tbody>
+    </table>
+
+    <h2>خامسا: الخلاصة والاستنتاجات</h2>
     <p>__CONCLUSION__</p>
 
     <h2 class="appendix-title">ملحق – جداول الأداء والرصد</h2>

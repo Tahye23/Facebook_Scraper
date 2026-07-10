@@ -78,6 +78,35 @@ public class ScrapeController {
         }
     }
 
+    @PostMapping(value = "/csv-report-24h", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<?> enqueueCsvReportLast24h(
+            @RequestPart("file") MultipartFile file
+    ) {
+        List<String> urls;
+        try {
+            urls = CsvUrlExtractor.extractTikTokProfileUrls(file);
+        } catch (IllegalArgumentException ex) {
+            return ResponseEntity.badRequest().body(Map.of("error", ex.getMessage()));
+        }
+
+        if (urls.isEmpty()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "No TikTok profile URLs found in CSV"));
+        }
+
+        try {
+            ScrapeJob job = orchestrationService.enqueueTikTokCsvBatchLast24h(urls);
+            return ResponseEntity.accepted().body(Map.of(
+                    "scrape_id", job.getScrapeId(),
+                    "status", job.getStatus() != null ? job.getStatus().name() : "QUEUED",
+                    "urls_count", urls.size(),
+                    "mode", "last_24h",
+                    "time_window_hours", 24
+            ));
+        } catch (IllegalArgumentException ex) {
+            return ResponseEntity.badRequest().body(Map.of("error", ex.getMessage()));
+        }
+    }
+
     @GetMapping("/{scrapeId}")
     public ResponseEntity<?> getJob(@PathVariable String scrapeId) {
         return orchestrationService.getJob(scrapeId)

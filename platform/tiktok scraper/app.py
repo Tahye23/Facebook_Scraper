@@ -50,6 +50,15 @@ def scrape_page():
     except Exception:
         return jsonify({"error": "max_posts doit etre un entier"}), 400
 
+    raw_max_age_hours = data.get("max_age_hours")
+    if raw_max_age_hours in (None, ""):
+        max_age_hours = None
+    else:
+        try:
+            max_age_hours = int(raw_max_age_hours)
+        except Exception:
+            return jsonify({"error": "max_age_hours doit etre un entier"}), 400
+
     raw_headless = data.get("headless", False)
     if isinstance(raw_headless, bool):
         headless = raw_headless
@@ -57,7 +66,12 @@ def scrape_page():
         headless = str(raw_headless).strip().lower() in ("1", "true", "yes", "y", "on")
 
     try:
-        result = scrape_tiktok_page(url=url, max_posts=max_posts, headless_override=headless)
+        result = scrape_tiktok_page(
+            url=url,
+            max_posts=max_posts,
+            max_age_hours=max_age_hours,
+            headless_override=headless,
+        )
         return jsonify(result)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500

@@ -16,10 +16,11 @@ Flux d'execution:
 import json
 import os
 import queue
+import random
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from html import escape
@@ -428,6 +429,7 @@ def _build_mauritanie_24h_html_report(
     source_rows: list[dict],
     gemini_report: dict,
     videos_payload: list[dict] | None,
+    failed_pages: list[dict] | None,
     output_dir: Path,
 ) -> str | None:
     """Genere une version HTML stylisee du rapport Mauritanie 24h via template externe."""
@@ -459,7 +461,11 @@ def _build_mauritanie_24h_html_report(
             return "متوسط"
         return "ضعيف"
 
-    def _source_label(url: str) -> str:
+    def _source_label(url: str, author: str | None = None) -> str:
+        author_text = str(author or "").strip().lstrip("@")
+        if author_text:
+            return author_text
+
         raw = str(url or "").strip()
         if not raw:
             return "مصدر غير معروف"
@@ -469,6 +475,11 @@ def _build_mauritanie_24h_html_report(
             from urllib.parse import urlparse
 
             parsed = urlparse(raw)
+            path_parts = [part for part in parsed.path.split("/") if part]
+            if path_parts:
+                first = path_parts[0]
+                if first.startswith("@"):
+                    return first.lstrip("@")
             if parsed.netloc:
                 return parsed.netloc.replace("www.", "")
         except Exception:
@@ -497,6 +508,7 @@ def _build_mauritanie_24h_html_report(
 
     videos_payload = videos_payload or []
     source_rows = source_rows or []
+    failed_pages = failed_pages or []
     video_items = gemini_report.get("videos") or []
 
     total_posts = sum(_int_value(row.get("posts")) for row in source_rows)
@@ -558,7 +570,7 @@ def _build_mauritanie_24h_html_report(
         ratio = (likes / views) if views > 0 else None
         ranked_posts.append(
             {
-                "source": _source_label(item.get("source") or item.get("post_url") or ""),
+                "source": _source_label(item.get("source") or item.get("post_url") or "", item.get("author")),
                 "description": str(item.get("description") or "").strip(),
                 "interactions": likes + comments + shares,
                 "comments": comments,
@@ -575,7 +587,7 @@ def _build_mauritanie_24h_html_report(
             f"<td>{row['shares']:,}</td>"
             f"<td>{row['comments']:,}</td>"
             f"<td>{row['interactions']:,}</td>"
-            f"<td>{escape((row['description'][:120] + '…') if len(row['description']) > 120 else row['description'] or '—')}</td>"
+            f"<td class='description-cell'>{escape(row['description'] or '—')}</td>"
             f"<td>{escape(row['source'])}</td>"
             f"<td><span class='dot' style='background:{_ratio_color(row['ratio'])}'></span> {escape(ratio_text)}</td>"
             "</tr>"
@@ -594,6 +606,15 @@ def _build_mauritanie_24h_html_report(
             "</tr>"
         )
 
+    failed_rows_html = []
+    for row in failed_pages:
+        failed_rows_html.append(
+            "<tr>"
+            f"<td>{escape(_source_label(row.get('url')))}</td>"
+            f"<td>{escape(str(row.get('error') or 'unknown_error'))}</td>"
+            "</tr>"
+        )
+
     html = _render_html_template(
         "mauritanie_24h_report.html",
         {
@@ -609,6 +630,8 @@ def _build_mauritanie_24h_html_report(
             "__SOURCE_ROWS__": "".join(source_rows_html) or "<tr><td colspan='5'>لا توجد بيانات كافية</td></tr>",
             "__TOPIC_APPENDIX_ROWS__": "".join(topic_rows) or "<tr><td colspan='6'>لا توجد بيانات كافية</td></tr>",
             "__ACTIVE_ROWS__": "".join(source_rows_html) or "<tr><td colspan='5'>لا توجد بيانات كافية</td></tr>",
+            "__FAILED_PAGES_COUNT__": str(len(failed_pages)),
+            "__FAILED_ROWS__": "".join(failed_rows_html) or "<tr><td colspan='2'>لا توجد صفحات فاشلة</td></tr>",
         },
     )
 
@@ -621,6 +644,7 @@ def _build_mauritanie_24h_pdf(
     source_rows: list[dict],
     gemini_report: dict,
     videos_payload: list[dict] | None,
+    failed_pages: list[dict] | None,
     output_dir: Path,
 ) -> str | None:
     try:
@@ -685,7 +709,11 @@ def _build_mauritanie_24h_pdf(
         except (TypeError, ValueError):
             return 0
 
-    def _source_label(url: str) -> str:
+    def _source_label(url: str, author: str | None = None) -> str:
+        author_text = str(author or "").strip().lstrip("@")
+        if author_text:
+            return author_text
+
         raw = str(url or "").strip()
         if not raw:
             return "مصدر غير معروف"
@@ -695,17 +723,16 @@ def _build_mauritanie_24h_pdf(
             from urllib.parse import urlparse
 
             parsed = urlparse(raw)
+            path_parts = [part for part in parsed.path.split("/") if part]
+            if path_parts:
+                first = path_parts[0]
+                if first.startswith("@"):
+                    return first.lstrip("@")
             if parsed.netloc:
                 return parsed.netloc.replace("www.", "")
         except Exception:
             pass
         return raw[:42]
-
-    def _truncate(text: str, limit: int = 120) -> str:
-        raw = str(text or "").strip()
-        if len(raw) <= limit:
-            return raw
-        return raw[: limit - 1].rstrip() + "…"
 
     def _make_para(text: str, style: ParagraphStyle) -> Paragraph:
         return Paragraph(_shape_ar(text), style)
@@ -775,6 +802,7 @@ def _build_mauritanie_24h_pdf(
 
     videos_payload = videos_payload or []
     source_rows = source_rows or []
+    failed_pages = failed_pages or []
 
     font_name = "Helvetica"
     font_env = (os.getenv("TIKTOK_ARABIC_FONT_PATH") or "").strip()
@@ -1049,7 +1077,7 @@ def _build_mauritanie_24h_pdf(
 
     story.append(_make_para("ثالثا: أبرز الأحداث والقضايا الساخنة", styles["section"]))
     for idx, item in enumerate(video_items[:3], start=1):
-        topic_name = _truncate(item.get("topic_ar") or "محتوى عام", 70)
+        topic_name = str(item.get("topic_ar") or "محتوى عام").strip() or "محتوى عام"
         heading = f"{idx}. {topic_name}"
         story.append(_make_para(heading, styles["subsection"]))
         story.append(RTLTextBlock(item.get("description_ar") or item.get("description") or "لا توجد تفاصيل كافية.", styles["body"], doc.width))
@@ -1061,8 +1089,8 @@ def _build_mauritanie_24h_pdf(
         interactions = _metric_total(item)
         top_posts.append(
             {
-                "source": _source_label(item.get("source") or item.get("post_url") or ""),
-                "description": _truncate(item.get("description") or item.get("description_ar") or "", 110),
+                "source": _source_label(item.get("source") or item.get("post_url") or "", item.get("author")),
+                "description": str(item.get("description") or item.get("description_ar") or "").strip(),
                 "likes": _int_value(item.get("likes")),
                 "comments": _int_value(item.get("comments")),
                 "shares": _int_value(item.get("shares")),
@@ -1093,7 +1121,23 @@ def _build_mauritanie_24h_pdf(
         top_post_widths = [52, 58, 68, max(130, page_width - 318), 110]
         story.append(_build_table(top_post_data, top_post_widths, header_fill=colors_map["navy"]))
 
-    story.append(_make_para("خامسا: تحليل التفاعل والمؤشرات الرقمية", styles["section"]))
+    if failed_pages:
+        story.append(_make_para("خامسا: الصفحات التي فشل جمعها", styles["section"]))
+        failed_table = [[
+            _make_para("الصفحة / المصدر", styles["table_header"]),
+            _make_para("سبب الفشل", styles["table_header"]),
+        ]]
+        for row in failed_pages:
+            failed_table.append(
+                [
+                    _make_para(_source_label(row.get("url")), styles["table_cell"]),
+                    _make_para(str(row.get("error") or "unknown_error"), styles["table_cell"]),
+                ]
+            )
+        failed_widths = [max(180, page_width - 200), 180]
+        story.append(_build_table(failed_table, failed_widths, header_fill=colors_map["navy"]))
+
+    story.append(_make_para("سادسا: تحليل التفاعل والمؤشرات الرقمية", styles["section"]))
     avg_interactions = (total_interactions / total_posts) if total_posts else 0
     avg_comments = (total_comments / total_posts) if total_posts else 0
     avg_shares = (total_shares / total_posts) if total_posts else 0
@@ -1103,7 +1147,7 @@ def _build_mauritanie_24h_pdf(
     )
     story.append(RTLTextBlock(analysis_text, styles["body"], doc.width))
 
-    story.append(_make_para("سادسا: الخلاصة والاستنتاجات", styles["section"]))
+    story.append(_make_para("سابعا: الخلاصة والاستنتاجات", styles["section"]))
     story.append(RTLTextBlock(conclusion, styles["body"], doc.width))
 
     story.append(PageBreak())
@@ -1229,9 +1273,19 @@ def _build_fallback_ar_report_from_videos(videos_payload: list[dict]) -> dict:
     }
 
 
-def _process_csv_batch_task(channel, scrape_id: str, urls: list[str], max_posts_per_page: int):
+def _process_csv_batch_task(
+    channel,
+    scrape_id: str,
+    urls: list[str],
+    max_posts_per_page: int,
+    time_window_hours: int | None = None,
+):
     scoped_logger = with_context(LOGGER, scrape_id=scrape_id)
     output_dir = Path(os.getenv("VIDEO_ANALYSIS_OUTPUT_DIR") or "video_reports")
+    page_attempts = max(1, int((os.getenv("TIKTOK_BATCH_PAGE_ATTEMPTS") or "2").strip()))
+    page_delay_seconds = max(0.0, float((os.getenv("TIKTOK_BATCH_PAGE_DELAY_SECONDS") or "2.5").strip()))
+    page_delay_jitter = max(0.0, float((os.getenv("TIKTOK_BATCH_PAGE_DELAY_JITTER_SECONDS") or "1.5").strip()))
+    retry_backoff_seconds = max(0.5, float((os.getenv("TIKTOK_BATCH_RETRY_BACKOFF_SECONDS") or "5").strip()))
 
     source_rows = []
     failed_pages = []
@@ -1250,22 +1304,43 @@ def _process_csv_batch_task(channel, scrape_id: str, urls: list[str], max_posts_
             metrics.get("views"),
         )
 
+    def _page_cooldown(multiplier: float = 1.0):
+        pause = (page_delay_seconds * multiplier) + random.uniform(0.0, page_delay_jitter)
+        if pause > 0:
+            time.sleep(pause)
+
     for page_url in urls:
         page_logger = with_context(scoped_logger, url=page_url)
         page_logger.info("Processing page from CSV batch")
 
-        result = scrape_tiktok_page(
-            url=page_url,
-            max_posts=max_posts_per_page,
-            analyze_video_content=False,
-        )
+        result = None
+        for attempt in range(1, page_attempts + 1):
+            result = scrape_tiktok_page(
+                url=page_url,
+                max_posts=max_posts_per_page,
+                max_age_hours=time_window_hours,
+                analyze_video_content=False,
+            )
+
+            error_code = str(result.get("error") or "").strip().lower()
+            if error_code not in {"challenge_detected", "no_posts_found"}:
+                break
+
+            if attempt < page_attempts:
+                backoff_multiplier = attempt
+                retry_pause = (retry_backoff_seconds * backoff_multiplier) + random.uniform(0.0, page_delay_jitter)
+                page_logger.warning("Page scrape retry scheduled after soft failure")
+                time.sleep(retry_pause)
 
         if result.get("error"):
             failed_pages.append({"url": page_url, "error": str(result.get("error"))})
             page_logger.warning("Page scrape failed")
+            _page_cooldown(multiplier=1.3)
             continue
 
-        posts = (result.get("posts") or [])[:max_posts_per_page]
+        posts = result.get("posts") or []
+        if not time_window_hours:
+            posts = posts[:max_posts_per_page]
         if not posts:
             failed_pages.append({"url": page_url, "error": "no_posts_found"})
             page_logger.warning("Page returned no posts")
@@ -1310,6 +1385,8 @@ def _process_csv_batch_task(channel, scrape_id: str, urls: list[str], max_posts_
                 }
             )
 
+        _page_cooldown()
+
     report_json_path = _build_batch_pages_report(scrape_id, source_rows, failed_pages, output_dir)
     videos_json_path = _save_batch_videos_json(scrape_id=scrape_id, videos=videos_payload, output_dir=output_dir)
 
@@ -1319,9 +1396,21 @@ def _process_csv_batch_task(channel, scrape_id: str, urls: list[str], max_posts_
     gemini_report_obj = None
     try:
         if videos_payload:
-            gemini_result = analyze_videos_json_with_gemini(videos_json_path=videos_json_path, output_dir=str(output_dir))
+            gemini_timeout_seconds = max(5, int((os.getenv("TIKTOK_GEMINI_BATCH_TIMEOUT_SECONDS") or "90").strip()))
+            scoped_logger.info("Starting Gemini batch report generation", extra={"post_id": None})
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    analyze_videos_json_with_gemini,
+                    videos_json_path=videos_json_path,
+                    output_dir=str(output_dir),
+                )
+                gemini_result = future.result(timeout=gemini_timeout_seconds)
+
             gemini_report_path = gemini_result.get("report_path")
             gemini_report_obj = gemini_result.get("report") or {}
+            scoped_logger.info("Gemini batch report generation completed", extra={"post_id": None})
+    except FuturesTimeoutError:
+        scoped_logger.warning("Gemini batch report generation timed out; using fallback report")
     except Exception:
         scoped_logger.exception("Failed to build Gemini/PDF Mauritanie 24h report")
 
@@ -1335,6 +1424,7 @@ def _process_csv_batch_task(channel, scrape_id: str, urls: list[str], max_posts_
                 source_rows=source_rows,
                 gemini_report=gemini_report_obj,
                 videos_payload=videos_payload,
+                failed_pages=failed_pages,
                 output_dir=output_dir,
             )
             mauritanie_pdf_path = _build_mauritanie_24h_pdf(
@@ -1342,6 +1432,7 @@ def _process_csv_batch_task(channel, scrape_id: str, urls: list[str], max_posts_
                 source_rows=source_rows,
                 gemini_report=gemini_report_obj,
                 videos_payload=videos_payload,
+                failed_pages=failed_pages,
                 output_dir=output_dir,
             )
         except Exception:
@@ -1366,6 +1457,7 @@ def _process_csv_batch_task(channel, scrape_id: str, urls: list[str], max_posts_
             "pagesSucceeded": len(source_rows),
             "pagesFailed": len(failed_pages),
             "failedPages": failed_pages,
+            "timeWindowHours": time_window_hours,
         },
         "count": published_count,
     }
@@ -1395,6 +1487,11 @@ def on_message(channel, method, properties, body):
         urls = task.get("urls") if isinstance(task.get("urls"), list) else []
         report_mode = bool(task.get("report_mode") if task.get("report_mode") is not None else task.get("reportMode"))
         report_type = str(task.get("report_type") or task.get("reportType") or "").strip().lower()
+        raw_time_window = task.get("time_window_hours", task.get("timeWindowHours"))
+        try:
+            time_window_hours = int(raw_time_window) if raw_time_window is not None else None
+        except (TypeError, ValueError):
+            time_window_hours = None
         scoped_logger = with_context(LOGGER, scrape_id=scrape_id, url=url)
         raw_max_posts = task.get("max_posts", task.get("maxPosts", 20))
         try:
@@ -1404,13 +1501,14 @@ def on_message(channel, method, properties, body):
         if max_posts <= 0:
             max_posts = 20
 
-        if report_mode and report_type == "csv" and urls:
+        if report_mode and report_type in ("csv", "csv_24h") and urls:
             scoped_logger.info("CSV batch task received")
             _process_csv_batch_task(
                 channel=channel,
                 scrape_id=scrape_id,
                 urls=urls,
                 max_posts_per_page=max_posts,
+                time_window_hours=(24 if report_type == "csv_24h" else time_window_hours),
             )
             scoped_logger.info("CSV batch task completed")
             channel.basic_ack(delivery_tag=method.delivery_tag)

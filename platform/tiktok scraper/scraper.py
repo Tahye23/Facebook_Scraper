@@ -218,8 +218,20 @@ def _build_proxy_config() -> dict | None:
 
 
 def _build_user_data_dir() -> str:
-    """Retourne le dossier profil navigateur persistant (ou chaine vide)."""
-    return (os.getenv("TIKTOK_USER_DATA_DIR") or "").strip()
+    """Retourne le dossier profil navigateur persistant (ou chaine vide).
+
+    Un chemin relatif est resolu par rapport au dossier de ce fichier (et non
+    au cwd du process), afin que le profil persistant fonctionne de maniere
+    identique quel que soit l'endroit d'ou `worker.py` est lance sur le
+    serveur (systemd, docker, shell interactif, etc.).
+    """
+    raw = (os.getenv("TIKTOK_USER_DATA_DIR") or "").strip()
+    if not raw:
+        return ""
+    path = Path(raw)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / path
+    return str(path)
 
 
 def _should_apply_stealth(user_data_dir: str) -> bool:
@@ -313,6 +325,52 @@ def _describe_proxy(proxy_cfg: dict | None) -> str:
     if not proxy_cfg:
         return "direct"
     return proxy_cfg.get("server") or "proxy"
+
+
+def _rotate_ipv6_identity() -> str | None:
+    """Demande au proxy local de rotation IPv6 de changer d'adresse source.
+
+    Explication pour bien comprendre le mecanisme complet:
+    - Playwright n'a AUCUNE option pour choisir l'IP source d'une connexion
+      (il n'existe pas de parametre "local_address"). La seule chose que
+      Playwright sait faire, c'est parler a un proxy via l'option `proxy`.
+    - On utilise donc un petit proxy SOCKS5 qui tourne en local sur le
+      serveur (voir tools/ipv6_rotating_proxy.py). C'est LUI qui choisit
+      une adresse IPv6 aleatoire dans le bloc /64 et qui "bind" dessus avant
+      de se connecter a TikTok.
+    - Cette fonction appelle simplement l'URL de controle de ce proxy
+      (http://127.0.0.1:8091/rotate par defaut) pour lui dire: "a partir de
+      maintenant, choisis une NOUVELLE adresse aleatoire". Le proxy
+      lui-meme ne change rien tout seul: c'est nous (le scraper) qui
+      decidons du bon moment (toutes les N videos, voir plus bas).
+    - Important: changer l'adresse cote proxy ne suffit pas. Les connexions
+      TCP DEJA ouvertes par le navigateur gardent leur ancienne IP source
+      jusqu'a leur fermeture. C'est pour ca qu'on ferme et qu'on recree le
+      contexte Playwright juste apres cet appel (voir `_scrape_with_browser`):
+      ca force le navigateur a ouvrir des connexions toutes neuves, qui
+      passeront donc par la nouvelle adresse.
+
+    Best-effort: si TIKTOK_IPV6_ROTATE_CONTROL_URL n'est pas configuree, ou
+    si l'appel echoue (proxy pas demarre, reseau...), on log un warning et on
+    continue le scraping normalement (sans rotation) plutot que de faire
+    planter tout le job pour ca.
+
+    Retourne la nouvelle adresse (texte brut renvoye par le proxy) ou None.
+    """
+    control_url = (os.getenv("TIKTOK_IPV6_ROTATE_CONTROL_URL") or "").strip()
+    if not control_url:
+        return None
+    try:
+        response = requests.get(control_url, timeout=5)
+        body = (response.text or "").strip()
+        LOGGER.info("IPv6 identity rotated via control endpoint", extra={"proxy_response": body[:200]})
+        return body
+    except Exception:
+        LOGGER.warning(
+            "Failed to rotate IPv6 identity (proxy control endpoint unreachable?); continuing without rotation",
+            exc_info=True,
+        )
+        return None
 
 
 def _save_challenge_artifacts(page):
@@ -729,17 +787,30 @@ def _scrape_with_browser(
     slow_mo_ms: int,
     proxy_cfg: dict | None,
     analyze_video_content: bool,
+    rotate_every_n_posts: int = 0,
 ) -> dict:
     """Pipeline principal de scraping via Playwright.
 
     Etapes:
     1) Ouvrir un contexte navigateur (persistant ou temporaire).
     2) Injecter headers/stealth/cookies selon la config.
-    3) Naviguer vers le profil et collecter les posts (DOM + reseau).
+    3) Naviguer vers le profil et collecter les posts (DOM + reseau), avec
+       une rotation d'identite IPv6 toutes les `rotate_every_n_posts` videos
+       si ce parametre est configure (0 = rotation desactivee).
     4) Gérer challenge/fallback HTTP si necessaire.
     5) Enrichir et analyser les posts avant retour.
     """
+    # Ces trois variables representent "le navigateur actuel". Elles sont
+    # reassignees a chaque rotation d'IPv6 (fermeture + reouverture), d'ou le
+    # `nonlocal` utilise dans les fonctions imbriquees ci-dessous.
     browser = None
+    context = None
+    page = None
+
+    # Défini avant le bloc try: même si une exception survient tôt (warmup,
+    # ouverture de contexte, etc.), on doit pouvoir renvoyer les posts déjà
+    # collectés au lieu de les perdre silencieusement.
+    all_posts: list[dict] = []
     user_data_dir = _build_user_data_dir()
     browser_args = [
         "--no-sandbox",
@@ -762,59 +833,116 @@ def _scrape_with_browser(
     if proxy_cfg:
         LOGGER.info("Using proxy candidate", extra={"url": _describe_proxy(proxy_cfg)})
 
-    # Deux modes de contexte:
-    # - persistent_context: reutilise un profil navigateur reel
-    # - new_context: session propre, ephemere
-    if user_data_dir:
-        os.makedirs(user_data_dir, exist_ok=True)
-        launch_persistent_args = {
-            "user_data_dir": user_data_dir,
-            "headless": headless,
-            "slow_mo": slow_mo_ms,
-            "args": browser_args,
-            **context_options,
-        }
-        if proxy_cfg:
-            launch_persistent_args["proxy"] = proxy_cfg
-        context = playwright.chromium.launch_persistent_context(**launch_persistent_args)
-    else:
-        launch_args = {
-            "headless": headless,
-            "slow_mo": slow_mo_ms,
-            "args": browser_args,
-        }
-        if proxy_cfg:
-            launch_args["proxy"] = proxy_cfg
-        browser = playwright.chromium.launch(**launch_args)
-        context = browser.new_context(**context_options)
+    # Tampon partage par le listener reseau (`handle_response`, defini plus
+    # bas) entre deux extractions de cartes video. Reste valide a travers les
+    # rotations puisqu'on ne fait qu'ajouter/vider son contenu (pas de
+    # reassignation), donc pas besoin de `nonlocal` pour lui.
+    network_posts: list[dict] = []
 
-    # Headers additionnels pour mimer un trafic navigateur classique.
-    context.set_extra_http_headers(
-        {
-            "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-CH-UA": '"Chromium";v="124", "Not:A-Brand";v="99"',
-            "Sec-CH-UA-Platform": '"Windows"',
-            "Sec-CH-UA-Mobile": "?0",
-        }
-    )
-    if _should_apply_stealth(user_data_dir):
-        _install_stealth_scripts(context)
+    def handle_response(response):
+        """Capture passive des reponses JSON reseau (posts parfois absents du DOM)."""
+        rurl = response.url.lower()
+        if not any(k in rurl for k in ("item_list", "aweme", "post/item", "user/post")):
+            return
+        try:
+            ctype = response.headers.get("content-type", "").lower()
+            if "json" not in ctype:
+                return
+        except Exception:
+            return
+        try:
+            payload = response.json()
+            parsed = _extract_posts_from_json_payload(payload)
+            if parsed:
+                network_posts.extend(parsed)
+        except Exception:
+            LOGGER.debug("Failed to parse network JSON response", exc_info=True)
 
-    # Injection de cookies si contexte non persistant, ou si forçage explicite.
-    force_cookie_injection = _env_bool("TIKTOK_FORCE_COOKIE_INJECTION", False)
-    if not user_data_dir or force_cookie_injection:
-        cookies = load_cookies()
-        if cookies:
+    def _open_context_and_page() -> None:
+        """(Ré)ouvre un contexte Playwright + une page.
+
+        Appelee une premiere fois au demarrage, puis re-appelee a chaque
+        rotation d'IPv6 (apres avoir ferme l'ancien contexte). La config
+        (user-agent, proxy, cookies, stealth) est identique a chaque appel:
+        seule l'identite reseau change, cote proxy local (voir
+        `_rotate_ipv6_identity`), pas cote Playwright.
+        """
+        nonlocal browser, context, page
+
+        if user_data_dir:
+            os.makedirs(user_data_dir, exist_ok=True)
+            launch_persistent_args = {
+                "user_data_dir": user_data_dir,
+                "headless": headless,
+                "slow_mo": slow_mo_ms,
+                "args": browser_args,
+                **context_options,
+            }
+            if proxy_cfg:
+                launch_persistent_args["proxy"] = proxy_cfg
+            context = playwright.chromium.launch_persistent_context(**launch_persistent_args)
+            browser = None
+        else:
+            launch_args = {
+                "headless": headless,
+                "slow_mo": slow_mo_ms,
+                "args": browser_args,
+            }
+            if proxy_cfg:
+                launch_args["proxy"] = proxy_cfg
+            browser = playwright.chromium.launch(**launch_args)
+            context = browser.new_context(**context_options)
+
+        # Headers additionnels pour mimer un trafic navigateur classique.
+        context.set_extra_http_headers(
+            {
+                "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-CH-UA": '"Chromium";v="124", "Not:A-Brand";v="99"',
+                "Sec-CH-UA-Platform": '"Windows"',
+                "Sec-CH-UA-Mobile": "?0",
+            }
+        )
+        if _should_apply_stealth(user_data_dir):
+            _install_stealth_scripts(context)
+
+        # Injection de cookies si contexte non persistant, ou si forçage explicite.
+        force_cookie_injection = _env_bool("TIKTOK_FORCE_COOKIE_INJECTION", False)
+        if not user_data_dir or force_cookie_injection:
+            cookies = load_cookies()
+            if cookies:
+                try:
+                    context.add_cookies(cookies)
+                except Exception:
+                    LOGGER.warning("Failed to inject cookies", exc_info=True)
+
+        page = context.new_page()
+        page.on("response", handle_response)
+
+    def _close_current_context() -> None:
+        """Ferme proprement le contexte/navigateur courant avant une rotation.
+
+        Fait "au mieux": une erreur de fermeture ne doit jamais empecher la
+        suite du scraping (on log juste un warning).
+        """
+        nonlocal browser, context, page
+        if context is not None:
             try:
-                context.add_cookies(cookies)
-            except Exception as e:
-                LOGGER.warning("Failed to inject cookies", exc_info=True)
+                context.close()
+            except Exception:
+                LOGGER.warning("Failed to close context during IPv6 rotation", exc_info=True)
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                LOGGER.warning("Failed to close browser during IPv6 rotation", exc_info=True)
+        context = None
+        browser = None
+        page = None
 
-    page = context.new_page()
+    _open_context_and_page()
 
     try:
-        network_posts = []
 
         def _build_partial_result(posts: list[dict], warning: str | None = None) -> dict:
             payload = {
@@ -828,30 +956,6 @@ def _scrape_with_browser(
                 payload["warning"] = warning
             return payload
 
-        # Capture passive des reponses JSON reseau pour recuperer des posts
-        # parfois absents du DOM rendu.
-        def handle_response(response):
-            rurl = response.url.lower()
-            if not any(k in rurl for k in ("item_list", "aweme", "post/item", "user/post")):
-                return
-
-            try:
-                ctype = response.headers.get("content-type", "").lower()
-                if "json" not in ctype:
-                    return
-            except Exception:
-                return
-
-            try:
-                payload = response.json()
-                parsed = _extract_posts_from_json_payload(payload)
-                if parsed:
-                    network_posts.extend(parsed)
-            except Exception:
-                LOGGER.debug("Failed to parse network JSON response", exc_info=True)
-
-        page.on("response", handle_response)
-
         _warmup_and_open_profile(page, profile_url)
 
         # Si challenge detecte, on laisse une fenetre de resolution manuelle.
@@ -863,13 +967,32 @@ def _scrape_with_browser(
             except Exception as retry_err:
                 LOGGER.warning("Challenge retry warmup failed", exc_info=True)
 
-        all_posts = []
         seen = set()
 
         stop_due_to_age = False
 
+        # --- Rotation IPv6 "toutes les N videos" -----------------------------
+        # `posts_at_last_rotation` retient combien de posts on avait deja
+        # collecte au moment de la derniere rotation (0 au debut). Des que
+        # `len(all_posts) - posts_at_last_rotation >= rotate_every_n_posts`,
+        # on change d'adresse IPv6 et on repart avec un navigateur neuf.
+        posts_at_last_rotation = 0
+
+        # La boucle etait auparavant limitee a 8 scrolls fixes. Avec la
+        # rotation activee (et des `max_posts` eleves, ex: 200 pour un
+        # rapport 24h), il faut pouvoir scroller beaucoup plus longtemps.
+        # On borne maintenant la boucle par un nombre max d'iterations
+        # configurable, et on s'arrete plus tot si plusieurs scrolls de suite
+        # ne rapportent aucune video nouvelle (plus la peine de continuer).
+        max_scroll_iterations = _env_int("TIKTOK_MAX_SCROLL_ITERATIONS", 60)
+        max_consecutive_empty_scrolls = _env_int("TIKTOK_MAX_EMPTY_SCROLLS", 3)
+        consecutive_empty_scrolls = 0
+
         # Scroll progressif pour charger davantage de posts.
-        for i in range(8):
+        iteration = 0
+        while iteration < max_scroll_iterations:
+            iteration += 1
+
             if _looks_like_tiktok_challenge(page):
                 if all_posts:
                     LOGGER.warning("Challenge detected during scroll; returning partial posts")
@@ -884,6 +1007,7 @@ def _scrape_with_browser(
             batch = cards + network_posts
             network_posts = []
 
+            new_posts_this_round = 0
             for card in batch:
                 sig = _video_signature(card)
                 if sig in seen:
@@ -900,6 +1024,7 @@ def _scrape_with_browser(
 
                 seen.add(sig)
                 all_posts.append(card)
+                new_posts_this_round += 1
                 if on_post is not None:
                     try:
                         on_post(dict(card))
@@ -913,6 +1038,44 @@ def _scrape_with_browser(
 
             if len(all_posts) >= max_posts:
                 break
+
+            # --- Point de decision de la rotation IPv6 ---------------------
+            # On ne verifie qu'ICI (apres avoir traite un lot de cartes, avant
+            # de scroller) pour ne jamais rater le seuil de 30 videos, meme si
+            # un lot en ramene plusieurs d'un coup.
+            if (
+                rotate_every_n_posts > 0
+                and (len(all_posts) - posts_at_last_rotation) >= rotate_every_n_posts
+            ):
+                LOGGER.info(
+                    "IPv6 rotation triggered after reaching threshold",
+                    extra={
+                        "posts_collected": len(all_posts),
+                        "rotate_every_n_posts": rotate_every_n_posts,
+                    },
+                )
+                _rotate_ipv6_identity()  # 1) le proxy local choisit une nouvelle IPv6
+                _close_current_context()  # 2) on ferme le navigateur actuel (et ses connexions "vieille IP")
+                _open_context_and_page()  # 3) on ouvre un navigateur neuf: ses connexions utiliseront la nouvelle IPv6
+                _warmup_and_open_profile(page, profile_url)  # 4) on recharge la page profil dans ce nouveau contexte
+                posts_at_last_rotation = len(all_posts)
+                consecutive_empty_scrolls = 0
+                # On ne scrolle pas immediatement: la page vient d'etre
+                # rechargee depuis le debut, le prochain tour de boucle va
+                # deja trouver du contenu (les videos deja vues seront
+                # ignorees grace a `seen`).
+                continue
+
+            if new_posts_this_round == 0:
+                consecutive_empty_scrolls += 1
+                if consecutive_empty_scrolls >= max_consecutive_empty_scrolls:
+                    LOGGER.info(
+                        "No new posts after %d scrolls in a row; stopping scroll loop",
+                        consecutive_empty_scrolls,
+                    )
+                    break
+            else:
+                consecutive_empty_scrolls = 0
 
             page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
             _human_pause(1.7, 1.0)
@@ -962,16 +1125,35 @@ def _scrape_with_browser(
         return _build_partial_result(analyzed_posts, warning=warning)
     except Exception as e:
         LOGGER.exception("Browser scraping pipeline failed")
+        # Ne jamais jeter les posts deja collectes avant l'exception (ex: timeout
+        # d'enrichissement, crash de page suite a une detection tardive, etc.).
+        # Le caller (worker) decide s'il s'agit d'un succes partiel ou d'un echec sec.
+        if all_posts:
+            LOGGER.warning(
+                "Exception occurred but %d posts were already collected; returning them as partial result",
+                len(all_posts),
+            )
+            return {
+                "posts": all_posts,
+                "total": len(all_posts),
+                "url": profile_url,
+                "error": str(e),
+                "warning": "exception_with_partial_posts",
+            }
         return {"posts": [], "error": str(e), "url": profile_url}
     finally:
-        try:
-            context.close()
-        except Exception as exc:
-            LOGGER.warning("Failed to close browser context", exc_info=True)
+        # `context`/`browser` peuvent etre None si une exception est survenue
+        # PENDANT une rotation IPv6 (entre la fermeture de l'ancien contexte
+        # et l'ouverture du nouveau) - on protege donc ces appels.
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                LOGGER.warning("Failed to close browser context", exc_info=True)
         if browser is not None:
             try:
                 browser.close()
-            except Exception as exc:
+            except Exception:
                 LOGGER.warning("Failed to close browser", exc_info=True)
 
 
@@ -1329,6 +1511,13 @@ def scrape_tiktok_page(
     slow_mo_ms = 0 if headless else 150
     proxy_candidates = _load_proxy_candidates()
 
+    # Rotation IPv6 "toutes les N videos" (0 = desactivee). Voir
+    # `_rotate_ipv6_identity` et `tools/ipv6_rotating_proxy.py` pour le
+    # mecanisme complet. Lu ici (et non code en dur) pour pouvoir l'activer
+    # uniquement sur le serveur qui a le proxy IPv6 en place, sans toucher au
+    # code sur les autres environnements (ex: poste de dev local).
+    rotate_every_n_posts = _env_int("TIKTOK_IPV6_ROTATE_EVERY_N_POSTS", 0)
+
     with sync_playwright() as p:
         last_result = None
         for attempt_index, proxy_cfg in enumerate(proxy_candidates, start=1):
@@ -1344,11 +1533,16 @@ def scrape_tiktok_page(
                 slow_mo_ms,
                 proxy_cfg,
                 analyze_video_content,
+                rotate_every_n_posts=rotate_every_n_posts,
             )
             last_result = result
-            if result.get("error") != "challenge_detected":
+            # On arrete de faire tourner les proxies dès qu'on a recupere des
+            # posts (meme partiels) ou dès qu'il ne s'agit pas d'un challenge
+            # pur (0 post). Rotation supplementaire n'a de sens que pour
+            # retenter un challenge_detected sans aucun post.
+            if result.get("posts") or result.get("error") != "challenge_detected":
                 if result.get("error"):
-                    scoped_logger.warning("Scrape finished with error")
+                    scoped_logger.warning("Scrape finished with error", extra={"has_partial_posts": bool(result.get("posts"))})
                 else:
                     scoped_logger.info("Scrape finished successfully")
                 return result

@@ -1309,42 +1309,8 @@ def _process_csv_batch_task(
         if pause > 0:
             time.sleep(pause)
 
-    for page_url in urls:
-        page_logger = with_context(scoped_logger, url=page_url)
-        page_logger.info("Processing page from CSV batch")
-
-        result = None
-        for attempt in range(1, page_attempts + 1):
-            result = scrape_tiktok_page(
-                url=page_url,
-                max_posts=max_posts_per_page,
-                max_age_hours=time_window_hours,
-                analyze_video_content=False,
-            )
-
-            error_code = str(result.get("error") or "").strip().lower()
-            if error_code not in {"challenge_detected", "no_posts_found"}:
-                break
-
-            if attempt < page_attempts:
-                backoff_multiplier = attempt
-                retry_pause = (retry_backoff_seconds * backoff_multiplier) + random.uniform(0.0, page_delay_jitter)
-                page_logger.warning("Page scrape retry scheduled after soft failure")
-                time.sleep(retry_pause)
-
-        if result.get("error"):
-            failed_pages.append({"url": page_url, "error": str(result.get("error"))})
-            page_logger.warning("Page scrape failed")
-            _page_cooldown(multiplier=1.3)
-            continue
-
-        posts = result.get("posts") or []
-        if not time_window_hours:
-            posts = posts[:max_posts_per_page]
-        if not posts:
-            failed_pages.append({"url": page_url, "error": "no_posts_found"})
-            page_logger.warning("Page returned no posts")
-            continue
+    def _publish_page_posts(page_url: str, posts: list[dict]) -> None:
+        nonlocal published_count
         likes = sum(_to_int(p.get("likes")) for p in posts)
         comments = sum(_to_int(p.get("comments_count")) for p in posts)
         shares = sum(_to_int(p.get("shares")) for p in posts)
@@ -1385,7 +1351,109 @@ def _process_csv_batch_task(
                 }
             )
 
+    def _attempt_page(page_url: str, attempts: int, page_logger) -> dict:
+        """Scrape une page avec retries internes; retourne toujours le dernier resultat.
+
+        Le resultat conserve les posts deja collectes meme en cas d'erreur
+        finale (challenge/exception), grace au fix de scraper.py qui ne jette
+        plus les posts partiels.
+        """
+        result = None
+        for attempt in range(1, attempts + 1):
+            result = scrape_tiktok_page(
+                url=page_url,
+                max_posts=max_posts_per_page,
+                max_age_hours=time_window_hours,
+                analyze_video_content=False,
+            )
+
+            if result.get("posts"):
+                # Des posts ont ete recuperes: on arrete les retries internes
+                # (meme si une erreur/warning accompagne le resultat), pour
+                # eviter de "jeter" un succes partiel en retentant a vide.
+                break
+
+            error_code = str(result.get("error") or "").strip().lower()
+            if error_code not in {"challenge_detected", "no_posts_found"}:
+                break
+
+            if attempt < attempts:
+                backoff_multiplier = attempt
+                retry_pause = (retry_backoff_seconds * backoff_multiplier) + random.uniform(0.0, page_delay_jitter)
+                page_logger.warning("Page scrape retry scheduled after soft failure")
+                time.sleep(retry_pause)
+
+        return result or {"posts": [], "error": "unknown_error", "url": page_url}
+
+    for page_url in urls:
+        page_logger = with_context(scoped_logger, url=page_url)
+        page_logger.info("Processing page from CSV batch")
+
+        result = _attempt_page(page_url, page_attempts, page_logger)
+
+        posts = result.get("posts") or []
+        if not time_window_hours:
+            posts = posts[:max_posts_per_page]
+
+        if not posts:
+            failed_pages.append({"url": page_url, "error": str(result.get("error") or "no_posts_found")})
+            page_logger.warning("Page scrape failed")
+            _page_cooldown(multiplier=1.3)
+            continue
+
+        if result.get("error"):
+            # Succes partiel: des posts ont ete collectes mais une erreur est
+            # survenue en cours de route (challenge tardif, exception apres
+            # coup...). On les garde et on ne compte pas la page en echec.
+            page_logger.warning(
+                "Page scrape ended with error but posts were recovered; keeping partial result",
+                extra={"error": str(result.get("error"))},
+            )
+
+        _publish_page_posts(page_url, posts)
         _page_cooldown()
+
+    # Round de retry final: apres avoir traite toutes les pages, on laisse la
+    # session "refroidir" puis on retente une derniere fois les pages
+    # marquees en echec pour cause de challenge/absence de posts. Objectif:
+    # que le plus de profils possible reviennent avec une reponse au lieu de
+    # rester marques en echec definitif dans le rapport.
+    final_retry_enabled = _env_bool("TIKTOK_BATCH_FINAL_RETRY_ENABLED", True)
+    recoverable_failed = [
+        row for row in failed_pages
+        if str(row.get("error") or "").strip().lower() in {"challenge_detected", "no_posts_found"}
+    ]
+    if final_retry_enabled and recoverable_failed:
+        final_retry_delay = max(0.0, float((os.getenv("TIKTOK_BATCH_FINAL_RETRY_DELAY_SECONDS") or "20").strip()))
+        scoped_logger.info(
+            "Starting final retry round for recoverable failed pages",
+            extra={"failed_count": len(recoverable_failed), "cooldown_seconds": final_retry_delay},
+        )
+        if final_retry_delay > 0:
+            time.sleep(final_retry_delay)
+
+        recoverable_urls = {row["url"] for row in recoverable_failed}
+        still_failed_urls = set(recoverable_urls)
+        for row in recoverable_failed:
+            page_url = row["url"]
+            page_logger = with_context(scoped_logger, url=page_url)
+            page_logger.info("Final retry attempt for previously failed page")
+
+            result = _attempt_page(page_url, 1, page_logger)
+            posts = result.get("posts") or []
+            if not time_window_hours:
+                posts = posts[:max_posts_per_page]
+
+            if posts:
+                page_logger.info("Final retry recovered posts for previously failed page", extra={"post_count": len(posts)})
+                _publish_page_posts(page_url, posts)
+                still_failed_urls.discard(page_url)
+            else:
+                page_logger.warning("Final retry still failed for page")
+
+            _page_cooldown(multiplier=1.3)
+
+        failed_pages = [row for row in failed_pages if row["url"] not in recoverable_urls or row["url"] in still_failed_urls]
 
     report_json_path = _build_batch_pages_report(scrape_id, source_rows, failed_pages, output_dir)
     videos_json_path = _save_batch_videos_json(scrape_id=scrape_id, videos=videos_payload, output_dir=output_dir)
@@ -1439,11 +1507,19 @@ def _process_csv_batch_task(
             scoped_logger.exception("Failed to generate fallback Mauritanie 24h PDF")
 
     has_results = published_count > 0
+    if not has_results:
+        completion_status = "FAILED"
+    elif failed_pages:
+        completion_status = "PARTIAL_SUCCESS"
+    else:
+        completion_status = "SUCCESS"
+
     completion_payload = {
         "scrapeId": scrape_id,
         "platform": "tiktok",
         "eventType": "COMPLETED",
         "success": has_results,
+        "status": completion_status,
         "errorMessage": None if has_results else "No posts extracted from CSV pages (TikTok challenge/no_posts_found)",
         "sessionReports": {
             "jsonPath": report_json_path,
@@ -1522,32 +1598,18 @@ def on_message(channel, method, properties, body):
 
         scoped_logger.info("Task received", extra={"post_id": None})
 
-        post_queue = queue.Queue()
-        done_event = threading.Event()
-        worker_result = {"value": None, "error": None}
+        # Resilience (job unique): si une tentative echoue (challenge TikTok,
+        # exception navigateur, etc.) SANS avoir publie le moindre post, on
+        # retente automatiquement avec un backoff au lieu d'abandonner tout
+        # le job immediatement. Si des posts ont deja ete publies avant que
+        # l'erreur survienne, on les conserve et on cloture en succes partiel
+        # plutot que de tout marquer FAILED.
+        job_max_attempts = max(1, int((os.getenv("TIKTOK_JOB_MAX_ATTEMPTS") or "3").strip()))
+        job_retry_backoff_seconds = max(1.0, float((os.getenv("TIKTOK_JOB_RETRY_BACKOFF_SECONDS") or "10").strip()))
 
-        def on_post(post: dict):
-            post_queue.put(post)
-
-        def run_scrape():
-            try:
-                scoped_logger.info("Starting scrape thread")
-                worker_result["value"] = scrape_tiktok_page(
-                    url=url,
-                    max_posts=max_posts,
-                    on_post=on_post,
-                    analyze_video_content=False,
-                )
-            except Exception as exc:
-                scoped_logger.exception("Scrape thread failed")
-                worker_result["error"] = exc
-            finally:
-                done_event.set()
-
-        threading.Thread(target=run_scrape, daemon=True).start()
-
-        published_snapshots = {}
+        published_snapshots: dict[str, tuple] = {}
         published_count = 0
+        collected_posts_by_sig: dict[str, dict] = {}
 
         def _payload_snapshot(payload: dict):
             metrics = payload.get("metrics") or {}
@@ -1563,47 +1625,93 @@ def on_message(channel, method, properties, body):
                 bool(payload.get("videoReport")),
             )
 
-        while True:
-            try:
-                post = post_queue.get(timeout=0.5)
-                sig = _post_signature(post)
-                payload = normalize_post(scrape_id, url, post)
-                snapshot = _payload_snapshot(payload)
-                previous = published_snapshots.get(sig)
-                if previous is None or snapshot != previous:
-                    published_snapshots[sig] = snapshot
-                    publish_result(channel, payload)
-                    published_count += 1
-            except queue.Empty:
-                if done_event.is_set():
-                    break
-
-        if worker_result["error"] is not None:
-            raise worker_result["error"]
-
-        result = worker_result["value"] or {}
-        if result.get("error"):
-            scoped_logger.error("Scraper returned error", extra={"post_id": None})
-            publish_error(channel, scrape_id, result["error"])
-            channel.basic_ack(delivery_tag=method.delivery_tag)
-            return
-
-        posts = result.get("posts", [])
-        if not posts:
-            scoped_logger.warning("No posts found for task")
-            publish_error(channel, scrape_id, "No TikTok posts found")
-            channel.basic_ack(delivery_tag=method.delivery_tag)
-            return
-
-        for post in posts:
+        def _publish_post_if_new(post: dict) -> None:
+            nonlocal published_count
             sig = _post_signature(post)
             payload = normalize_post(scrape_id, url, post)
             snapshot = _payload_snapshot(payload)
+            collected_posts_by_sig[sig] = post
             previous = published_snapshots.get(sig)
             if previous is None or snapshot != previous:
                 published_snapshots[sig] = snapshot
                 publish_result(channel, payload)
                 published_count += 1
+
+        result: dict = {}
+        for attempt in range(1, job_max_attempts + 1):
+            post_queue = queue.Queue()
+            done_event = threading.Event()
+            worker_result = {"value": None, "error": None}
+
+            def on_post(post: dict):
+                post_queue.put(post)
+
+            def run_scrape():
+                try:
+                    scoped_logger.info("Starting scrape thread", extra={"attempt": attempt})
+                    worker_result["value"] = scrape_tiktok_page(
+                        url=url,
+                        max_posts=max_posts,
+                        on_post=on_post,
+                        analyze_video_content=False,
+                    )
+                except Exception as exc:
+                    scoped_logger.exception("Scrape thread failed")
+                    worker_result["error"] = exc
+                finally:
+                    done_event.set()
+
+            threading.Thread(target=run_scrape, daemon=True).start()
+
+            while True:
+                try:
+                    post = post_queue.get(timeout=0.5)
+                    _publish_post_if_new(post)
+                except queue.Empty:
+                    if done_event.is_set():
+                        break
+
+            if worker_result["error"] is not None:
+                raise worker_result["error"]
+
+            result = worker_result["value"] or {}
+            for post in result.get("posts") or []:
+                _publish_post_if_new(post)
+
+            attempt_error = str(result.get("error") or "").strip()
+            if not attempt_error:
+                break
+
+            if published_count > 0:
+                scoped_logger.warning(
+                    "Attempt failed but posts already published; keeping them as partial success",
+                    extra={"attempt": attempt, "error": attempt_error, "published_count": published_count},
+                )
+                break
+
+            if attempt < job_max_attempts:
+                backoff = job_retry_backoff_seconds * attempt + random.uniform(0.0, 2.0)
+                scoped_logger.warning(
+                    "Attempt failed with 0 posts; retrying after backoff",
+                    extra={"attempt": attempt, "error": attempt_error, "backoff_seconds": round(backoff, 1)},
+                )
+                time.sleep(backoff)
+            else:
+                scoped_logger.error(
+                    "All attempts failed with 0 posts",
+                    extra={"attempts": job_max_attempts, "error": attempt_error},
+                )
+
+        attempt_error = str(result.get("error") or "").strip()
+
+        if published_count == 0:
+            # Echec sec: malgre les tentatives, aucun post n'a pu etre recupere.
+            scoped_logger.error("No posts found for task after retries", extra={"post_id": None})
+            publish_error(channel, scrape_id, attempt_error or "No TikTok posts found")
+            channel.basic_ack(delivery_tag=method.delivery_tag)
+            return
+
+        posts = list(collected_posts_by_sig.values())
 
         enriched_posts = []
         enrichment_enabled = _env_bool("TIKTOK_ASYNC_ENRICHMENT_ENABLED", True)
@@ -1649,7 +1757,7 @@ def on_message(channel, method, properties, body):
 
         try:
             session_output_dir = Path(os.getenv("VIDEO_ANALYSIS_OUTPUT_DIR") or "video_reports")
-            raw_posts = enriched_posts if enriched_posts else result.get("posts", [])
+            raw_posts = enriched_posts if enriched_posts else posts
             session_json = build_session_json_report(page_url=url, posts=raw_posts, output_dir=str(session_output_dir))
             session_json_path = session_json.get("json_path")
             session_html_path = _build_session_html_report(page_url=url, posts=raw_posts, output_dir=session_output_dir)
@@ -1657,12 +1765,23 @@ def on_message(channel, method, properties, body):
         except Exception:
             scoped_logger.exception("Failed to generate session reports")
 
+        # PARTIAL_SUCCESS: une erreur/challenge est survenu en cours de route
+        # (ou apres coup) mais des posts ont ete recuperes et publies malgre
+        # tout. SUCCESS: tout s'est deroule sans accroc.
+        is_partial = bool(attempt_error) or result.get("warning") in (
+            "challenge_detected_partial",
+            "exception_with_partial_posts",
+        )
+        completion_status = "PARTIAL_SUCCESS" if is_partial else "SUCCESS"
+
         completion_payload = {
             "scrapeId": scrape_id,
             "platform": "tiktok",
             "eventType": "COMPLETED",
             "success": True,
-            "errorMessage": None,
+            "status": completion_status,
+            "errorMessage": attempt_error or None,
+            "count": published_count,
             "sessionReports": {
                 "jsonPath": session_json_path,
                 "htmlPath": session_html_path,

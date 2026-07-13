@@ -191,7 +191,9 @@ public class ScrapeController {
             ScrapeStatus currentStatus = orchestrationService.getJob(scrapeId)
                     .map(ScrapeJob::getStatus)
                     .orElse(ScrapeStatus.FAILED);
-            if (currentStatus == ScrapeStatus.SUCCESS || currentStatus == ScrapeStatus.FAILED) {
+            if (currentStatus == ScrapeStatus.SUCCESS
+                    || currentStatus == ScrapeStatus.PARTIAL_SUCCESS
+                    || currentStatus == ScrapeStatus.FAILED) {
                 break;
             }
 
@@ -214,7 +216,9 @@ public class ScrapeController {
         ScrapeStatus latestStatus = orchestrationService.getJob(scrapeId)
                 .map(ScrapeJob::getStatus)
                 .orElse(job.getStatus());
-        boolean done = latestStatus == ScrapeStatus.SUCCESS || latestStatus == ScrapeStatus.FAILED;
+        boolean done = latestStatus == ScrapeStatus.SUCCESS
+                || latestStatus == ScrapeStatus.PARTIAL_SUCCESS
+                || latestStatus == ScrapeStatus.FAILED;
 
         return ResponseEntity.ok(Map.of(
                 "scrape_id", scrapeId,
@@ -306,7 +310,7 @@ public class ScrapeController {
         try {
             return ScrapeStatus.valueOf(status.trim().toUpperCase());
         } catch (IllegalArgumentException ex) {
-            throw new IllegalArgumentException("status must be one of: QUEUED, RUNNING, SUCCESS, FAILED");
+            throw new IllegalArgumentException("status must be one of: QUEUED, RUNNING, SUCCESS, PARTIAL_SUCCESS, FAILED");
         }
     }
 

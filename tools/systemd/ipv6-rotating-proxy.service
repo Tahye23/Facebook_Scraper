@@ -1,0 +1,23 @@
+[Unit]
+Description=IPv6 rotating SOCKS5 proxy for scraping resilience
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adapter ces deux chemins a votre installation:
+WorkingDirectory=/home/USER/Facebook_Scraper
+EnvironmentFile=/home/USER/Facebook_Scraper/.env
+Environment=IPV6_PROXY_LISTEN_HOST=127.0.0.1
+Environment=IPV6_PROXY_LISTEN_PORT=1080
+Environment=IPV6_PROXY_ROTATE_MODE=manual
+Environment=IPV6_PROXY_CONTROL_PORT=8091
+# IPV6_PROXY_PREFIX doit etre defini dans le .env (bloc /64 delegue par OVHcloud)
+ExecStart=/usr/bin/python3 "/home/USER/Facebook_Scraper/tools/ipv6_rotating_proxy.py"
+Restart=on-failure
+RestartSec=3
+User=USER
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

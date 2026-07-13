@@ -56,7 +56,18 @@ public class ScrapeResultListener {
                 job.setUpdatedAt(Instant.now());
                 jobRepository.save(job);
             }
-            updateJobStatus(job, ScrapeStatus.SUCCESS, null);
+            // Le worker peut signaler un succes partiel (posts recuperes malgre
+            // un challenge/une erreur en cours de route) via le champ "status".
+            // On ne marque FAILED que si le worker n'a explicitement publie
+            // aucun resultat exploitable (cas gere par le early-return !success
+            // ci-dessus).
+            String reportedStatus = getString(message, "status");
+            ScrapeStatus finalStatus = "PARTIAL_SUCCESS".equalsIgnoreCase(reportedStatus)
+                    ? ScrapeStatus.PARTIAL_SUCCESS
+                    : ScrapeStatus.SUCCESS;
+            updateJobStatus(job, finalStatus, "PARTIAL_SUCCESS".equalsIgnoreCase(reportedStatus)
+                    ? getString(message, "errorMessage", "error_message")
+                    : null);
             return;
         }
 

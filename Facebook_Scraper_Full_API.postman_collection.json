@@ -1,0 +1,574 @@
+{
+  "info": {
+    "_postman_id": "3f1a2c8e-9b4d-4e2f-8a6b-7c5d0e1f2a3b",
+    "name": "Facebook & TikTok Scraper - API complete + Ops",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "Collection consolidee pour l'architecture RabbitMQ/MongoDB/Spring Boot + workers Python (Facebook, TikTok).\n\nOrganisation en 5 dossiers:\n1. Health & Infra (gateway + proxy IPv6 de rotation)\n2. Jobs - Creation (POST /scrape, csv-report, csv-report-24h)\n3. Jobs - Statut & Resultats (GET status/results/stream)\n4. Requetes DB (jobs/results avec filtres)\n5. Cas d'erreur (validation, 404)\n\nNOTE IMPORTANTE sur le dossier 'Health & Infra > Proxy IPv6': le proxy de\nrotation (tools/ipv6_rotating_proxy.py) n'ecoute que sur 127.0.0.1 du VPS,\npour des raisons de securite (aucune authentification sur /rotate). Si vous\nexecutez Postman depuis votre PC et non depuis le VPS, il faut d'abord ouvrir\nun tunnel SSH:\n  ssh -L 8091:127.0.0.1:8091 -L 1080:127.0.0.1:1080 votre_user@votre_vps\nUne fois le tunnel ouvert, http://127.0.0.1:8091/... depuis Postman sur votre\nPC atteint bien le proxy du VPS.",
+    "schema_note": "Toutes les reponses JSON de la gateway sont en snake_case (spring.jackson.property-naming-strategy=SNAKE_CASE)."
+  },
+  "item": [
+    {
+      "name": "1. Health & Infra",
+      "item": [
+        {
+          "name": "Gateway Health - GET /actuator/health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/actuator/health",
+              "host": ["{{base_url}}"],
+              "path": ["actuator", "health"]
+            },
+            "description": "Verifie que la gateway Spring Boot est UP (et donc que sa connexion a MongoDB/RabbitMQ fonctionne)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Status is UP', function () {",
+                  "    const data = pm.response.json();",
+                  "    pm.expect(data.status).to.eql('UP');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Proxy IPv6 - Status - GET /status",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{proxy_control_base_url}}/status",
+              "host": ["{{proxy_control_base_url}}"],
+              "path": ["status"]
+            },
+            "description": "Verifie que le proxy SOCKS5 de rotation IPv6 (systemd, sur le VPS) est bien demarre. Necessite un tunnel SSH si Postman tourne hors du VPS (voir description de la collection)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Body starts with OK', function () {",
+                  "    pm.expect(pm.response.text()).to.include('OK');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Proxy IPv6 - Forcer une rotation - GET /rotate",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{proxy_control_base_url}}/rotate",
+              "host": ["{{proxy_control_base_url}}"],
+              "path": ["rotate"]
+            },
+            "description": "Force le proxy a choisir immediatement une nouvelle adresse IPv6 aleatoire dans le bloc /64 configure (IPV6_PROXY_PREFIX). C'est le meme endpoint que scraper.py appelle automatiquement toutes les TIKTOK_IPV6_ROTATE_EVERY_N_POSTS videos: utile ici pour tester manuellement la rotation sans lancer un scraping complet.\n\nAppelez deux fois de suite et comparez le corps de la reponse: l'adresse doit changer."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "const body = pm.response.text();",
+                  "pm.test('Response contains new IPv6 address', function () {",
+                  "    pm.expect(body).to.match(/OK\\s+[0-9a-fA-F:]+/);",
+                  "});",
+                  "console.log('Nouvelle adresse IPv6 du proxy:', body.trim());"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2. Jobs - Creation",
+      "item": [
+        {
+          "name": "Create Job Facebook - POST /scrape",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"url\": \"https://www.facebook.com/some-page-or-post\",\n  \"platform\": \"facebook\",\n  \"max_posts\": 5\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/scrape",
+              "host": ["{{base_url}}"],
+              "path": ["scrape"]
+            },
+            "description": "Cree un job de scraping Facebook et memorise scrape_id_facebook."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 202', function () {",
+                  "    pm.response.to.have.status(202);",
+                  "});",
+                  "const data = pm.response.json();",
+                  "pm.test('Response contains scrape_id', function () {",
+                  "    pm.expect(data.scrape_id).to.exist;",
+                  "});",
+                  "if (data.scrape_id) {",
+                  "    pm.collectionVariables.set('scrape_id', data.scrape_id);",
+                  "    pm.collectionVariables.set('scrape_id_facebook', data.scrape_id);",
+                  "    pm.collectionVariables.set('result_cursor_facebook', '');",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create Job TikTok - POST /scrape",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"url\": \"https://www.tiktok.com/@someuser\",\n  \"platform\": \"tiktok\",\n  \"max_posts\": 5\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/scrape",
+              "host": ["{{base_url}}"],
+              "path": ["scrape"]
+            },
+            "description": "Cree un job de scraping TikTok (job unique, une seule URL de profil) et memorise scrape_id_tiktok."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 202', function () {",
+                  "    pm.response.to.have.status(202);",
+                  "});",
+                  "const data = pm.response.json();",
+                  "pm.test('Response contains scrape_id', function () {",
+                  "    pm.expect(data.scrape_id).to.exist;",
+                  "});",
+                  "if (data.scrape_id) {",
+                  "    pm.collectionVariables.set('scrape_id', data.scrape_id);",
+                  "    pm.collectionVariables.set('scrape_id_tiktok', data.scrape_id);",
+                  "    pm.collectionVariables.set('result_cursor_tiktok', '');",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create CSV Batch Report TikTok - POST /scrape/csv-report",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "{{csv_file_path}}",
+                  "description": "Fichier CSV contenant des URLs de profils TikTok"
+                },
+                {
+                  "key": "maxPostsPerPage",
+                  "value": "{{max_posts_per_page}}",
+                  "type": "text",
+                  "description": "1 a 20"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}/scrape/csv-report",
+              "host": ["{{base_url}}"],
+              "path": ["scrape", "csv-report"]
+            },
+            "description": "Cree un job batch CSV TikTok (nombre fixe de posts par page) et retourne scrape_id + nombre d'URLs detectees."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 202', function () {",
+                  "    pm.response.to.have.status(202);",
+                  "});",
+                  "const data = pm.response.json();",
+                  "pm.test('Response contains scrape_id', function () {",
+                  "    pm.expect(data.scrape_id).to.exist;",
+                  "});",
+                  "if (data.scrape_id) {",
+                  "    pm.collectionVariables.set('scrape_id', data.scrape_id);",
+                  "    pm.collectionVariables.set('scrape_id_tiktok', data.scrape_id);",
+                  "    pm.collectionVariables.set('result_cursor_tiktok', '');",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create CSV Batch Report TikTok 24h - POST /scrape/csv-report-24h",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "{{csv_file_path}}",
+                  "description": "Fichier CSV contenant des URLs de profils TikTok"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}/scrape/csv-report-24h",
+              "host": ["{{base_url}}"],
+              "path": ["scrape", "csv-report-24h"]
+            },
+            "description": "Cree un job batch CSV TikTok avec fenetre automatique des dernieres 24h (pas de maxPostsPerPage: chaque page scrolle jusqu'a sortir de la fenetre de 24h). C'est ce endpoint qui beneficie le plus de la rotation IPv6 (TIKTOK_IPV6_ROTATE_EVERY_N_POSTS)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 202', function () {",
+                  "    pm.response.to.have.status(202);",
+                  "});",
+                  "const data = pm.response.json();",
+                  "pm.test('Response contains scrape_id', function () {",
+                  "    pm.expect(data.scrape_id).to.exist;",
+                  "});",
+                  "if (data.scrape_id) {",
+                  "    pm.collectionVariables.set('scrape_id', data.scrape_id);",
+                  "    pm.collectionVariables.set('scrape_id_tiktok', data.scrape_id);",
+                  "    pm.collectionVariables.set('result_cursor_tiktok', '');",
+                  "}"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "3. Jobs - Statut & Resultats",
+      "item": [
+        {
+          "name": "Get Job Status - GET /scrape/{scrapeId}",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/scrape/{{scrape_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["scrape", "{{scrape_id}}"]
+            },
+            "description": "Statut du dernier job cree (QUEUED, RUNNING, SUCCESS, PARTIAL_SUCCESS ou FAILED). PARTIAL_SUCCESS signifie que des posts ont ete recuperes malgre une erreur/challenge en cours de route (voir metadata pour le detail)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "const data = pm.response.json();",
+                  "if (data.metadata && data.metadata.jsonPath) {",
+                  "    pm.collectionVariables.set('batch_report_json_path', data.metadata.jsonPath);",
+                  "}",
+                  "console.log('Job status:', data.status);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get Job Results (snapshot complet) - GET /scrape/{scrapeId}/results",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/scrape/{{scrape_id}}/results",
+              "host": ["{{base_url}}"],
+              "path": ["scrape", "{{scrape_id}}", "results"]
+            },
+            "description": "Recupere TOUS les resultats stockes en MongoDB pour ce scrape_id (snapshot, pas de pagination)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200 or 202', function () {",
+                  "    pm.expect(pm.response.code).to.be.oneOf([200, 202]);",
+                  "});",
+                  "const data = pm.response.json();",
+                  "pm.test('Response has results array', function () {",
+                  "    pm.expect(data.results).to.be.an('array');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Stream Results Facebook (cursor + long-poll) - GET /scrape/{scrapeId}/results/stream",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/scrape/{{scrape_id_facebook}}/results/stream?cursor={{result_cursor_facebook}}&limit=5&waitMs=15000",
+              "host": ["{{base_url}}"],
+              "path": ["scrape", "{{scrape_id_facebook}}", "results", "stream"],
+              "query": [
+                { "key": "cursor", "value": "{{result_cursor_facebook}}", "description": "Cursor renvoye par l'appel precedent (vide au premier appel)" },
+                { "key": "limit", "value": "5" },
+                { "key": "waitMs", "value": "15000", "description": "Long-poll en ms (0..30000)" }
+              ]
+            },
+            "description": "Ne retourne que les NOUVEAUX resultats apres le cursor (mode progressif). Rejouez cette requete en boucle jusqu'a done=true. Met a jour result_cursor_facebook automatiquement."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "const data = pm.response.json();",
+                  "if (data.next_cursor !== undefined) {",
+                  "    pm.collectionVariables.set('result_cursor_facebook', data.next_cursor || '');",
+                  "}",
+                  "console.log('done=', data.done, 'status=', data.status, 'count=', data.count);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Stream Results TikTok (cursor + long-poll) - GET /scrape/{scrapeId}/results/stream",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/scrape/{{scrape_id_tiktok}}/results/stream?cursor={{result_cursor_tiktok}}&limit=5&waitMs=15000",
+              "host": ["{{base_url}}"],
+              "path": ["scrape", "{{scrape_id_tiktok}}", "results", "stream"],
+              "query": [
+                { "key": "cursor", "value": "{{result_cursor_tiktok}}", "description": "Cursor renvoye par l'appel precedent (vide au premier appel)" },
+                { "key": "limit", "value": "5" },
+                { "key": "waitMs", "value": "15000", "description": "Long-poll en ms (0..30000)" }
+              ]
+            },
+            "description": "Ne retourne que les NOUVEAUX resultats apres le cursor (mode progressif). Rejouez cette requete en boucle jusqu'a done=true. Met a jour result_cursor_tiktok automatiquement."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "const data = pm.response.json();",
+                  "if (data.next_cursor !== undefined) {",
+                  "    pm.collectionVariables.set('result_cursor_tiktok', data.next_cursor || '');",
+                  "}",
+                  "console.log('done=', data.done, 'status=', data.status, 'count=', data.count);"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "4. Requetes DB (jobs/resultats avec filtres)",
+      "item": [
+        {
+          "name": "List Jobs DB - GET /scrape/jobs",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/scrape/jobs?platform=tiktok&status=SUCCESS&limit=20",
+              "host": ["{{base_url}}"],
+              "path": ["scrape", "jobs"],
+              "query": [
+                { "key": "platform", "value": "tiktok", "description": "facebook|tiktok (optionnel)" },
+                { "key": "status", "value": "SUCCESS", "description": "QUEUED|RUNNING|SUCCESS|PARTIAL_SUCCESS|FAILED (optionnel)" },
+                { "key": "limit", "value": "20" }
+              ]
+            },
+            "description": "Liste les jobs stockes en MongoDB avec filtres optionnels."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "const data = pm.response.json();",
+                  "pm.test('Response has jobs array', function () {",
+                  "    pm.expect(data.jobs).to.be.an('array');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List Results DB - GET /scrape/results",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/scrape/results?scrapeId={{scrape_id}}&platform=tiktok&limit=100",
+              "host": ["{{base_url}}"],
+              "path": ["scrape", "results"],
+              "query": [
+                { "key": "scrapeId", "value": "{{scrape_id}}" },
+                { "key": "platform", "value": "tiktok", "description": "facebook|tiktok (optionnel)" },
+                { "key": "limit", "value": "100" }
+              ]
+            },
+            "description": "Liste les resultats stockes en MongoDB avec filtres optionnels."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "const data = pm.response.json();",
+                  "pm.test('Response has results array', function () {",
+                  "    pm.expect(data.results).to.be.an('array');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "5. Cas d'erreur",
+      "item": [
+        {
+          "name": "Validation Error - POST /scrape (plateforme invalide)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"url\": \"https://example.com\",\n  \"platform\": \"instagram\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/scrape",
+              "host": ["{{base_url}}"],
+              "path": ["scrape"]
+            },
+            "description": "Teste l'erreur metier pour une plateforme non supportee (doit repondre 400)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 400', function () {",
+                  "    pm.response.to.have.status(400);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Not Found - GET /scrape/{scrapeId inexistant}",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/scrape/not-existing-id",
+              "host": ["{{base_url}}"],
+              "path": ["scrape", "not-existing-id"]
+            },
+            "description": "Teste le 404 quand le scrape_id n'existe pas."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 404', function () {",
+                  "    pm.response.to.have.status(404);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "variable": [
+    { "key": "base_url", "value": "http://localhost:8080", "description": "URL de la gateway Spring Boot (ex: http://VOTRE_VPS_IP:8080 en production)" },
+    { "key": "proxy_control_base_url", "value": "http://127.0.0.1:8091", "description": "Port de controle du proxy IPv6 (voir note dans la description de la collection: tunnel SSH requis si Postman ne tourne pas sur le VPS)" },
+    { "key": "scrape_id", "value": "" },
+    { "key": "scrape_id_facebook", "value": "" },
+    { "key": "scrape_id_tiktok", "value": "" },
+    { "key": "result_cursor", "value": "" },
+    { "key": "result_cursor_facebook", "value": "" },
+    { "key": "result_cursor_tiktok", "value": "" },
+    { "key": "csv_file_path", "value": "" },
+    { "key": "max_posts_per_page", "value": "3" },
+    { "key": "batch_report_json_path", "value": "" }
+  ]
+}

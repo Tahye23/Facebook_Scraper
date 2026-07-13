@@ -2,7 +2,7 @@ services:
 
   # ─── MongoDB ───────────────────────────────────────────────────────────────
   mongodb:
-    image: mongo:7.0
+    image: mongo:8.0
     container_name: scraper_mongodb
     restart: unless-stopped
     environment:
@@ -23,7 +23,7 @@ services:
 
   # ─── RabbitMQ ──────────────────────────────────────────────────────────────
   rabbitmq:
-    image: rabbitmq:3.13-management-alpine
+    image: rabbitmq:4.3-management-alpine
     container_name: scraper_rabbitmq
     restart: unless-stopped
     environment:
@@ -74,6 +74,8 @@ services:
       - scraper_net
 
   # ─── Worker Facebook ───────────────────────────────────────────────────────
+  # Reste sur le reseau bridge "scraper_net" (isole): il ne parle pas au proxy
+  # IPv6 local, donc pas besoin d'acceder au reseau de l'hote.
   worker-facebook:
     build:
       context: "./platform/facebook scraper"
@@ -89,12 +91,61 @@ services:
       RABBITMQ_QUEUE: scraping_queue_facebook
       RABBITMQ_RESULT_QUEUE: scrape_result_queue
       RABBITMQ_EXCHANGE: scrape.exchange
-    command: ["python", "-u", "worker.py"]
+    volumes:
+      # fb_cookies.json contient la session Facebook (exportee au prealable via
+      # save_session.py); on la monte plutot que de la copier dans l'image
+      # pour ne jamais committer/embarquer un secret dans un layer Docker.
+      - "./platform/facebook scraper/fb_cookies.json:/app/fb_cookies.json:ro"
+      - "./logs:/app/logs"
+    command: ["python", "worker.py"]
     depends_on:
       rabbitmq:
         condition: service_healthy
     networks:
       - scraper_net
+
+  # ─── Worker TikTok ─────────────────────────────────────────────────────────
+  # TRES IMPORTANT: network_mode "host" (pas de "networks:" ni de "ports:" avec
+  # ce mode). Ce worker doit pouvoir joindre le proxy SOCKS5 de rotation IPv6
+  # (tools/ipv6_rotating_proxy.py) qui tourne EN SYSTEMD DIRECTEMENT SUR L'HOTE
+  # du VPS, sur 127.0.0.1:1080 (proxy) et 127.0.0.1:8091 (controle /rotate).
+  # Avec le reseau bridge par defaut, 127.0.0.1 a l'interieur du conteneur ne
+  # designerait PAS l'hote mais le conteneur lui-meme: le proxy serait injoignable.
+  # Consequence: comme ce conteneur partage la pile reseau de l'hote, il ne
+  # peut PAS resoudre "rabbitmq" par DNS (ce nom n'existe que sur scraper_net);
+  # il faut donc utiliser 127.0.0.1 (le port 5672 est publie sur l'hote par le
+  # service rabbitmq ci-dessus).
+  worker-tiktok:
+    build:
+      context: .
+      dockerfile: "platform/tiktok scraper/Dockerfile"
+    container_name: scraper_worker_tiktok
+    restart: unless-stopped
+    network_mode: "host"
+    env_file:
+      - .env
+    environment:
+      RABBITMQ_HOST: 127.0.0.1
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+      RABBITMQ_QUEUE: scraping_queue_tiktok
+      RABBITMQ_RESULT_QUEUE: scrape_result_queue
+      RABBITMQ_EXCHANGE: scrape.exchange
+      # Override du chemin defini dans .env (qui est relatif a la racine du
+      # repo pour les runs locaux hors Docker): dans le conteneur, le CWD est
+      # deja "platform/tiktok scraper", donc un chemin relatif simple suffit.
+      VIDEO_ANALYSIS_OUTPUT_DIR: video_reports
+    volumes:
+      # Le dossier est copie sans espace dans l'image ("tiktok-scraper", voir
+      # Dockerfile), d'ou le chemin different a droite du ":".
+      - "./platform/tiktok scraper/tiktok_profile:/app/platform/tiktok-scraper/tiktok_profile"
+      - "./platform/tiktok scraper/video_reports:/app/platform/tiktok-scraper/video_reports"
+      - "./logs:/app/logs"
+    command: ["python", "worker.py"]
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
 
 # ─── Volumes ───────────────────────────────────────────────────────────────
 volumes:

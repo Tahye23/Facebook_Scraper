@@ -4,6 +4,8 @@
 cookies.json
 fb_cookies.json
 platform/facebook scraper/fb_cookies.json
+# Profil Chrome complet (cookies/cache/session Facebook) - jamais committer.
+platform/facebook scraper/fb_profile/
 platform/tiktok scraper/tiktok_cookies.json
 platform/tiktok scraper/tiktok_challenge.png
 platform/tiktok scraper/tiktok_challenge.html

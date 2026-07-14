@@ -32,7 +32,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from logging_setup import get_logger, with_context
-from scraper import scrape_tiktok_page
+from scraper import get_proxy_pool, scrape_tiktok_page
 from video_analysis import (
     analyze_tiktok_video,
     analyze_videos_json_with_gemini,
@@ -1273,6 +1273,49 @@ def _build_fallback_ar_report_from_videos(videos_payload: list[dict]) -> dict:
     }
 
 
+def _split_round_robin(items: list, num_buckets: int) -> list[list]:
+    """Repartit `items` en `num_buckets` sous-listes, en alternance (round-robin).
+
+    Exemple avec 7 urls et 3 buckets -> [u0,u3,u6], [u1,u4], [u2,u5].
+    Chaque bucket est ensuite traite par un thread dedie (une "lane"), qui
+    reste attache a UN SEUL proxy pendant toute sa lane: c'est ce qui permet
+    de "diviser le travail" sur N proxies en parallele plutot que de les
+    utiliser en rotation sequentielle sur une seule page a la fois.
+    """
+    num_buckets = max(1, num_buckets)
+    buckets = [[] for _ in range(num_buckets)]
+    for index, item in enumerate(items):
+        buckets[index % num_buckets].append(item)
+    return [bucket for bucket in buckets if bucket]
+
+
+def _resolve_batch_concurrency(proxy_pool_size: int) -> int:
+    """Determine le nombre de "lanes" paralleles pour un batch CSV.
+
+    Par defaut: une lane par proxy configure dans TIKTOK_PROXY_LIST (ex: 10
+    proxies Webshare = 10 profils TikTok traites en parallele, chacun avec sa
+    propre adresse IP source). Peut etre force via TIKTOK_BATCH_CONCURRENCY
+    (utile pour limiter la charge meme avec plus de proxies disponibles, ou
+    pour paralleliser aussi en mode direct sans proxy).
+    """
+    override = (os.getenv("TIKTOK_BATCH_CONCURRENCY") or "").strip()
+    if override:
+        try:
+            value = int(override)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return proxy_pool_size if proxy_pool_size > 0 else 1
+
+
+def _proxy_label(proxy_cfg: dict | None) -> str:
+    """Description courte (sans mot de passe) du proxy utilise, pour les logs."""
+    if not proxy_cfg:
+        return "direct"
+    return proxy_cfg.get("server") or "proxy"
+
+
 def _process_csv_batch_task(
     channel,
     scrape_id: str,
@@ -1287,11 +1330,22 @@ def _process_csv_batch_task(
     page_delay_jitter = max(0.0, float((os.getenv("TIKTOK_BATCH_PAGE_DELAY_JITTER_SECONDS") or "1.5").strip()))
     retry_backoff_seconds = max(0.5, float((os.getenv("TIKTOK_BATCH_RETRY_BACKOFF_SECONDS") or "5").strip()))
 
+    # Repartition du travail sur plusieurs proxies (voir _split_round_robin /
+    # _resolve_batch_concurrency). Avec 0 proxy configure, on garde une seule
+    # lane sequentielle: comportement strictement identique a avant.
+    proxy_pool = get_proxy_pool()
+    batch_concurrency = _resolve_batch_concurrency(len(proxy_pool))
+    scoped_logger.info(
+        "Batch concurrency resolved for CSV task",
+        extra={"proxy_pool_size": len(proxy_pool), "concurrency": batch_concurrency, "page_count": len(urls)},
+    )
+
     source_rows = []
     failed_pages = []
     videos_payload = []
     published_count = 0
     published_snapshots = {}
+    state_lock = threading.Lock()
 
     def _payload_snapshot(payload: dict):
         metrics = payload.get("metrics") or {}
@@ -1310,53 +1364,61 @@ def _process_csv_batch_task(
             time.sleep(pause)
 
     def _publish_page_posts(page_url: str, posts: list[dict]) -> None:
+        # Appele depuis plusieurs threads/lanes en parallele: toute mutation
+        # d'etat partage (listes/dict/compteur) doit rester sous `state_lock`.
         nonlocal published_count
         likes = sum(_to_int(p.get("likes")) for p in posts)
         comments = sum(_to_int(p.get("comments_count")) for p in posts)
         shares = sum(_to_int(p.get("shares")) for p in posts)
         views = sum(_to_int(p.get("views")) for p in posts)
 
-        source_rows.append(
-            {
-                "source": page_url,
-                "posts": len(posts),
-                "likes": likes,
-                "comments": comments,
-                "shares": shares,
-                "views": views,
-            }
-        )
-
-        for post in posts:
-            sig = f"{page_url}|{_post_signature(post)}"
-            payload = normalize_post(scrape_id, page_url, post)
-            snapshot = _payload_snapshot(payload)
-            previous = published_snapshots.get(sig)
-            if previous is None or snapshot != previous:
-                published_snapshots[sig] = snapshot
-                publish_result(channel, payload)
-                published_count += 1
-
-            videos_payload.append(
+        with state_lock:
+            source_rows.append(
                 {
                     "source": page_url,
-                    "post_url": payload.get("sourceUrl"),
-                    "author": payload.get("author"),
-                    "description": payload.get("textContent"),
-                    "likes": (payload.get("metrics") or {}).get("likes"),
-                    "comments": (payload.get("metrics") or {}).get("comments"),
-                    "shares": (payload.get("metrics") or {}).get("shares"),
-                    "views": (payload.get("metrics") or {}).get("views"),
-                    "published_at": payload.get("publishedAt"),
+                    "posts": len(posts),
+                    "likes": likes,
+                    "comments": comments,
+                    "shares": shares,
+                    "views": views,
                 }
             )
 
-    def _attempt_page(page_url: str, attempts: int, page_logger) -> dict:
+            for post in posts:
+                sig = f"{page_url}|{_post_signature(post)}"
+                payload = normalize_post(scrape_id, page_url, post)
+                snapshot = _payload_snapshot(payload)
+                previous = published_snapshots.get(sig)
+                if previous is None or snapshot != previous:
+                    published_snapshots[sig] = snapshot
+                    publish_result(channel, payload)
+                    published_count += 1
+
+                videos_payload.append(
+                    {
+                        "source": page_url,
+                        "post_url": payload.get("sourceUrl"),
+                        "author": payload.get("author"),
+                        "description": payload.get("textContent"),
+                        "likes": (payload.get("metrics") or {}).get("likes"),
+                        "comments": (payload.get("metrics") or {}).get("comments"),
+                        "shares": (payload.get("metrics") or {}).get("shares"),
+                        "views": (payload.get("metrics") or {}).get("views"),
+                        "published_at": payload.get("publishedAt"),
+                    }
+                )
+
+    def _attempt_page(page_url: str, attempts: int, page_logger, proxy_cfg: dict | None = None) -> dict:
         """Scrape une page avec retries internes; retourne toujours le dernier resultat.
 
         Le resultat conserve les posts deja collectes meme en cas d'erreur
         finale (challenge/exception), grace au fix de scraper.py qui ne jette
         plus les posts partiels.
+
+        `proxy_cfg`: proxy dedie de la lane courante (voir `get_proxy_pool` /
+        `_split_round_robin`). Passe tel quel a `scrape_tiktok_page` via
+        `proxy_override`, pour que cette page utilise TOUJOURS ce proxy (pas
+        de rotation croisee avec les autres lanes).
         """
         result = None
         for attempt in range(1, attempts + 1):
@@ -1365,6 +1427,7 @@ def _process_csv_batch_task(
                 max_posts=max_posts_per_page,
                 max_age_hours=time_window_hours,
                 analyze_video_content=False,
+                proxy_override=proxy_cfg,
             )
 
             if result.get("posts"):
@@ -1385,21 +1448,22 @@ def _process_csv_batch_task(
 
         return result or {"posts": [], "error": "unknown_error", "url": page_url}
 
-    for page_url in urls:
+    def _process_one_page(page_url: str, proxy_cfg: dict | None) -> None:
         page_logger = with_context(scoped_logger, url=page_url)
-        page_logger.info("Processing page from CSV batch")
+        page_logger.info("Processing page from CSV batch", extra={"proxy": _proxy_label(proxy_cfg)})
 
-        result = _attempt_page(page_url, page_attempts, page_logger)
+        result = _attempt_page(page_url, page_attempts, page_logger, proxy_cfg=proxy_cfg)
 
         posts = result.get("posts") or []
         if not time_window_hours:
             posts = posts[:max_posts_per_page]
 
         if not posts:
-            failed_pages.append({"url": page_url, "error": str(result.get("error") or "no_posts_found")})
+            with state_lock:
+                failed_pages.append({"url": page_url, "error": str(result.get("error") or "no_posts_found")})
             page_logger.warning("Page scrape failed")
             _page_cooldown(multiplier=1.3)
-            continue
+            return
 
         if result.get("error"):
             # Succes partiel: des posts ont ete collectes mais une erreur est
@@ -1412,6 +1476,27 @@ def _process_csv_batch_task(
 
         _publish_page_posts(page_url, posts)
         _page_cooldown()
+
+    def _run_lane(lane_urls: list[str], proxy_cfg: dict | None) -> None:
+        # Une lane = un thread dedie a UN proxy, qui traite ses pages les
+        # unes apres les autres (avec les memes cooldowns qu'avant). Le
+        # parallelisme vient du fait que N lanes tournent en meme temps.
+        for page_url in lane_urls:
+            try:
+                _process_one_page(page_url, proxy_cfg)
+            except Exception:
+                with_context(scoped_logger, url=page_url).exception("Unhandled error while processing page in batch lane")
+                with state_lock:
+                    failed_pages.append({"url": page_url, "error": "unhandled_exception"})
+
+    lanes = _split_round_robin(urls, batch_concurrency)
+    with ThreadPoolExecutor(max_workers=max(1, len(lanes))) as executor:
+        futures = [
+            executor.submit(_run_lane, lane_urls, proxy_pool[lane_index % len(proxy_pool)] if proxy_pool else None)
+            for lane_index, lane_urls in enumerate(lanes)
+        ]
+        for future in as_completed(futures):
+            future.result()
 
     # Round de retry final: apres avoir traite toutes les pages, on laisse la
     # session "refroidir" puis on retente une derniere fois les pages
@@ -1434,12 +1519,12 @@ def _process_csv_batch_task(
 
         recoverable_urls = {row["url"] for row in recoverable_failed}
         still_failed_urls = set(recoverable_urls)
-        for row in recoverable_failed:
-            page_url = row["url"]
-            page_logger = with_context(scoped_logger, url=page_url)
-            page_logger.info("Final retry attempt for previously failed page")
 
-            result = _attempt_page(page_url, 1, page_logger)
+        def _retry_one_page(page_url: str, proxy_cfg: dict | None) -> None:
+            page_logger = with_context(scoped_logger, url=page_url)
+            page_logger.info("Final retry attempt for previously failed page", extra={"proxy": _proxy_label(proxy_cfg)})
+
+            result = _attempt_page(page_url, 1, page_logger, proxy_cfg=proxy_cfg)
             posts = result.get("posts") or []
             if not time_window_hours:
                 posts = posts[:max_posts_per_page]
@@ -1447,11 +1532,32 @@ def _process_csv_batch_task(
             if posts:
                 page_logger.info("Final retry recovered posts for previously failed page", extra={"post_count": len(posts)})
                 _publish_page_posts(page_url, posts)
-                still_failed_urls.discard(page_url)
+                with state_lock:
+                    still_failed_urls.discard(page_url)
             else:
                 page_logger.warning("Final retry still failed for page")
 
             _page_cooldown(multiplier=1.3)
+
+        def _run_retry_lane(lane_urls: list[str], proxy_cfg: dict | None) -> None:
+            for page_url in lane_urls:
+                try:
+                    _retry_one_page(page_url, proxy_cfg)
+                except Exception:
+                    with_context(scoped_logger, url=page_url).exception("Unhandled error during final retry lane")
+
+        retry_lanes = _split_round_robin(sorted(recoverable_urls), batch_concurrency)
+        with ThreadPoolExecutor(max_workers=max(1, len(retry_lanes))) as executor:
+            retry_futures = [
+                executor.submit(
+                    _run_retry_lane,
+                    lane_urls,
+                    proxy_pool[lane_index % len(proxy_pool)] if proxy_pool else None,
+                )
+                for lane_index, lane_urls in enumerate(retry_lanes)
+            ]
+            for future in as_completed(retry_futures):
+                future.result()
 
         failed_pages = [row for row in failed_pages if row["url"] not in recoverable_urls or row["url"] in still_failed_urls]
 

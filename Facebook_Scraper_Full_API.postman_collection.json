@@ -3,7 +3,7 @@
     "_postman_id": "3f1a2c8e-9b4d-4e2f-8a6b-7c5d0e1f2a3b",
     "name": "Facebook & TikTok Scraper - API complete + Ops",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
-    "description": "Collection consolidee pour l'architecture RabbitMQ/MongoDB/Spring Boot + workers Python (Facebook, TikTok).\n\nOrganisation en 5 dossiers:\n1. Health & Infra (gateway + proxy IPv6 de rotation)\n2. Jobs - Creation (POST /scrape, csv-report, csv-report-24h)\n3. Jobs - Statut & Resultats (GET status/results/stream)\n4. Requetes DB (jobs/results avec filtres)\n5. Cas d'erreur (validation, 404)\n\nNOTE IMPORTANTE sur le dossier 'Health & Infra > Proxy IPv6': le proxy de\nrotation (tools/ipv6_rotating_proxy.py) n'ecoute que sur 127.0.0.1 du VPS,\npour des raisons de securite (aucune authentification sur /rotate). Si vous\nexecutez Postman depuis votre PC et non depuis le VPS, il faut d'abord ouvrir\nun tunnel SSH:\n  ssh -L 8091:127.0.0.1:8091 -L 1080:127.0.0.1:1080 votre_user@votre_vps\nUne fois le tunnel ouvert, http://127.0.0.1:8091/... depuis Postman sur votre\nPC atteint bien le proxy du VPS.",
+    "description": "Collection consolidee pour l'architecture RabbitMQ/MongoDB/Spring Boot + workers Python (Facebook, TikTok).\n\nOrganisation en 5 dossiers:\n1. Health & Infra (gateway + proxy IPv6 de rotation, legacy)\n2. Jobs - Creation (POST /scrape, csv-report, csv-report-24h)\n3. Jobs - Statut & Resultats (GET status/results/stream)\n4. Requetes DB (jobs/results avec filtres)\n5. Cas d'erreur (validation, 404)\n\nSTRATEGIE ANTI-DETECTION ACTUELLE: un batch CSV (csv-report / csv-report-24h)\nrepartit automatiquement ses pages sur les proxies definis dans\nTIKTOK_PROXY_LIST (.env, ex: 10 proxies Webshare), une lane parallele dediee\npar proxy (voir worker.py: get_proxy_pool / _split_round_robin). Rien a\nappeler manuellement pour ca, c'est automatique a chaque batch.\n\nNOTE sur le dossier 'Health & Infra > Proxy IPv6' (LEGACY, desactive par\ndefaut, TIKTOK_PROXY_SERVER vide dans .env): ancienne strategie de rotation\nbasee sur un bloc IPv6 /64 route sur le VPS (tools/ipv6_rotating_proxy.py),\nconservee pour reference/reactivation future. Ce proxy n'ecoute que sur\n127.0.0.1 du VPS, pour des raisons de securite (aucune authentification sur\n/rotate). Si vous l'utilisez et executez Postman depuis votre PC et non\ndepuis le VPS, il faut d'abord ouvrir un tunnel SSH:\n  ssh -L 8091:127.0.0.1:8091 -L 1080:127.0.0.1:1080 votre_user@votre_vps\nUne fois le tunnel ouvert, http://127.0.0.1:8091/... depuis Postman sur votre\nPC atteint bien le proxy du VPS.",
     "schema_note": "Toutes les reponses JSON de la gateway sont en snake_case (spring.jackson.property-naming-strategy=SNAKE_CASE)."
   },
   "item": [
@@ -41,7 +41,7 @@
           ]
         },
         {
-          "name": "Proxy IPv6 - Status - GET /status",
+          "name": "Proxy IPv6 (legacy) - Status - GET /status",
           "request": {
             "method": "GET",
             "header": [],
@@ -70,7 +70,7 @@
           ]
         },
         {
-          "name": "Proxy IPv6 - Forcer une rotation - GET /rotate",
+          "name": "Proxy IPv6 (legacy) - Forcer une rotation - GET /rotate",
           "request": {
             "method": "GET",
             "header": [],
@@ -256,7 +256,7 @@
               "host": ["{{base_url}}"],
               "path": ["scrape", "csv-report-24h"]
             },
-            "description": "Cree un job batch CSV TikTok avec fenetre automatique des dernieres 24h (pas de maxPostsPerPage: chaque page scrolle jusqu'a sortir de la fenetre de 24h). C'est ce endpoint qui beneficie le plus de la rotation IPv6 (TIKTOK_IPV6_ROTATE_EVERY_N_POSTS)."
+            "description": "Cree un job batch CSV TikTok avec fenetre automatique des dernieres 24h (pas de maxPostsPerPage: chaque page scrolle jusqu'a sortir de la fenetre de 24h). C'est ce endpoint qui beneficie le plus de la repartition en parallele sur TIKTOK_PROXY_LIST (une lane/proxy dediee par groupe de pages, voir worker.py)."
           },
           "event": [
             {

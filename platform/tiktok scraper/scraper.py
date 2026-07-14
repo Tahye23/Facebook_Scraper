@@ -251,6 +251,9 @@ def _parse_proxy_spec(spec: str) -> dict | None:
     Formats acceptes:
     - host:port|username|password
     - scheme://username:password@host:port
+    - host:port:username:password (export brut par defaut du dashboard
+      Webshare, ex: "31.59.20.176:6754:sdwopfmy:v78vnzm50pdj") - permet de
+      copier/coller directement le fichier telecharge sans le reformater.
     - valeur brute (server)
     """
     raw = (spec or "").strip()
@@ -267,6 +270,17 @@ def _parse_proxy_spec(spec: str) -> dict | None:
             proxy["username"] = parts[1]
             proxy["password"] = parts[2] if len(parts) > 2 else ""
         return proxy
+
+    if "://" not in raw:
+        # Format Webshare brut "host:port:username:password" (4 champs). On
+        # ne le detecte que si le 2e champ est bien un port numerique, pour
+        # ne jamais casser un format "host:port" simple (2 champs) qui doit
+        # rester gere par le fallback `{"server": raw}` plus bas.
+        parts = raw.split(":")
+        if len(parts) == 4 and parts[1].isdigit():
+            host, port, username, password = (part.strip() for part in parts)
+            if host and port and username:
+                return {"server": f"{host}:{port}", "username": username, "password": password}
 
     parsed = urlsplit(raw)
     if parsed.scheme and parsed.hostname:
@@ -318,6 +332,19 @@ def _load_proxy_candidates() -> list[dict | None]:
     if _env_bool("TIKTOK_TRY_DIRECT_AFTER_PROXIES", False):
         candidates.append(None)
     return candidates
+
+
+def get_proxy_pool() -> list[dict]:
+    """Retourne la liste "a plat" des proxies configures (sans l'entree
+    `None` de connexion directe que `_load_proxy_candidates` peut ajouter).
+
+    Utilise par `worker.py` pour repartir un batch de plusieurs pages sur
+    plusieurs proxies EN PARALLELE (une "lane" dediee par proxy), au lieu de
+    la rotation sequentielle par defaut de `scrape_tiktok_page` (qui essaie
+    chaque proxy l'un apres l'autre, sur une seule page, seulement si un
+    challenge est detecte).
+    """
+    return [proxy for proxy in _load_proxy_candidates() if proxy is not None]
 
 
 def _describe_proxy(proxy_cfg: dict | None) -> str:
@@ -1491,6 +1518,7 @@ def scrape_tiktok_page(
     on_post=None,
     headless_override: bool | None = None,
     analyze_video_content: bool | None = None,
+    proxy_override: dict | None = None,
 ) -> dict:
     """Point d'entree public: scrape une page TikTok et retourne un resultat.
 
@@ -1499,6 +1527,13 @@ def scrape_tiktok_page(
     - decide headless/headed
     - prepare les candidats proxy
     - tente le scraping sur chaque candidat jusqu'au succes
+
+    `proxy_override`: si fourni, on saute completement `_load_proxy_candidates()`
+    et on scrape uniquement avec CE proxy (pas de rotation/fallback). Utilise
+    par `worker.py` quand un batch de pages est deja reparti sur des "lanes"
+    ayant chacune un proxy dedie (voir `get_proxy_pool`) - dans ce cas la
+    rotation sequentielle habituelle n'a pas de sens, la page a deja sa propre
+    IP assignee pour toute sa lane.
     """
     profile_url = _normalize_profile_url(url)
     scoped_logger = with_context(LOGGER, url=profile_url)
@@ -1509,7 +1544,7 @@ def scrape_tiktok_page(
     if analyze_video_content is None:
         analyze_video_content = _env_bool("TIKTOK_ANALYZE_VIDEO_CONTENT", False)
     slow_mo_ms = 0 if headless else 150
-    proxy_candidates = _load_proxy_candidates()
+    proxy_candidates = [proxy_override] if proxy_override is not None else _load_proxy_candidates()
 
     # Rotation IPv6 "toutes les N videos" (0 = desactivee). Voir
     # `_rotate_ipv6_identity` et `tools/ipv6_rotating_proxy.py` pour le

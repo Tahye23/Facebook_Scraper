@@ -105,27 +105,24 @@ services:
       - scraper_net
 
   # ─── Worker TikTok ─────────────────────────────────────────────────────────
-  # TRES IMPORTANT: network_mode "host" (pas de "networks:" ni de "ports:" avec
-  # ce mode). Ce worker doit pouvoir joindre le proxy SOCKS5 de rotation IPv6
-  # (tools/ipv6_rotating_proxy.py) qui tourne EN SYSTEMD DIRECTEMENT SUR L'HOTE
-  # du VPS, sur 127.0.0.1:1080 (proxy) et 127.0.0.1:8091 (controle /rotate).
-  # Avec le reseau bridge par defaut, 127.0.0.1 a l'interieur du conteneur ne
-  # designerait PAS l'hote mais le conteneur lui-meme: le proxy serait injoignable.
-  # Consequence: comme ce conteneur partage la pile reseau de l'hote, il ne
-  # peut PAS resoudre "rabbitmq" par DNS (ce nom n'existe que sur scraper_net);
-  # il faut donc utiliser 127.0.0.1 (le port 5672 est publie sur l'hote par le
-  # service rabbitmq ci-dessus).
+  # Reste desormais sur le reseau bridge "scraper_net" comme les autres
+  # services: la rotation d'IP se fait via TIKTOK_PROXY_LIST (proxies
+  # Webshare externes, joignables depuis n'importe quel reseau Docker), donc
+  # on n'a plus besoin de network_mode: "host" pour atteindre un proxy local
+  # sur 127.0.0.1 (l'ancienne rotation IPv6, desactivee par defaut - voir .env).
+  # Si vous reactivez un jour tools/ipv6_rotating_proxy.py sur l'hote, remettez
+  # `network_mode: "host"` (et RABBITMQ_HOST: 127.0.0.1) a la place de
+  # "networks"/"RABBITMQ_HOST: rabbitmq" ci-dessous.
   worker-tiktok:
     build:
       context: .
       dockerfile: "platform/tiktok scraper/Dockerfile"
     container_name: scraper_worker_tiktok
     restart: unless-stopped
-    network_mode: "host"
     env_file:
       - .env
     environment:
-      RABBITMQ_HOST: 127.0.0.1
+      RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
       RABBITMQ_USER: ${RABBITMQ_USER}
       RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
@@ -146,6 +143,8 @@ services:
     depends_on:
       rabbitmq:
         condition: service_healthy
+    networks:
+      - scraper_net
 
 # ─── Volumes ───────────────────────────────────────────────────────────────
 volumes:

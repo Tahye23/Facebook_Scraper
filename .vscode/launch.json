@@ -1,0 +1,25 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "TikTok - Debug local (app.py, sans RabbitMQ)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/platform/tiktok scraper/app.py",
+      "cwd": "${workspaceFolder}/platform/tiktok scraper",
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "TikTok - Debug worker.py (via RabbitMQ)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/platform/tiktok scraper/worker.py",
+      "cwd": "${workspaceFolder}/platform/tiktok scraper",
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ]
+}

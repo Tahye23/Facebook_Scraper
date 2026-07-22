@@ -7,8 +7,10 @@ platform/facebook scraper/fb_cookies.json
 # Profil Chrome complet (cookies/cache/session Facebook) - jamais committer.
 platform/facebook scraper/fb_profile/
 platform/tiktok scraper/tiktok_cookies.json
-platform/tiktok scraper/tiktok_challenge.png
-platform/tiktok scraper/tiktok_challenge.html
+# Artefacts de debug (screenshot/HTML) produits par _save_challenge_artifacts,
+# un couple de fichiers par "label" (challenge, no_posts_found, ...).
+platform/tiktok scraper/tiktok_*.png
+platform/tiktok scraper/tiktok_*.html
 platform/tiktok scraper/tiktok_profile/
 platform/tiktok scraper/__pycache__/
 platform/tiktok scraper/*.pyc

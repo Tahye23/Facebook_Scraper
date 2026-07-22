@@ -400,25 +400,35 @@ def _rotate_ipv6_identity() -> str | None:
         return None
 
 
-def _save_challenge_artifacts(page):
-    """Sauvegarde des artefacts de debug quand un challenge TikTok est detecte.
+def _save_challenge_artifacts(page, label: str = "challenge"):
+    """Sauvegarde des artefacts de debug pour inspecter visuellement ce que
+    TikTok a renvoye (utile en debug local, ex: proxy Webshare suspect).
 
-    Fichiers produits:
-    - screenshot PNG
-    - HTML complet de la page
-    - contexte URL + titre dans les logs
+    `label` differencie le scenario (fichiers "tiktok_{label}.png/.html"):
+    - "challenge": un challenge/captcha a ete detecte explicitement.
+    - "no_posts_found": la page a charge sans challenge detecte, mais aucune
+      video n'a pu etre extraite (page vide, geo-restriction, session/proxy
+      incoherents, changement de markup TikTok...). Ce cas est souvent le
+      plus difficile a diagnostiquer sans regarder le HTML/screenshot, d'ou
+      cette capture systematique meme en l'absence de "challenge" reconnu.
+
+    Fichiers produits: screenshot PNG + HTML complet de la page, plus
+    URL/titre courants dans les logs (pour reperer une redirection silencieuse,
+    ex: renvoi vers la home page ou une page de restriction regionale).
     """
+    safe_label = re.sub(r"[^a-z0-9_-]+", "_", (label or "challenge").lower()) or "challenge"
+
     try:
-        page.screenshot(path="tiktok_challenge.png", full_page=True)
-    except Exception as exc:
-        LOGGER.warning("Failed to save challenge screenshot", exc_info=True)
+        page.screenshot(path=f"tiktok_{safe_label}.png", full_page=True)
+    except Exception:
+        LOGGER.warning("Failed to save %s screenshot", safe_label, exc_info=True)
 
     try:
         html = page.content()
-        with open("tiktok_challenge.html", "w", encoding="utf-8") as f:
+        with open(f"tiktok_{safe_label}.html", "w", encoding="utf-8") as f:
             f.write(html)
-    except Exception as exc:
-        LOGGER.warning("Failed to save challenge HTML", exc_info=True)
+    except Exception:
+        LOGGER.warning("Failed to save %s HTML", safe_label, exc_info=True)
 
     try:
         current_url = page.url
@@ -429,6 +439,11 @@ def _save_challenge_artifacts(page):
         title = page.title()
     except Exception:
         title = "unknown"
+
+    LOGGER.info(
+        "Saved debug artifacts",
+        extra={"label": safe_label, "page_url": current_url, "page_title": title},
+    )
 
 
 
@@ -869,6 +884,12 @@ def _scrape_with_browser(
     def handle_response(response):
         """Capture passive des reponses JSON reseau (posts parfois absents du DOM)."""
         rurl = response.url.lower()
+        # NE JAMAIS capturer le feed de recommandations "For You" (charge par le
+        # warmup homepage) ni l'onglet Explore: ce ne sont PAS les videos du
+        # profil cible. Sans ce garde-fou, `/api/recommend/item_list/` matchait
+        # "item_list" et polluait les resultats avec des videos etrangeres.
+        if any(feed in rurl for feed in ("recommend", "/explore", "for_you", "foryou")):
+            return
         if not any(k in rurl for k in ("item_list", "aweme", "post/item", "user/post")):
             return
         try:
@@ -896,6 +917,13 @@ def _scrape_with_browser(
         """
         nonlocal browser, context, page
 
+        # Canal navigateur optionnel: "chrome"/"msedge" utilise le VRAI Chrome
+        # installe sur la machine (bien moins detectable que le Chromium
+        # embarque de Playwright, qui declenche souvent la verif anti-bot
+        # TikTok). Vide = Chromium embarque par defaut. Necessite que le
+        # navigateur correspondant soit installe (local: OK; Docker: a installer).
+        browser_channel = (os.getenv("TIKTOK_BROWSER_CHANNEL") or "").strip()
+
         if user_data_dir:
             os.makedirs(user_data_dir, exist_ok=True)
             launch_persistent_args = {
@@ -905,6 +933,8 @@ def _scrape_with_browser(
                 "args": browser_args,
                 **context_options,
             }
+            if browser_channel:
+                launch_persistent_args["channel"] = browser_channel
             if proxy_cfg:
                 launch_persistent_args["proxy"] = proxy_cfg
             context = playwright.chromium.launch_persistent_context(**launch_persistent_args)
@@ -915,6 +945,8 @@ def _scrape_with_browser(
                 "slow_mo": slow_mo_ms,
                 "args": browser_args,
             }
+            if browser_channel:
+                launch_args["channel"] = browser_channel
             if proxy_cfg:
                 launch_args["proxy"] = proxy_cfg
             browser = playwright.chromium.launch(**launch_args)
@@ -993,6 +1025,11 @@ def _scrape_with_browser(
                 _warmup_and_open_profile(page, profile_url)
             except Exception as retry_err:
                 LOGGER.warning("Challenge retry warmup failed", exc_info=True)
+
+        # Purge des reponses reseau captees pendant le warmup (home "For You",
+        # etc.): a partir d'ici, on ne veut compter QUE les videos du profil
+        # cible chargees dans la boucle de scroll ci-dessous.
+        network_posts.clear()
 
         seen = set()
 
@@ -1139,6 +1176,11 @@ def _scrape_with_browser(
             if _looks_like_tiktok_challenge(page):
                 _save_challenge_artifacts(page)
                 return {"posts": [], "total": 0, "error": "challenge_detected", "url": profile_url}
+            # Aucun challenge reconnu, mais aucune video non plus: capturer
+            # quand meme un screenshot/HTML, ce cas etant souvent aussi
+            # difficile a diagnostiquer qu'un challenge classique (page vide,
+            # redirection silencieuse, geo-restriction du proxy...).
+            _save_challenge_artifacts(page, label="no_posts_found")
             return {"posts": [], "total": 0, "error": "no_posts_found", "url": profile_url}
 
         # Post-traitements: enrichissement detail + analyse IA optionnelle.
@@ -1458,6 +1500,8 @@ def _looks_like_tiktok_challenge(page) -> bool:
                 "complete the captcha",
                 "something went wrong",
                 "something went wrong. please try again",
+                "an unexpected error occurred",
+                "an unexpected error occurred. please try again",
             )
         ):
             return True
@@ -1572,16 +1616,36 @@ def scrape_tiktok_page(
             )
             last_result = result
             # On arrete de faire tourner les proxies dès qu'on a recupere des
-            # posts (meme partiels) ou dès qu'il ne s'agit pas d'un challenge
-            # pur (0 post). Rotation supplementaire n'a de sens que pour
-            # retenter un challenge_detected sans aucun post.
-            if result.get("posts") or result.get("error") != "challenge_detected":
+            # posts (meme partiels) ou dès qu'il ne s'agit pas d'un echec
+            # "soft" (0 post). Rotation supplementaire n'a de sens que pour
+            # retenter un `challenge_detected` OU un `no_posts_found` sans
+            # aucun post: on a constate (voir tiktok_no_posts_found.png/.html)
+            # que certains proxies datacenter sont "silencieusement" bloques
+            # par TikTok (page chargee normalement, botType marque cote
+            # serveur, mais AUCUN challenge visible) - ca ressort en
+            # `no_posts_found`, pas en `challenge_detected`. Sans ce
+            # traitement equivalent, on retentait 3x le MEME proxy (le
+            # premier de la liste) au lieu d'essayer les 9 autres.
+            error_code = str(result.get("error") or "").strip().lower()
+            # En plus des codes connus, toute erreur reseau/proxy brute
+            # remontee par Chromium (ex: net::ERR_TUNNEL_CONNECTION_FAILED
+            # quand le proxy lui-meme refuse la connexion, souvent un 402/407
+            # cote fournisseur - quota depasse, abonnement expire...) doit
+            # aussi faire passer au proxy candidat suivant: ce n'est jamais
+            # la peine de retenter le MEME proxy mort plusieurs fois.
+            is_network_or_proxy_error = any(
+                token in error_code for token in ("net::err", "err_tunnel", "err_proxy", "err_connection", "err_timed_out")
+            )
+            retryable_with_next_proxy = (
+                error_code in {"challenge_detected", "no_posts_found"} or is_network_or_proxy_error
+            )
+            if result.get("posts") or not retryable_with_next_proxy:
                 if result.get("error"):
                     scoped_logger.warning("Scrape finished with error", extra={"has_partial_posts": bool(result.get("posts"))})
                 else:
                     scoped_logger.info("Scrape finished successfully")
                 return result
             if attempt_index < len(proxy_candidates):
-                scoped_logger.warning("Challenge detected, rotating proxy candidate")
+                scoped_logger.warning("Soft failure detected, rotating proxy candidate", extra={"error": error_code})
 
         return last_result or {"posts": [], "total": 0, "error": "challenge_detected", "url": profile_url}

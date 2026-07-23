@@ -133,11 +133,20 @@ services:
       # repo pour les runs locaux hors Docker): dans le conteneur, le CWD est
       # deja "platform/tiktok scraper", donc un chemin relatif simple suffit.
       VIDEO_ANALYSIS_OUTPUT_DIR: video_reports
+      # Dans un conteneur il n'y a pas d'ecran: on FORCE le mode headless
+      # (override du .env qui reste en false pour le dev local avec py worker.py).
+      TIKTOK_HEADLESS: "true"
+      # On utilise le VRAI Chrome installe dans l'image (voir Dockerfile):
+      # fingerprint authentique = beaucoup moins detecte par TikTok.
+      TIKTOK_BROWSER_CHANNEL: "chrome"
     volumes:
       # Le dossier est copie sans espace dans l'image ("tiktok-scraper", voir
       # Dockerfile), d'ou le chemin different a droite du ":".
       - "./platform/tiktok scraper/tiktok_profile:/app/platform/tiktok-scraper/tiktok_profile"
       - "./platform/tiktok scraper/video_reports:/app/platform/tiktok-scraper/video_reports"
+      # Cookies TikTok montes (comme fb_cookies.json cote Facebook): on peut les
+      # remplacer sans reconstruire l'image quand la session expire.
+      - "./platform/tiktok scraper/tiktok_cookies.json:/app/platform/tiktok-scraper/tiktok_cookies.json:ro"
       - "./logs:/app/logs"
     command: ["python", "worker.py"]
     depends_on:

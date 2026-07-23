@@ -1,0 +1,44 @@
+# Contexte de build Docker = racine du repo (voir docker-compose: worker-tiktok
+# build.context = "."). Sans ce fichier, Docker empaquete TOUT le depot, dont:
+#  - le profil Chrome persistant (tiktok_profile) qui contient des sockets/locks
+#    au "type de fichier inconnu" -> erreur `archive/tar: unknown file mode`
+#  - des centaines de Mo de cache/artefacts inutiles a l'image.
+# On exclut donc tout ce qui n'est pas necessaire au build.
+
+# --- Profils navigateur persistants (sockets/locks -> cassent le tar) ---------
+**/tiktok_profile/
+**/fb_profile/
+**/*.pma
+**/BrowserMetrics/
+**/Crashpad/
+
+# --- Artefacts / rapports generes --------------------------------------------
+**/video_reports/
+**/tiktok_no_posts_found.*
+# Dossier imbrique cree par erreur lors de runs locaux (py worker.py)
+platform/tiktok scraper/platform/
+
+# --- Python -------------------------------------------------------------------
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.venv/
+**/venv/
+**/.pytest_cache/
+**/.mypy_cache/
+
+# --- Java / Maven (gateway) ---------------------------------------------------
+**/target/
+
+# --- Git / IDE / logs ---------------------------------------------------------
+.git/
+.gitignore
+.vscode/
+.idea/
+logs/
+**/*.log
+terminals/
+
+# --- Divers -------------------------------------------------------------------
+**/node_modules/
+*.md

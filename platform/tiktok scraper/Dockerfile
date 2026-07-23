@@ -30,7 +30,13 @@ RUN apt-get update && apt-get install -y \
 COPY ["platform/tiktok scraper/requirements.txt", "./requirements.txt"]
 RUN pip install --no-cache-dir -r requirements.txt
 
+# On installe DEUX navigateurs:
+#  - chromium (embarque Playwright): fallback si TIKTOK_BROWSER_CHANNEL est vide.
+#  - google chrome (vrai navigateur): requis par TIKTOK_BROWSER_CHANNEL=chrome,
+#    beaucoup moins detecte par l'anti-bot TikTok (fingerprint authentique).
+# `--with-deps` installe aussi les librairies systeme necessaires (apt).
 RUN python -m playwright install chromium --with-deps \
+    && python -m playwright install chrome --with-deps \
     && chmod -R 755 /ms-playwright
 
 # logging_setup.py (racine du repo) + le code du scraper TikTok. On renomme le

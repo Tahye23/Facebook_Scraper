@@ -165,6 +165,50 @@ def _normalize_profile_url(url: str) -> str:
     return clean
 
 
+def _username_from_url(url: str) -> str:
+    """Extrait le handle (@username) d'une URL de profil TikTok, en minuscules.
+
+    Ex: "https://www.tiktok.com/@Tawatur" -> "tawatur". Retourne "" si absent.
+    """
+    try:
+        path = urlparse(url).path
+    except Exception:
+        path = url or ""
+    for segment in path.split("/"):
+        segment = segment.strip()
+        if segment.startswith("@"):
+            return segment[1:].lower()
+    return ""
+
+
+def _card_belongs_to_profile(card: dict, target_username: str) -> bool:
+    """Vrai si le post appartient bien au profil cible.
+
+    Garde-fou contre la fuite de videos "For You": `window.SIGI_STATE.ItemModule`
+    conserve en memoire les videos du feed d'accueil charge pendant le warmup,
+    et `_extract_video_cards` les remonte sans distinction d'auteur. On ne
+    conserve donc un post que si:
+    - son auteur correspond au handle cible (insensible a la casse), ou
+    - son `post_url` contient `/@<handle>/` (grille du profil), ou
+    - on ne connait pas le handle cible (target vide -> on ne filtre pas).
+
+    Les posts sans auteur ET sans handle dans l'URL sont consideres ambigus et
+    rejetes en mode filtre (ils proviennent quasi toujours de l'etat "For You").
+    """
+    if not target_username:
+        return True
+
+    author = str(card.get("author") or "").strip().lower()
+    if author and author == target_username:
+        return True
+
+    post_url = str(card.get("post_url") or "").strip().lower()
+    if f"/@{target_username}/" in post_url:
+        return True
+
+    return False
+
+
 def _video_signature(video: dict) -> str:
     """Construit une signature stable pour dedupliquer les videos.
 
@@ -853,6 +897,9 @@ def _scrape_with_browser(
     # ouverture de contexte, etc.), on doit pouvoir renvoyer les posts déjà
     # collectés au lieu de les perdre silencieusement.
     all_posts: list[dict] = []
+    # Handle du profil cible: sert a rejeter les videos "For You" qui trainent
+    # dans l'etat JS (SIGI_STATE.ItemModule) apres le warmup homepage.
+    target_username = _username_from_url(profile_url)
     user_data_dir = _build_user_data_dir()
     browser_args = [
         "--no-sandbox",
@@ -952,18 +999,28 @@ def _scrape_with_browser(
             browser = playwright.chromium.launch(**launch_args)
             context = browser.new_context(**context_options)
 
-        # Headers additionnels pour mimer un trafic navigateur classique.
-        context.set_extra_http_headers(
-            {
-                "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
-                "Upgrade-Insecure-Requests": "1",
-                "Sec-CH-UA": '"Chromium";v="124", "Not:A-Brand";v="99"',
-                "Sec-CH-UA-Platform": '"Windows"',
-                "Sec-CH-UA-Mobile": "?0",
-            }
-        )
-        if _should_apply_stealth(user_data_dir):
-            _install_stealth_scripts(context)
+        # IMPORTANT: avec un VRAI navigateur (channel="chrome"/"msedge"), on ne
+        # falsifie NI les client-hints Sec-CH-UA NI le fingerprint via stealth.
+        # Diagnostic mesure sur @tawatur (grille = 91 videos):
+        #   - Chrome nu (ni headers ni stealth) -> 92 liens video charges. OK
+        #   - + faux Sec-CH-UA "Chromium"        -> 6 liens (grille vide). KO
+        #   - + script stealth                   -> 6 liens (grille vide). KO
+        # Ces "camouflages", concus pour le Chromium embarque, creent au
+        # contraire une INCOHERENCE de fingerprint sur un vrai Chrome (le vrai
+        # Chrome annonce "Google Chrome", pas "Chromium"; navigator.webdriver
+        # patche est detectable), et TikTok repond alors avec un item_list vide.
+        if not browser_channel:
+            context.set_extra_http_headers(
+                {
+                    "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
+                    "Upgrade-Insecure-Requests": "1",
+                    "Sec-CH-UA": '"Chromium";v="124", "Not:A-Brand";v="99"',
+                    "Sec-CH-UA-Platform": '"Windows"',
+                    "Sec-CH-UA-Mobile": "?0",
+                }
+            )
+            if _should_apply_stealth(user_data_dir):
+                _install_stealth_scripts(context)
 
         # Injection de cookies si contexte non persistant, ou si forçage explicite.
         force_cookie_injection = _env_bool("TIKTOK_FORCE_COOKIE_INJECTION", False)
@@ -1075,6 +1132,12 @@ def _scrape_with_browser(
             for card in batch:
                 sig = _video_signature(card)
                 if sig in seen:
+                    continue
+
+                # Rejet des videos qui n'appartiennent pas au profil cible
+                # (fuite du feed "For You" via SIGI_STATE.ItemModule).
+                if not _card_belongs_to_profile(card, target_username):
+                    seen.add(sig)
                     continue
 
                 if max_age_hours is not None and max_age_hours > 0:
@@ -1193,7 +1256,37 @@ def _scrape_with_browser(
         warning = "challenge_detected_partial" if _looks_like_tiktok_challenge(page) else None
         return _build_partial_result(analyzed_posts, warning=warning)
     except Exception as e:
-        LOGGER.exception("Browser scraping pipeline failed")
+        # Beaucoup d'exceptions ici sont ATTENDUES et deja gerees par la rotation
+        # de proxy en amont (proxy lent/mort/bloque): net::ERR_TIMED_OUT,
+        # ERR_CONNECTION_CLOSED, ERR_HTTP_RESPONSE_CODE_FAILURE (403 anti-bot)...
+        # Pour ces cas on log UNE seule ligne WARNING lisible (sans stack trace),
+        # et on reserve la trace ERROR complete aux vraies erreurs inattendues
+        # (bug de code, etc.) qui, elles, meritent un diagnostic detaille.
+        err_text = str(e)
+        expected_network_tokens = (
+            "net::err",
+            "err_timed_out",
+            "err_connection",
+            "err_tunnel",
+            "err_proxy",
+            "err_http_response_code_failure",
+            "err_aborted",
+            "err_name_not_resolved",
+            "err_address_unreachable",
+            "timeout",
+        )
+        is_expected_network_error = any(
+            tok in err_text.lower() for tok in expected_network_tokens
+        )
+        if is_expected_network_error:
+            # `splitlines()[0]` = juste "Page.goto: net::ERR_... at <url>" sans
+            # dumper toute la stack Playwright (bruit inutile dans les logs).
+            LOGGER.warning(
+                "Browser attempt failed (%s); rotating proxy candidate",
+                err_text.splitlines()[0] if err_text else "unknown network error",
+            )
+        else:
+            LOGGER.exception("Browser scraping pipeline failed")
         # Ne jamais jeter les posts deja collectes avant l'exception (ex: timeout
         # d'enrichissement, crash de page suite a une detection tardive, etc.).
         # Le caller (worker) decide s'il s'agit d'un succes partiel ou d'un echec sec.

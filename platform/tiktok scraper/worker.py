@@ -20,6 +20,7 @@ import random
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1448,53 +1449,90 @@ def _process_csv_batch_task(
 
         return result or {"posts": [], "error": "unknown_error", "url": page_url}
 
-    def _process_one_page(page_url: str, proxy_cfg: dict | None) -> None:
-        page_logger = with_context(scoped_logger, url=page_url)
-        page_logger.info("Processing page from CSV batch", extra={"proxy": _proxy_label(proxy_cfg)})
+    # --- Distribution DYNAMIQUE (work-queue) + releve de proxy ----------------
+    # Au lieu de pre-decouper les URLs en lots fixes (round-robin statique), on
+    # place toutes les pages dans une FILE partagee `pending_urls`. On lance
+    # `batch_concurrency` lanes en parallele; chaque lane, des qu'elle est libre,
+    # pioche la page suivante dans la file (auto-equilibrage: une lane lente ne
+    # bloque plus les autres).
+    #
+    # RELEVE DE PROXY: chaque lane demarre avec un proxy "actif". Si sa page
+    # echoue (0 post), la lane prend un proxy DE SECOURS dans `spare_proxies`
+    # (les proxies configures AU-DELA du nombre de lanes) et bascule dessus pour
+    # cette page ET les suivantes. C'est le comportement demande: proxy #2 KO
+    # -> #11 prend la suite, #11 KO -> #12, etc. Pour en profiter, configurer
+    # PLUS de proxies dans TIKTOK_PROXY_LIST que de lanes (TIKTOK_BATCH_CONCURRENCY).
+    pending_urls = deque(urls)
+    active_proxies = (proxy_pool[:batch_concurrency] if proxy_pool else [None]) or [None]
+    spare_proxies = deque(proxy_pool[batch_concurrency:]) if proxy_pool else deque()
 
-        result = _attempt_page(page_url, page_attempts, page_logger, proxy_cfg=proxy_cfg)
+    def _next_pending_url() -> str | None:
+        with state_lock:
+            return pending_urls.popleft() if pending_urls else None
 
+    def _take_spare_proxy() -> dict | None:
+        with state_lock:
+            return spare_proxies.popleft() if spare_proxies else None
+
+    def _clip_posts(result: dict) -> list[dict]:
         posts = result.get("posts") or []
         if not time_window_hours:
             posts = posts[:max_posts_per_page]
+        return posts
 
-        if not posts:
-            with state_lock:
-                failed_pages.append({"url": page_url, "error": str(result.get("error") or "no_posts_found")})
-            page_logger.warning("Page scrape failed")
-            _page_cooldown(multiplier=1.3)
-            return
-
-        if result.get("error"):
-            # Succes partiel: des posts ont ete collectes mais une erreur est
-            # survenue en cours de route (challenge tardif, exception apres
-            # coup...). On les garde et on ne compte pas la page en echec.
-            page_logger.warning(
-                "Page scrape ended with error but posts were recovered; keeping partial result",
-                extra={"error": str(result.get("error"))},
-            )
-
-        _publish_page_posts(page_url, posts)
-        _page_cooldown()
-
-    def _run_lane(lane_urls: list[str], proxy_cfg: dict | None) -> None:
-        # Une lane = un thread dedie a UN proxy, qui traite ses pages les
-        # unes apres les autres (avec les memes cooldowns qu'avant). Le
-        # parallelisme vient du fait que N lanes tournent en meme temps.
-        for page_url in lane_urls:
+    def _lane_worker(initial_proxy: dict | None) -> None:
+        # Une lane = un thread qui garde un proxy "courant" et enchaine les
+        # pages de la file jusqu'a epuisement, avec releve de proxy en cas d'echec.
+        current_proxy = initial_proxy
+        while True:
+            page_url = _next_pending_url()
+            if page_url is None:
+                return
+            page_logger = with_context(scoped_logger, url=page_url)
             try:
-                _process_one_page(page_url, proxy_cfg)
+                page_logger.info("Processing page from CSV batch", extra={"proxy": _proxy_label(current_proxy)})
+                result = _attempt_page(page_url, page_attempts, page_logger, proxy_cfg=current_proxy)
+                posts = _clip_posts(result)
+
+                # Releve: le proxy courant n'a rien donne -> on tente un proxy de
+                # secours (si dispo) et on bascule la lane dessus durablement.
+                while not posts:
+                    spare = _take_spare_proxy()
+                    if spare is None:
+                        break
+                    page_logger.warning(
+                        "Page failed on current proxy; failing over to spare proxy",
+                        extra={"old_proxy": _proxy_label(current_proxy), "new_proxy": _proxy_label(spare)},
+                    )
+                    current_proxy = spare
+                    result = _attempt_page(page_url, page_attempts, page_logger, proxy_cfg=current_proxy)
+                    posts = _clip_posts(result)
+
+                if not posts:
+                    with state_lock:
+                        failed_pages.append({"url": page_url, "error": str(result.get("error") or "no_posts_found")})
+                    page_logger.warning("Page scrape failed")
+                    _page_cooldown(multiplier=1.3)
+                    continue
+
+                if result.get("error"):
+                    # Succes partiel: des posts collectes malgre une erreur
+                    # (challenge tardif, exception apres coup...). On les garde.
+                    page_logger.warning(
+                        "Page scrape ended with error but posts were recovered; keeping partial result",
+                        extra={"error": str(result.get("error"))},
+                    )
+
+                _publish_page_posts(page_url, posts)
+                _page_cooldown()
             except Exception:
-                with_context(scoped_logger, url=page_url).exception("Unhandled error while processing page in batch lane")
+                page_logger.exception("Unhandled error while processing page in batch lane")
                 with state_lock:
                     failed_pages.append({"url": page_url, "error": "unhandled_exception"})
 
-    lanes = _split_round_robin(urls, batch_concurrency)
-    with ThreadPoolExecutor(max_workers=max(1, len(lanes))) as executor:
-        futures = [
-            executor.submit(_run_lane, lane_urls, proxy_pool[lane_index % len(proxy_pool)] if proxy_pool else None)
-            for lane_index, lane_urls in enumerate(lanes)
-        ]
+    lane_count = max(1, len(active_proxies))
+    with ThreadPoolExecutor(max_workers=lane_count) as executor:
+        futures = [executor.submit(_lane_worker, active_proxies[i]) for i in range(lane_count)]
         for future in as_completed(futures):
             future.result()
 

@@ -7,6 +7,9 @@ platform/facebook scraper/fb_cookies.json
 # Profil Chrome complet (cookies/cache/session Facebook) - jamais committer.
 platform/facebook scraper/fb_profile/
 platform/tiktok scraper/tiktok_cookies.json
+# Pool Webshare (credentials) + blacklist locale des proxies en cooldown
+platform/tiktok scraper/webshare_residential_proxies.txt
+platform/tiktok scraper/proxy_blacklist.json
 # Artefacts de debug (screenshot/HTML) produits par _save_challenge_artifacts,
 # un couple de fichiers par "label" (challenge, no_posts_found, ...).
 platform/tiktok scraper/tiktok_*.png

@@ -5,11 +5,18 @@ import com.richatt.scraper.model.ScrapeResult;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.mongodb.repository.MongoRepository;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 
 public interface ScrapeResultRepository extends MongoRepository<ScrapeResult, String> {
     List<ScrapeResult> findByScrapeId(String scrapeId);
+
+    // Cache de re-scraping: le document unique d'une video (upsert par
+    // platform+postId) et le lookup batch utilise par l'endpoint interne.
+    Optional<ScrapeResult> findFirstByPlatformAndPostId(Platform platform, String postId);
+
+    List<ScrapeResult> findByPlatformAndPostIdIn(Platform platform, Collection<String> postIds);
 
     List<ScrapeResult> findByScrapeIdOrderByIdAsc(String scrapeId, Pageable pageable);
 

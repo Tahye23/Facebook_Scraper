@@ -41,4 +41,6 @@ terminals/
 
 # --- Divers -------------------------------------------------------------------
 **/node_modules/
+**/webshare_residential_proxies.txt
+**/proxy_blacklist.json
 *.md

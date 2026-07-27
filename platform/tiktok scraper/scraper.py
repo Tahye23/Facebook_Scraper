@@ -3,6 +3,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote, urlparse, urlsplit, urlunsplit
@@ -20,6 +21,10 @@ from logging_setup import get_logger, with_context
 
 
 COOKIES_FILE = "tiktok_cookies.json"
+# Fichier JSON persistant des proxies mis en pause (cooldown 24h par defaut).
+# Cle = identite sticky Webshare (username), valeur = {until, reason}.
+PROXY_BLACKLIST_FILE = "proxy_blacklist.json"
+_PROXY_BLACKLIST_LOCK = threading.Lock()
 LOGGER = get_logger(__name__, platform="tiktok", service="scraper")
 
 
@@ -261,6 +266,289 @@ def _build_proxy_config() -> dict | None:
     return proxy
 
 
+def _proxy_identity(proxy_cfg: dict | None) -> str:
+    """Cle stable d'un proxy pour blacklist / dedup.
+
+    Pour Webshare sticky (`sdwopfmy-N`), le username est l'identite IP.
+    Fallback: server + username.
+    """
+    if not proxy_cfg:
+        return "direct"
+    username = str(proxy_cfg.get("username") or "").strip()
+    server = str(proxy_cfg.get("server") or "").strip()
+    if username:
+        return username
+    return server or "proxy"
+
+
+def _blacklist_path() -> Path:
+    """Chemin du fichier blacklist (a cote du scraper, pas du cwd)."""
+    raw = (os.getenv("TIKTOK_PROXY_BLACKLIST_FILE") or PROXY_BLACKLIST_FILE).strip()
+    path = Path(raw)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / path
+    return path
+
+
+def _load_blacklist() -> dict:
+    """Charge la blacklist et purge les entrees expirees."""
+    path = _blacklist_path()
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        LOGGER.warning("Failed to read proxy blacklist; starting empty", exc_info=True)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+
+    now = datetime.now(tz=timezone.utc)
+    alive = {}
+    for key, entry in data.items():
+        if not isinstance(entry, dict):
+            continue
+        until_raw = entry.get("until")
+        try:
+            until = datetime.fromisoformat(str(until_raw).replace("Z", "+00:00"))
+            if until.tzinfo is None:
+                until = until.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            continue
+        if until > now:
+            alive[str(key)] = {"until": until.isoformat(), "reason": entry.get("reason") or ""}
+    return alive
+
+
+def _save_blacklist(data: dict) -> None:
+    path = _blacklist_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except OSError:
+        LOGGER.warning("Failed to persist proxy blacklist", exc_info=True)
+
+
+def _is_blacklisted(proxy_cfg: dict | None) -> bool:
+    if not proxy_cfg:
+        return False
+    with _PROXY_BLACKLIST_LOCK:
+        return _proxy_identity(proxy_cfg) in _load_blacklist()
+
+
+def _blacklist_proxy(proxy_cfg: dict | None, reason: str) -> None:
+    """Met un proxy en cooldown (defaut 24h = 1 jour)."""
+    if not proxy_cfg:
+        return
+    hours = max(1, _env_int("TIKTOK_PROXY_BLACKLIST_HOURS", 24))
+    key = _proxy_identity(proxy_cfg)
+    until = datetime.now(tz=timezone.utc) + timedelta(hours=hours)
+    with _PROXY_BLACKLIST_LOCK:
+        data = _load_blacklist()
+        data[key] = {"until": until.isoformat(), "reason": (reason or "")[:200]}
+        _save_blacklist(data)
+    LOGGER.warning(
+        "Proxy blacklisted for cooldown",
+        extra={"url": _describe_proxy(proxy_cfg), "error": reason, "post_id": key},
+    )
+
+
+def _should_blacklist_error(error_code: str) -> bool:
+    """True si l'erreur justifie un cooldown 24h (timeout / 403 / no_posts / nav)."""
+    return _is_retryable_soft_error(error_code)
+
+
+def _is_retryable_soft_error(error_code: str) -> bool:
+    """Erreurs pour lesquelles on doit retenter / changer de proxy (pas abandonner).
+
+    Inclut aussi les erreurs Playwright de navigation (ex: "interrupted by
+    another navigation") qui ne contiennent pas `net::ERR_...` mais sont
+    typiques d'un anti-bot / redirect TikTok — sans ca, on arretait apres
+    1 seul proxy au lieu d'essayer les 4.
+    """
+    err = (error_code or "").strip().lower()
+    if not err:
+        return False
+    if err in {"challenge_detected", "no_posts_found", "all_proxies_blocked"}:
+        return True
+    tokens = (
+        "net::err",
+        "err_timed_out",
+        "err_http_response_code_failure",
+        "err_connection",
+        "err_tunnel",
+        "err_proxy",
+        "err_aborted",
+        "err_name_not_resolved",
+        "err_address_unreachable",
+        "403",
+        "interrupted by another navigation",
+        "navigation to",
+        "page.goto",
+        "timeout",
+        "target closed",
+        "browser has been closed",
+        "connection closed",
+    )
+    return any(tok in err for tok in tokens)
+
+
+def _resolve_proxy_file_path() -> Path | None:
+    """Chemin du fichier pool Webshare (20k lignes), ou None si absent."""
+    raw = (os.getenv("TIKTOK_PROXY_FILE") or "webshare_residential_proxies.txt").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / path
+    return path if path.exists() else None
+
+
+def _iter_proxy_specs_from_sources() -> list[str]:
+    """Collecte les specs proxy: fichier 20k + TIKTOK_PROXY_LIST + PROXY_SERVER.
+
+    On NE met PAS les 20k dans le .env: le fichier est lu a la volee, puis on
+    tire un echantillon aleatoire (voir `_select_proxy_candidates`).
+    """
+    specs: list[str] = []
+
+    proxy_file = _resolve_proxy_file_path()
+    if proxy_file is not None:
+        try:
+            with open(proxy_file, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        specs.append(line)
+        except OSError:
+            LOGGER.warning("Failed to read proxy file", extra={"url": str(proxy_file)}, exc_info=True)
+
+    raw_list = (os.getenv("TIKTOK_PROXY_LIST") or "").replace(";", "\n")
+    for line in raw_list.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            specs.append(line)
+
+    inline = (os.getenv("TIKTOK_PROXY_SERVER") or "").strip()
+    if inline:
+        # Reconstruit une spec host:port:user:pass si user/pass fournis a part.
+        username = (os.getenv("TIKTOK_PROXY_USERNAME") or "").strip()
+        password = os.getenv("TIKTOK_PROXY_PASSWORD") or ""
+        if username and "://" not in inline and "|" not in inline and inline.count(":") == 1:
+            specs.append(f"{inline}:{username}:{password}")
+        else:
+            specs.append(inline)
+
+    return specs
+
+
+def _parse_all_proxies() -> list[dict]:
+    """Parse + deduplique toutes les specs disponibles (fichier + env)."""
+    candidates: list[dict] = []
+    seen: set[str] = set()
+    for spec in _iter_proxy_specs_from_sources():
+        proxy = _parse_proxy_spec(spec)
+        if not proxy:
+            continue
+        key = _proxy_identity(proxy)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(proxy)
+    return candidates
+
+
+def _select_proxy_candidates(limit: int | None = None) -> list[dict | None]:
+    """Tire au hasard N proxies NON blacklists depuis le pool (fichier 20k).
+
+    Defaut N = TIKTOK_PROXY_MAX_PER_JOB (4). On ne charge PAS les 20k dans la
+    boucle de scrape: seulement N sessions sticky aleatoires, encore dispo.
+    """
+    if limit is None:
+        limit = max(1, _env_int("TIKTOK_PROXY_MAX_PER_JOB", 4))
+
+    pool = _parse_all_proxies()
+    if not pool:
+        return [None]
+
+    with _PROXY_BLACKLIST_LOCK:
+        blocked = set(_load_blacklist().keys())
+
+    available = [p for p in pool if _proxy_identity(p) not in blocked]
+    if not available:
+        # Tout le pool est en cooldown: on retombe sur le pool brut (mieux que
+        # abandonner sec) mais on logue clairement.
+        LOGGER.warning(
+            "All proxies are blacklisted; sampling from full pool anyway",
+            extra={"post_id": None},
+        )
+        available = pool
+
+    random.shuffle(available)
+    selected = available[:limit]
+    LOGGER.info(
+        "Selected proxy sample for job",
+        extra={
+            "post_id": None,
+            "url": f"pool={len(pool)} available={len(available) if available is not pool else 0} selected={len(selected)}",
+        },
+    )
+
+    if _env_bool("TIKTOK_TRY_DIRECT_AFTER_PROXIES", False):
+        selected = list(selected) + [None]
+    return selected
+
+
+def _load_proxy_candidates() -> list[dict | None]:
+    """Compat: sample dynamique pour un job (4 par defaut), pas toute la liste."""
+    return _select_proxy_candidates()
+
+
+def get_proxy_pool() -> list[dict]:
+    """Echantillon de proxies pour les lanes batch (hors blacklist).
+
+    Ne retourne PAS les 20k: seulement assez pour concurrency + reserve
+    (defaut: max(concurrency*2, PROXY_MAX_PER_JOB)).
+    """
+    concurrency = max(1, _env_int("TIKTOK_BATCH_CONCURRENCY", 6))
+    sample_size = max(concurrency * 2, _env_int("TIKTOK_PROXY_MAX_PER_JOB", 4))
+    return [p for p in _select_proxy_candidates(limit=sample_size) if p is not None]
+
+
+def pick_replacement_proxy(exclude: set[str] | None = None) -> dict | None:
+    """Tire UNE nouvelle IP hors blacklist et hors `exclude` (pour releve CSV).
+
+    Sert a remplacer une IP morte: on la blacklist, puis on en prend une autre
+    dans le pool 20k pour garder la reserve pleine.
+    """
+    excluded = set(exclude or set())
+    pool = _parse_all_proxies()
+    if not pool:
+        return None
+    with _PROXY_BLACKLIST_LOCK:
+        blocked = set(_load_blacklist().keys())
+    available = [
+        p for p in pool
+        if _proxy_identity(p) not in blocked and _proxy_identity(p) not in excluded
+    ]
+    if not available:
+        return None
+    return random.choice(available)
+
+
+def _describe_proxy(proxy_cfg: dict | None) -> str:
+    """Retourne une description lisible du mode reseau (proxy/direct)."""
+    if not proxy_cfg:
+        return "direct"
+    identity = _proxy_identity(proxy_cfg)
+    server = proxy_cfg.get("server") or "proxy"
+    if identity and identity not in (server, "proxy"):
+        return f"{server} ({identity})"
+    return server
+
+
 def _build_user_data_dir() -> str:
     """Retourne le dossier profil navigateur persistant (ou chaine vide).
 
@@ -339,63 +627,6 @@ def _parse_proxy_spec(spec: str) -> dict | None:
         return proxy
 
     return {"server": raw}
-
-
-def _load_proxy_candidates() -> list[dict | None]:
-    """Construit la liste de proxies candidats avec deduplication.
-
-    Sources:
-    - TIKTOK_PROXY_SERVER (+ username/password)
-    - TIKTOK_PROXY_LIST (multi-lignes)
-
-    Retourne `[None]` si aucun proxy n'est configure (mode direct).
-    """
-    candidates = []
-    seen = set()
-
-    inline_proxy = _build_proxy_config()
-    if inline_proxy:
-        key = json.dumps(inline_proxy, sort_keys=True)
-        seen.add(key)
-        candidates.append(inline_proxy)
-
-    raw_list = (os.getenv("TIKTOK_PROXY_LIST") or "").replace(";", "\n")
-    for line in raw_list.splitlines():
-        proxy = _parse_proxy_spec(line)
-        if not proxy:
-            continue
-        key = json.dumps(proxy, sort_keys=True)
-        if key in seen:
-            continue
-        seen.add(key)
-        candidates.append(proxy)
-
-    if not candidates:
-        return [None]
-
-    if _env_bool("TIKTOK_TRY_DIRECT_AFTER_PROXIES", False):
-        candidates.append(None)
-    return candidates
-
-
-def get_proxy_pool() -> list[dict]:
-    """Retourne la liste "a plat" des proxies configures (sans l'entree
-    `None` de connexion directe que `_load_proxy_candidates` peut ajouter).
-
-    Utilise par `worker.py` pour repartir un batch de plusieurs pages sur
-    plusieurs proxies EN PARALLELE (une "lane" dediee par proxy), au lieu de
-    la rotation sequentielle par defaut de `scrape_tiktok_page` (qui essaie
-    chaque proxy l'un apres l'autre, sur une seule page, seulement si un
-    challenge est detecte).
-    """
-    return [proxy for proxy in _load_proxy_candidates() if proxy is not None]
-
-
-def _describe_proxy(proxy_cfg: dict | None) -> str:
-    """Retourne une description lisible du mode reseau (proxy/direct)."""
-    if not proxy_cfg:
-        return "direct"
-    return proxy_cfg.get("server") or "proxy"
 
 
 def _rotate_ipv6_identity() -> str | None:
@@ -1106,7 +1337,7 @@ def _scrape_with_browser(
         # configurable, et on s'arrete plus tot si plusieurs scrolls de suite
         # ne rapportent aucune video nouvelle (plus la peine de continuer).
         max_scroll_iterations = _env_int("TIKTOK_MAX_SCROLL_ITERATIONS", 60)
-        max_consecutive_empty_scrolls = _env_int("TIKTOK_MAX_EMPTY_SCROLLS", 3)
+        max_consecutive_empty_scrolls = _env_int("TIKTOK_MAX_EMPTY_SCROLLS", 2)
         consecutive_empty_scrolls = 0
 
         # Scroll progressif pour charger davantage de posts.
@@ -1263,24 +1494,9 @@ def _scrape_with_browser(
         # et on reserve la trace ERROR complete aux vraies erreurs inattendues
         # (bug de code, etc.) qui, elles, meritent un diagnostic detaille.
         err_text = str(e)
-        expected_network_tokens = (
-            "net::err",
-            "err_timed_out",
-            "err_connection",
-            "err_tunnel",
-            "err_proxy",
-            "err_http_response_code_failure",
-            "err_aborted",
-            "err_name_not_resolved",
-            "err_address_unreachable",
-            "timeout",
-        )
-        is_expected_network_error = any(
-            tok in err_text.lower() for tok in expected_network_tokens
-        )
-        if is_expected_network_error:
-            # `splitlines()[0]` = juste "Page.goto: net::ERR_... at <url>" sans
-            # dumper toute la stack Playwright (bruit inutile dans les logs).
+        if _is_retryable_soft_error(err_text):
+            # `splitlines()[0]` = juste "Page.goto: ..." sans dumper toute la
+            # stack Playwright (bruit inutile dans les logs).
             LOGGER.warning(
                 "Browser attempt failed (%s); rotating proxy candidate",
                 err_text.splitlines()[0] if err_text else "unknown network error",
@@ -1681,7 +1897,13 @@ def scrape_tiktok_page(
     if analyze_video_content is None:
         analyze_video_content = _env_bool("TIKTOK_ANALYZE_VIDEO_CONTENT", False)
     slow_mo_ms = 0 if headless else 150
-    proxy_candidates = [proxy_override] if proxy_override is not None else _load_proxy_candidates()
+    # Sample dynamique: N proxies aleatoires hors blacklist (pas toute la liste
+    # .env / fichier 20k). `proxy_override` (lanes batch) force UN seul proxy.
+    attempts_per_proxy = max(1, _env_int("TIKTOK_PROXY_ATTEMPTS_PER_PROXY", 2))
+    if proxy_override is not None:
+        proxy_candidates = [proxy_override]
+    else:
+        proxy_candidates = _select_proxy_candidates()
 
     # Rotation IPv6 "toutes les N videos" (0 = desactivee). Voir
     # `_rotate_ipv6_identity` et `tools/ipv6_rotating_proxy.py` pour le
@@ -1692,53 +1914,80 @@ def scrape_tiktok_page(
 
     with sync_playwright() as p:
         last_result = None
-        for attempt_index, proxy_cfg in enumerate(proxy_candidates, start=1):
-            scoped_logger.info("Scrape attempt started", extra={"post_id": None})
-            # Rotation proxy: si challenge detecte, on passe au candidat suivant.
-            result = _scrape_with_browser(
-                p,
-                profile_url,
-                max_posts,
-                max_age_hours,
-                on_post,
-                headless,
-                slow_mo_ms,
-                proxy_cfg,
-                analyze_video_content,
-                rotate_every_n_posts=rotate_every_n_posts,
-            )
-            last_result = result
-            # On arrete de faire tourner les proxies dès qu'on a recupere des
-            # posts (meme partiels) ou dès qu'il ne s'agit pas d'un echec
-            # "soft" (0 post). Rotation supplementaire n'a de sens que pour
-            # retenter un `challenge_detected` OU un `no_posts_found` sans
-            # aucun post: on a constate (voir tiktok_no_posts_found.png/.html)
-            # que certains proxies datacenter sont "silencieusement" bloques
-            # par TikTok (page chargee normalement, botType marque cote
-            # serveur, mais AUCUN challenge visible) - ca ressort en
-            # `no_posts_found`, pas en `challenge_detected`. Sans ce
-            # traitement equivalent, on retentait 3x le MEME proxy (le
-            # premier de la liste) au lieu d'essayer les 9 autres.
-            error_code = str(result.get("error") or "").strip().lower()
-            # En plus des codes connus, toute erreur reseau/proxy brute
-            # remontee par Chromium (ex: net::ERR_TUNNEL_CONNECTION_FAILED
-            # quand le proxy lui-meme refuse la connexion, souvent un 402/407
-            # cote fournisseur - quota depasse, abonnement expire...) doit
-            # aussi faire passer au proxy candidat suivant: ce n'est jamais
-            # la peine de retenter le MEME proxy mort plusieurs fois.
-            is_network_or_proxy_error = any(
-                token in error_code for token in ("net::err", "err_tunnel", "err_proxy", "err_connection", "err_timed_out")
-            )
-            retryable_with_next_proxy = (
-                error_code in {"challenge_detected", "no_posts_found"} or is_network_or_proxy_error
-            )
-            if result.get("posts") or not retryable_with_next_proxy:
-                if result.get("error"):
-                    scoped_logger.warning("Scrape finished with error", extra={"has_partial_posts": bool(result.get("posts"))})
-                else:
-                    scoped_logger.info("Scrape finished successfully")
-                return result
-            if attempt_index < len(proxy_candidates):
-                scoped_logger.warning("Soft failure detected, rotating proxy candidate", extra={"error": error_code})
+        tried = 0
+        for proxy_cfg in proxy_candidates:
+            # Avant d'essayer: verifie que ce proxy n'a pas ete blackliste entre
+            # temps (autre job / lane parallele), sinon on saute.
+            if proxy_cfg is not None and _is_blacklisted(proxy_cfg):
+                scoped_logger.info(
+                    "Skipping already-blacklisted proxy",
+                    extra={"url": _describe_proxy(proxy_cfg)},
+                )
+                continue
 
-        return last_result or {"posts": [], "total": 0, "error": "challenge_detected", "url": profile_url}
+            for try_index in range(1, attempts_per_proxy + 1):
+                tried += 1
+                scoped_logger.info(
+                    "Scrape attempt started",
+                    extra={"post_id": None, "url": f"{_describe_proxy(proxy_cfg)} try={try_index}/{attempts_per_proxy}"},
+                )
+                result = _scrape_with_browser(
+                    p,
+                    profile_url,
+                    max_posts,
+                    max_age_hours,
+                    on_post,
+                    headless,
+                    slow_mo_ms,
+                    proxy_cfg,
+                    analyze_video_content,
+                    rotate_every_n_posts=rotate_every_n_posts,
+                )
+                last_result = result
+                error_code = str(result.get("error") or "").strip().lower()
+                retryable_soft = _is_retryable_soft_error(error_code)
+
+                if result.get("posts") or not retryable_soft:
+                    if result.get("error"):
+                        scoped_logger.warning(
+                            "Scrape finished with error",
+                            extra={"has_partial_posts": bool(result.get("posts"))},
+                        )
+                    else:
+                        scoped_logger.info("Scrape finished successfully")
+                    return result
+
+                # Soft failure: retente le MEME proxy si essais restants, sinon
+                # blacklist 24h et passe au suivant (s'il n'est pas deja pris).
+                if try_index < attempts_per_proxy:
+                    scoped_logger.warning(
+                        "Soft failure on proxy; retrying same proxy",
+                        extra={"error": error_code[:120], "url": _describe_proxy(proxy_cfg)},
+                    )
+                    continue
+
+                if _should_blacklist_error(error_code):
+                    _blacklist_proxy(proxy_cfg, error_code)
+                scoped_logger.warning(
+                    "Soft failure detected, rotating proxy candidate",
+                    extra={"error": error_code[:120]},
+                )
+                break
+
+        # Aucun proxy n'a donne de posts: message clair pour l'API utilisateur.
+        friendly = (
+            "TikTok a bloque les proxies testes (0 video recuperee). "
+            "Les proxies en echec sont mis en pause 24h. "
+            "Reessaie dans quelques minutes avec d'autres IP du pool."
+        )
+        if last_result is None:
+            return {
+                "posts": [],
+                "total": 0,
+                "error": friendly,
+                "error_code": "all_proxies_blocked",
+                "url": profile_url,
+            }
+        last_result["error_code"] = str(last_result.get("error") or "all_proxies_blocked")
+        last_result["error"] = friendly
+        return last_result

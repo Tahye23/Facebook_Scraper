@@ -56,6 +56,10 @@ services:
       SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
       SPRING_DATA_MONGODB_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/${MONGO_DB}?authSource=admin
       SPRING_MONGODB_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/${MONGO_DB}?authSource=admin
+      # Cache de re-scraping: fenetre de fraicheur des metriques + token de
+      # l'endpoint interne appele par le worker (voir InternalController).
+      SCRAPE_METRICS_TTL_HOURS: ${SCRAPE_METRICS_TTL_HOURS:-12}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-}
     command:
       - --spring.rabbitmq.host=rabbitmq
       - --spring.rabbitmq.port=5672
@@ -139,6 +143,10 @@ services:
       # On utilise le VRAI Chrome installe dans l'image (voir Dockerfile):
       # fingerprint authentique = beaucoup moins detecte par TikTok.
       TIKTOK_BROWSER_CHANNEL: "chrome"
+      # Cache de re-scraping: URL interne du gateway (nom de service Docker) que
+      # le worker interroge pour reutiliser les analyses IA deja en base. Le
+      # token eventuel vient du .env (INTERNAL_API_TOKEN).
+      GATEWAY_INTERNAL_URL: "http://gateway:8080"
     volumes:
       # Le dossier est copie sans espace dans l'image ("tiktok-scraper", voir
       # Dockerfile), d'ou le chemin different a droite du ":".
@@ -147,11 +155,19 @@ services:
       # Cookies TikTok montes (comme fb_cookies.json cote Facebook): on peut les
       # remplacer sans reconstruire l'image quand la session expire.
       - "./platform/tiktok scraper/tiktok_cookies.json:/app/platform/tiktok-scraper/tiktok_cookies.json:ro"
+      # Pool Webshare 20k sessions (lu a la volee, sample aleatoire par job).
+      - "./platform/tiktok scraper/webshare_residential_proxies.txt:/app/platform/tiktok-scraper/webshare_residential_proxies.txt:ro"
+      # Blacklist persistante des proxies en cooldown 24h.
+      - "./platform/tiktok scraper/proxy_blacklist.json:/app/platform/tiktok-scraper/proxy_blacklist.json"
       - "./logs:/app/logs"
     command: ["python", "worker.py"]
     depends_on:
       rabbitmq:
         condition: service_healthy
+      # Pas bloquant (le lookup cache echoue proprement si le gateway n'est pas
+      # encore pret), mais on demarre apres lui pour maximiser les hits cache.
+      gateway:
+        condition: service_started
     networks:
       - scraper_net
 

@@ -11,8 +11,10 @@ import com.richatt.scraper.repository.ScrapeResultRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
@@ -26,6 +28,13 @@ public class ScrapeResultListener {
 
     private final ScrapeJobRepository jobRepository;
     private final ScrapeResultRepository resultRepository;
+
+    // Fenetre de fraicheur des metriques (heures). En dessous, on NE rafraichit
+    // PAS les likes/vues/... lors d'un re-scrape (donnees jugees encore fraiches).
+    // 0 ou negatif => TTL desactive (on rafraichit toujours). Configurable via
+    // SCRAPE_METRICS_TTL_HOURS.
+    @Value("${SCRAPE_METRICS_TTL_HOURS:12}")
+    private long metricsTtlHours;
 
     @RabbitListener(queues = RabbitConfig.QUEUE_RESULT)
     public void onResult(Map<String, Object> message) {
@@ -165,33 +174,59 @@ public class ScrapeResultListener {
 
     private ScrapeResult upsertResult(ScrapeResult incoming) {
         String postId = incoming.getPostId();
-        if (postId == null || postId.isBlank()) {
+        // Sans postId (ou sans plateforme) on ne peut pas dedupliquer: insertion simple.
+        if (postId == null || postId.isBlank() || incoming.getPlatform() == null) {
             return resultRepository.save(incoming);
         }
 
+        // Cache "pas d'historique": un seul document par (platform, postId).
         ScrapeResult existing = resultRepository
-                .findFirstByScrapeIdAndPostId(incoming.getScrapeId(), postId)
+                .findFirstByPlatformAndPostId(incoming.getPlatform(), postId)
                 .orElse(null);
 
         if (existing == null) {
             return resultRepository.save(incoming);
         }
 
+        // Re-scrape de la meme video: on garde LE meme document et on le rattache
+        // au dernier job (scrapeId), pour que GET /scrape/{scrapeId}/results reste
+        // complet tout en n'ayant qu'un document par video.
+        existing.setScrapeId(incoming.getScrapeId());
         existing.setPlatform(incoming.getPlatform());
         existing.setAuthor(preferNonBlank(incoming.getAuthor(), existing.getAuthor()));
         existing.setTextContent(preferNonBlank(incoming.getTextContent(), existing.getTextContent()));
         existing.setSourceUrl(preferNonBlank(incoming.getSourceUrl(), existing.getSourceUrl()));
         existing.setSourceMediaUrl(preferNonBlank(incoming.getSourceMediaUrl(), existing.getSourceMediaUrl()));
         existing.setMediaPath(preferNonBlank(incoming.getMediaPath(), existing.getMediaPath()));
+        // video_report = analyse IA STABLE: on conserve l'existante, on ne
+        // merge que si le worker en renvoie une (il saute Gemini quand une
+        // analyse existe deja -> incoming.videoReport souvent null ici).
         existing.setVideoReport(mergeObjectMaps(existing.getVideoReport(), incoming.getVideoReport()));
         existing.setHashtags((incoming.getHashtags() == null || incoming.getHashtags().isEmpty())
                 ? existing.getHashtags()
                 : incoming.getHashtags());
         existing.setPublishedAt(incoming.getPublishedAt() != null ? incoming.getPublishedAt() : existing.getPublishedAt());
-        existing.setScrapedAt(incoming.getScrapedAt() != null ? incoming.getScrapedAt() : existing.getScrapedAt());
-        existing.setMetrics(mergeMetrics(existing.getMetrics(), incoming.getMetrics()));
+
+        // Regle TTL metriques: si le doc a ete rafraichi il y a MOINS de
+        // metricsTtlHours, les metriques sont jugees encore fraiches -> on ne
+        // touche NI aux metriques NI a scrapedAt (la fenetre reste mesuree depuis
+        // le dernier vrai rafraichissement). Sinon on rafraichit les deux.
+        if (!isWithinMetricsTtl(existing.getScrapedAt())) {
+            existing.setMetrics(mergeMetrics(existing.getMetrics(), incoming.getMetrics()));
+            if (incoming.getScrapedAt() != null) {
+                existing.setScrapedAt(incoming.getScrapedAt());
+            }
+        }
 
         return resultRepository.save(existing);
+    }
+
+    private boolean isWithinMetricsTtl(Instant lastScrapedAt) {
+        if (lastScrapedAt == null || metricsTtlHours <= 0) {
+            return false;
+        }
+        return Duration.between(lastScrapedAt, Instant.now())
+                .compareTo(Duration.ofHours(metricsTtlHours)) < 0;
     }
 
     private PostMetrics mergeMetrics(PostMetrics existing, PostMetrics incoming) {

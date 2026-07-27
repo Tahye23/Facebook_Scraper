@@ -5,6 +5,7 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import org.springframework.data.annotation.Id;
+import org.springframework.data.mongodb.core.index.CompoundIndex;
 import org.springframework.data.mongodb.core.index.Indexed;
 import org.springframework.data.mongodb.core.mapping.Document;
 
@@ -17,6 +18,13 @@ import java.util.Map;
 @NoArgsConstructor
 @AllArgsConstructor
 @Document(collection = "scrape_results")
+// Index compose (platform, postId): sert le "cache" de re-scraping. On upsert
+// desormais par (platform, postId) => un seul document par video (pas
+// d'historique), et les lookups par postId (endpoint interne) sont rapides.
+// Non unique volontairement: d'anciens doublons issus de jobs precedents ne
+// doivent pas faire echouer la creation de l'index; la logique d'upsert
+// applicative garantit l'unicite pour les nouveaux ecrits.
+@CompoundIndex(name = "platform_postId_idx", def = "{'platform': 1, 'postId': 1}")
 public class ScrapeResult {
     @Id
     private String id;

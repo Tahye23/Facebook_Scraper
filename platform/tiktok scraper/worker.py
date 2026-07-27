@@ -20,6 +20,8 @@ import random
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from datetime import datetime, timezone
@@ -33,7 +35,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from logging_setup import get_logger, with_context
-from scraper import get_proxy_pool, scrape_tiktok_page
+from scraper import get_proxy_pool, pick_replacement_proxy, scrape_tiktok_page
+from scraper import _is_blacklisted as is_proxy_blacklisted
+from scraper import _proxy_identity as proxy_identity
+from scraper import _blacklist_proxy as blacklist_proxy
 from video_analysis import (
     analyze_tiktok_video,
     analyze_videos_json_with_gemini,
@@ -370,6 +375,42 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _fetch_cached_video_reports(post_ids: list[str]) -> dict:
+    """Interroge le gateway pour savoir quels post_id ont deja une analyse IA.
+
+    Retourne un dict {post_id: video_report}. Sert le "cache de re-scraping":
+    pour ces posts, le worker saute l'appel Gemini (etape la plus couteuse) et
+    reutilise l'analyse existante. En cas d'erreur (gateway injoignable, etc.),
+    retourne un dict vide -> on retombe simplement sur le comportement normal
+    (on analyse), donc jamais bloquant.
+    """
+    ids = [str(pid).strip() for pid in post_ids if str(pid or "").strip()]
+    if not ids:
+        return {}
+
+    base_url = (os.getenv("GATEWAY_INTERNAL_URL") or "http://gateway:8080").rstrip("/")
+    endpoint = f"{base_url}/internal/results/reports"
+    token = (os.getenv("INTERNAL_API_TOKEN") or "").strip()
+    payload = json.dumps({"platform": "tiktok", "postIds": ids}).encode("utf-8")
+
+    request = urllib.request.Request(endpoint, data=payload, method="POST")
+    request.add_header("Content-Type", "application/json")
+    if token:
+        request.add_header("X-Internal-Token", token)
+
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        reports = data.get("reports") or {}
+        return reports if isinstance(reports, dict) else {}
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        LOGGER.warning(
+            "Cache lookup failed; will analyze all posts",
+            extra={"error": str(exc)},
+        )
+        return {}
 
 
 def _enrich_post_video(post: dict, output_dir: str) -> dict:
@@ -1456,23 +1497,55 @@ def _process_csv_batch_task(
     # pioche la page suivante dans la file (auto-equilibrage: une lane lente ne
     # bloque plus les autres).
     #
-    # RELEVE DE PROXY: chaque lane demarre avec un proxy "actif". Si sa page
-    # echoue (0 post), la lane prend un proxy DE SECOURS dans `spare_proxies`
-    # (les proxies configures AU-DELA du nombre de lanes) et bascule dessus pour
-    # cette page ET les suivantes. C'est le comportement demande: proxy #2 KO
-    # -> #11 prend la suite, #11 KO -> #12, etc. Pour en profiter, configurer
-    # PLUS de proxies dans TIKTOK_PROXY_LIST que de lanes (TIKTOK_BATCH_CONCURRENCY).
+    # RELEVE DE PROXY: si l'IP d'une lane echoue -> blacklist 24h + bascule sur
+    # une IP de reserve. La reserve est ensuite recompletee depuis le pool 20k
+    # (nouvelle IP hors blacklist / hors IP deja en service).
     pending_urls = deque(urls)
     active_proxies = (proxy_pool[:batch_concurrency] if proxy_pool else [None]) or [None]
     spare_proxies = deque(proxy_pool[batch_concurrency:]) if proxy_pool else deque()
+    # Identites des IP actuellement assignees (lanes + reserve) pour ne pas
+    # retirer la meme session sticky en remplacement.
+    in_use_ids = {
+        proxy_identity(p)
+        for p in list(active_proxies) + list(spare_proxies)
+        if p is not None
+    }
 
     def _next_pending_url() -> str | None:
         with state_lock:
             return pending_urls.popleft() if pending_urls else None
 
     def _take_spare_proxy() -> dict | None:
+        # 1) reserve locale (hors blacklist)  2) sinon tirage frais dans le pool 20k
         with state_lock:
-            return spare_proxies.popleft() if spare_proxies else None
+            while spare_proxies:
+                candidate = spare_proxies.popleft()
+                if candidate is not None and is_proxy_blacklisted(candidate):
+                    in_use_ids.discard(proxy_identity(candidate))
+                    continue
+                return candidate
+            fresh = pick_replacement_proxy(exclude=in_use_ids)
+            if fresh is not None:
+                in_use_ids.add(proxy_identity(fresh))
+            return fresh
+
+    def _retire_and_replace(dead_proxy: dict | None, reason: str) -> dict | None:
+        """Blacklist l'IP morte, retire une IP de remplacement, recomplete la reserve."""
+        if dead_proxy is not None and not is_proxy_blacklisted(dead_proxy):
+            blacklist_proxy(dead_proxy, reason or "no_posts_found")
+        if dead_proxy is not None:
+            with state_lock:
+                in_use_ids.discard(proxy_identity(dead_proxy))
+
+        replacement = _take_spare_proxy()
+        # Recompleter la reserve: tirer une IP supplementaire du pool 20k pour
+        # garder une marge de releve pour les prochaines pages.
+        with state_lock:
+            refill = pick_replacement_proxy(exclude=in_use_ids)
+            if refill is not None:
+                in_use_ids.add(proxy_identity(refill))
+                spare_proxies.append(refill)
+        return replacement
 
     def _clip_posts(result: dict) -> list[dict]:
         posts = result.get("posts") or []
@@ -1494,14 +1567,15 @@ def _process_csv_batch_task(
                 result = _attempt_page(page_url, page_attempts, page_logger, proxy_cfg=current_proxy)
                 posts = _clip_posts(result)
 
-                # Releve: le proxy courant n'a rien donne -> on tente un proxy de
-                # secours (si dispo) et on bascule la lane dessus durablement.
+                # Releve: IP courante KO -> blacklist 24h + remplacement (reserve
+                # ou nouvelle IP du pool 20k), puis on retente la meme page.
                 while not posts:
-                    spare = _take_spare_proxy()
+                    reason = str(result.get("error_code") or result.get("error") or "no_posts_found")
+                    spare = _retire_and_replace(current_proxy, reason)
                     if spare is None:
                         break
                     page_logger.warning(
-                        "Page failed on current proxy; failing over to spare proxy",
+                        "Page failed on current proxy; blacklisted and replaced",
                         extra={"old_proxy": _proxy_label(current_proxy), "new_proxy": _proxy_label(spare)},
                     )
                     current_proxy = spare
@@ -1748,7 +1822,7 @@ def on_message(channel, method, properties, body):
         # le job immediatement. Si des posts ont deja ete publies avant que
         # l'erreur survienne, on les conserve et on cloture en succes partiel
         # plutot que de tout marquer FAILED.
-        job_max_attempts = max(1, int((os.getenv("TIKTOK_JOB_MAX_ATTEMPTS") or "3").strip()))
+        job_max_attempts = max(1, int((os.getenv("TIKTOK_JOB_MAX_ATTEMPTS") or "1").strip()))
         job_retry_backoff_seconds = max(1.0, float((os.getenv("TIKTOK_JOB_RETRY_BACKOFF_SECONDS") or "10").strip()))
 
         published_snapshots: dict[str, tuple] = {}
@@ -1851,7 +1925,14 @@ def on_message(channel, method, properties, body):
         if published_count == 0:
             # Echec sec: malgre les tentatives, aucun post n'a pu etre recupere.
             scoped_logger.error("No posts found for task after retries", extra={"post_id": None})
-            publish_error(channel, scrape_id, attempt_error or "No TikTok posts found")
+            friendly = (
+                "TikTok a bloque les proxies testes (0 video recuperee). "
+                "Les proxies en echec sont mis en pause 24h. "
+                "Reessaie dans quelques minutes."
+            )
+            # Preferer le message clair renvoye par le scraper s'il est present.
+            err_msg = attempt_error if attempt_error and "TikTok a bloque" in attempt_error else friendly
+            publish_error(channel, scrape_id, err_msg)
             channel.basic_ack(delivery_tag=method.delivery_tag)
             return
 
@@ -1863,35 +1944,65 @@ def on_message(channel, method, properties, body):
         output_dir = os.getenv("VIDEO_ANALYSIS_OUTPUT_DIR") or "video_reports"
 
         if enrichment_enabled and posts:
-            scoped_logger.info("Starting async enrichment", extra={"post_id": None})
-            with ThreadPoolExecutor(max_workers=enrichment_workers) as executor:
-                futures = {executor.submit(_enrich_post_video, post, output_dir): post for post in posts}
-                for future in as_completed(futures):
-                    base_post = futures[future]
-                    try:
-                        enriched = future.result()
-                        enriched_posts.append(enriched)
-                        if enriched.get("video_report"):
+            # Cache de re-scraping (Option B): avant d'appeler Gemini, on demande
+            # au gateway quels post_id possedent DEJA une analyse IA en base. Pour
+            # ceux-la on reutilise l'analyse existante et on saute Gemini (etape la
+            # plus couteuse). Les metriques, elles, sont gerees cote gateway (regle
+            # TTL: pas de rafraichissement si scrape < SCRAPE_METRICS_TTL_HOURS).
+            cache_reuse = _env_bool("TIKTOK_CACHE_REUSE_ENABLED", True)
+            cached_reports = {}
+            if cache_reuse:
+                post_ids = [str(p.get("post_id") or p.get("id") or "").strip() for p in posts]
+                cached_reports = _fetch_cached_video_reports(post_ids)
+
+            posts_to_analyze = []
+            for post in posts:
+                pid = str(post.get("post_id") or post.get("id") or "").strip()
+                cached = cached_reports.get(pid) if pid else None
+                if cached:
+                    # Reutilisation: on attache l'analyse existante (pour que les
+                    # rapports de session soient complets) et on NE rappelle PAS
+                    # Gemini. Le document Mongo conserve deja cette analyse (upsert
+                    # par platform+postId cote gateway), inutile de republier.
+                    post["video_report"] = cached
+                    enriched_posts.append(post)
+                else:
+                    posts_to_analyze.append(post)
+
+            scoped_logger.info(
+                "Async enrichment: reusing cached analyses, analyzing the rest",
+                extra={"post_id": None, "reused": len(enriched_posts), "to_analyze": len(posts_to_analyze)},
+            )
+
+            if posts_to_analyze:
+                with ThreadPoolExecutor(max_workers=enrichment_workers) as executor:
+                    futures = {executor.submit(_enrich_post_video, post, output_dir): post for post in posts_to_analyze}
+                    for future in as_completed(futures):
+                        base_post = futures[future]
+                        try:
+                            enriched = future.result()
+                            enriched_posts.append(enriched)
+                            if enriched.get("video_report"):
+                                publish_enrichment_update(
+                                    channel=channel,
+                                    scrape_id=scrape_id,
+                                    url=url,
+                                    post=enriched,
+                                    event_type="POST_ENRICHED",
+                                    success=True,
+                                    error_message=None,
+                                )
+                        except Exception as exc:
+                            scoped_logger.warning("Post enrichment failed", exc_info=True)
                             publish_enrichment_update(
                                 channel=channel,
                                 scrape_id=scrape_id,
                                 url=url,
-                                post=enriched,
-                                event_type="POST_ENRICHED",
-                                success=True,
-                                error_message=None,
+                                post=base_post,
+                                event_type="POST_ENRICHMENT_FAILED",
+                                success=False,
+                                error_message=str(exc),
                             )
-                    except Exception as exc:
-                        scoped_logger.warning("Post enrichment failed", exc_info=True)
-                        publish_enrichment_update(
-                            channel=channel,
-                            scrape_id=scrape_id,
-                            url=url,
-                            post=base_post,
-                            event_type="POST_ENRICHMENT_FAILED",
-                            success=False,
-                            error_message=str(exc),
-                        )
         else:
             enriched_posts = posts
 

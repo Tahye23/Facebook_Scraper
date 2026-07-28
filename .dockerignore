@@ -43,4 +43,5 @@ terminals/
 **/node_modules/
 **/webshare_residential_proxies.txt
 **/proxy_blacklist.json
+**/tiktok_sessions/
 *.md

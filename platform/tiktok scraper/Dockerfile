@@ -50,7 +50,7 @@ COPY ["platform/tiktok scraper", "platform/tiktok-scraper"]
 WORKDIR /app/platform/tiktok-scraper
 
 RUN useradd -m workeruser \
-    && mkdir -p tiktok_profile video_reports \
+    && mkdir -p tiktok_profile video_reports tiktok_sessions \
     && chown -R workeruser /app /ms-playwright
 USER workeruser
 

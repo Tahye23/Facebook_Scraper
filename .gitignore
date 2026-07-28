@@ -15,6 +15,7 @@ platform/tiktok scraper/proxy_blacklist.json
 platform/tiktok scraper/tiktok_*.png
 platform/tiktok scraper/tiktok_*.html
 platform/tiktok scraper/tiktok_profile/
+platform/tiktok scraper/tiktok_sessions/
 platform/tiktok scraper/__pycache__/
 platform/tiktok scraper/*.pyc
 platform/tiktok scraper/video_reports/

@@ -30,7 +30,8 @@ public class ScrapeResultListener {
     private final ScrapeResultRepository resultRepository;
 
     // Fenetre de fraicheur des metriques (heures). En dessous, on NE rafraichit
-    // PAS les likes/vues/... lors d'un re-scrape (donnees jugees encore fraiches).
+    // PAS les likes/vues deja presents lors d'un re-scrape. Si les metriques
+    // existantes sont encore nulles, on accepte toujours les nouvelles valeurs.
     // 0 ou negatif => TTL desactive (on rafraichit toujours). Configurable via
     // SCRAPE_METRICS_TTL_HOURS.
     @Value("${SCRAPE_METRICS_TTL_HOURS:12}")
@@ -207,11 +208,15 @@ public class ScrapeResultListener {
                 : incoming.getHashtags());
         existing.setPublishedAt(incoming.getPublishedAt() != null ? incoming.getPublishedAt() : existing.getPublishedAt());
 
-        // Regle TTL metriques: si le doc a ete rafraichi il y a MOINS de
-        // metricsTtlHours, les metriques sont jugees encore fraiches -> on ne
-        // touche NI aux metriques NI a scrapedAt (la fenetre reste mesuree depuis
-        // le dernier vrai rafraichissement). Sinon on rafraichit les deux.
-        if (!isWithinMetricsTtl(existing.getScrapedAt())) {
+        // Regle TTL metriques:
+        // - Si le doc a deja des metriques NON nulles et qu'il est encore dans
+        //   la fenetre TTL, on ne force PAS un refresh (donnees jugees fraiches).
+        // - Si les metriques existantes sont absentes/vides, on accepte TOUJOURS
+        //   les valeurs entrantes (sinon un 1er scrape sans likes bloque 12h
+        //   les scrapes suivants qui ont enfin recupere les stats).
+        boolean existingMetricsMissing = isMetricsMissing(existing.getMetrics());
+        boolean withinTtl = isWithinMetricsTtl(existing.getScrapedAt());
+        if (!withinTtl || existingMetricsMissing) {
             existing.setMetrics(mergeMetrics(existing.getMetrics(), incoming.getMetrics()));
             if (incoming.getScrapedAt() != null) {
                 existing.setScrapedAt(incoming.getScrapedAt());
@@ -219,6 +224,16 @@ public class ScrapeResultListener {
         }
 
         return resultRepository.save(existing);
+    }
+
+    private boolean isMetricsMissing(PostMetrics metrics) {
+        if (metrics == null) {
+            return true;
+        }
+        return metrics.getLikes() == null
+                && metrics.getComments() == null
+                && metrics.getShares() == null
+                && metrics.getViews() == null;
     }
 
     private boolean isWithinMetricsTtl(Instant lastScrapedAt) {

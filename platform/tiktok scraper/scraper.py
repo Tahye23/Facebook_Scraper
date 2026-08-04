@@ -393,6 +393,13 @@ def _is_profile_lock_error(error_code: str) -> bool:
             "profile appears to be in use",
             "singletonlock",
             "process_singleton",
+            # Crash local Chrome/Xvfb: ce n'est PAS la faute du proxy.
+            "target page, context or browser has been closed",
+            "targetclosederror",
+            "browser has been closed",
+            "launch_persistent_context",
+            "xserver running",
+            "headed browser without having a xserver",
         )
     )
 
@@ -506,11 +513,12 @@ def _parse_all_proxies() -> list[dict]:
 
 
 def _select_proxy_candidates(limit: int | None = None) -> list[dict | None]:
-    """Tire au hasard N proxies NON blacklists depuis le pool (fichier 20k).
+    """Tire N proxies NON blacklists.
 
-    Preferrence sticky: les IP qui ont DEJA un profil chauffe sur disque
-    (`tiktok_sessions/<id>/`) sont tirees en priorite, pour reutiliser cookies
-    + fingerprint lies a cette IP.
+    Modele cookies-par-IP:
+      1) Preferer les IP qui ont DEJA un slot cookies valide sur disque
+      2) Completer avec de nouvelles IP du pool sticky (seront chauffees a
+         l'usage; si plafond de slots atteint -> LRU remplace le plus ancien)
     """
     if limit is None:
         limit = max(1, _env_int("TIKTOK_PROXY_MAX_PER_JOB", 4))
@@ -518,6 +526,12 @@ def _select_proxy_candidates(limit: int | None = None) -> list[dict | None]:
     pool = _parse_all_proxies()
     if not pool:
         return [None]
+
+    by_id: dict[str, dict] = {}
+    for proxy in pool:
+        identity = _proxy_identity(proxy)
+        if identity and identity not in by_id:
+            by_id[identity] = proxy
 
     with _PROXY_BLACKLIST_LOCK:
         blocked = set(_load_blacklist().keys())
@@ -531,8 +545,7 @@ def _select_proxy_candidates(limit: int | None = None) -> list[dict | None]:
         available = pool
 
     # Pool sticky dedie optionnel: priorise les N premieres sessions du fichier,
-    # mais SI trop peu restent (blacklist), complete depuis le reste du pool
-    # sinon le job echoue avec 0 IP alors qu'il reste 19k proxies.
+    # mais SI trop peu restent (blacklist), complete depuis le reste du pool.
     sticky_pool_size = _env_int("TIKTOK_STICKY_POOL_SIZE", 0)
     if sticky_pool_size > 0:
         dedicated_ids = {_proxy_identity(p) for p in pool[:sticky_pool_size]}
@@ -545,21 +558,37 @@ def _select_proxy_candidates(limit: int | None = None) -> list[dict | None]:
             else:
                 available = dedicated
 
-    # Evite de re-selectionner un sticky deja utilise par une autre lane/job
-    # (Chrome SingletonLock / .in_use). Fallback: si tout est busy, on garde
-    # la liste complete et le soft-lock decidéra au launch.
     if sticky_sessions.sticky_enabled():
         free = [p for p in available if not sticky_sessions.is_session_busy(_proxy_identity(p))]
         if free:
             available = free
 
-    warmed = sticky_sessions.warmed_identities() if sticky_sessions.sticky_enabled() else set()
-    hot = [p for p in available if _proxy_identity(p) in warmed]
-    cold = [p for p in available if _proxy_identity(p) not in warmed]
-    random.shuffle(hot)
-    random.shuffle(cold)
-    ordered = hot + cold
-    selected = ordered[:limit]
+    cookie_ids = (
+        sticky_sessions.identities_with_valid_cookies()
+        if sticky_sessions.sticky_enabled()
+        else set()
+    )
+    # IP hors pool dedie mais avec cookies: les garder en tete aussi.
+    with_cookies: list[dict] = []
+    seen_ids: set[str] = set()
+    for identity in cookie_ids:
+        if identity in blocked or sticky_sessions.is_session_busy(identity):
+            continue
+        proxy = by_id.get(identity)
+        if proxy is None:
+            continue
+        with_cookies.append(proxy)
+        seen_ids.add(identity)
+    for proxy in available:
+        identity = _proxy_identity(proxy)
+        if identity in cookie_ids and identity not in seen_ids:
+            with_cookies.append(proxy)
+            seen_ids.add(identity)
+
+    without_cookies = [p for p in available if _proxy_identity(p) not in seen_ids]
+    random.shuffle(with_cookies)
+    random.shuffle(without_cookies)
+    selected = (with_cookies + without_cookies)[:limit]
 
     LOGGER.info(
         "Selected proxy sample for job",
@@ -567,7 +596,8 @@ def _select_proxy_candidates(limit: int | None = None) -> list[dict | None]:
             "post_id": None,
             "url": (
                 f"pool={len(pool)} available={len(available)} "
-                f"warmed={len(hot)} selected={len(selected)}"
+                f"with_cookies={len(with_cookies)} selected={len(selected)} "
+                f"mode=cookie_slots"
             ),
         },
     )
@@ -596,15 +626,33 @@ def get_proxy_pool() -> list[dict]:
 def pick_replacement_proxy(exclude: set[str] | None = None) -> dict | None:
     """Tire UNE nouvelle IP hors blacklist et hors `exclude` (pour releve CSV).
 
-    Sert a remplacer une IP morte: on la blacklist, puis on en prend une autre
-    dans le pool 20k pour garder la reserve pleine.
+    Preferre une IP qui a deja des cookies valides; sinon une IP neuve
+    (chauffee a l'usage, slot LRU si besoin).
     """
     excluded = set(exclude or set())
     pool = _parse_all_proxies()
     if not pool:
         return None
+    by_id: dict[str, dict] = {}
+    for proxy in pool:
+        identity = _proxy_identity(proxy)
+        if identity and identity not in by_id:
+            by_id[identity] = proxy
     with _PROXY_BLACKLIST_LOCK:
         blocked = set(_load_blacklist().keys())
+
+    if sticky_sessions.sticky_enabled():
+        hot = []
+        for identity in sticky_sessions.identities_with_valid_cookies():
+            if identity in blocked or identity in excluded:
+                continue
+            proxy = by_id.get(identity)
+            if proxy is None or sticky_sessions.is_session_busy(identity):
+                continue
+            hot.append(proxy)
+        if hot:
+            return random.choice(hot)
+
     available = [
         p for p in pool
         if _proxy_identity(p) not in blocked and _proxy_identity(p) not in excluded
@@ -967,6 +1015,11 @@ def _wait_for_profile_video_links(page, timeout_ms: int | None = None) -> bool:
         page.wait_for_selector('a[href*="/video/"]', timeout=timeout_ms)
         return True
     except Exception:
+        try:
+            if page.locator('a[href*="/video/"]').count() > 0:
+                return True
+        except Exception:
+            pass
         LOGGER.info(
             "Video grid links did not appear within wait window",
             extra={"url": f"timeout_ms={timeout_ms}"},
@@ -1697,18 +1750,35 @@ def _scrape_with_browser(
             sticky_identity=sticky_identity if use_sticky else None,
         )
 
-        # Si challenge detecte, on laisse une fenetre de resolution manuelle.
+        # Captcha modal reel: inutile de re-attendre 25s / re-warmup.
+        # Soft-block squelette (sans captcha) -> on tente l'extract ci-dessous.
         if _looks_like_tiktok_challenge(page):
-            _manual_solve_wait_if_enabled(user_data_dir, headless)
-            _wait_for_challenge_resolution(page, user_data_dir, headless)
+            has_captcha_ui = False
             try:
-                grid_ready = _warmup_and_open_profile(
-                    page,
-                    profile_url,
-                    sticky_identity=sticky_identity if use_sticky else None,
-                )
-            except Exception as retry_err:
-                LOGGER.warning("Challenge retry warmup failed", exc_info=True)
+                has_captcha_ui = page.locator(
+                    'iframe[src*="captcha"], [id*="captcha"], [class*="captcha"]'
+                ).count() > 0
+            except Exception:
+                has_captcha_ui = False
+            if has_captcha_ui and not grid_ready:
+                _manual_solve_wait_if_enabled(user_data_dir, headless)
+                _wait_for_challenge_resolution(page, user_data_dir, headless)
+                if _looks_like_tiktok_challenge(page):
+                    _save_challenge_artifacts(page)
+                    return {
+                        "posts": [],
+                        "total": 0,
+                        "error": "challenge_detected",
+                        "url": profile_url,
+                    }
+                try:
+                    grid_ready = _warmup_and_open_profile(
+                        page,
+                        profile_url,
+                        sticky_identity=sticky_identity if use_sticky else None,
+                    )
+                except Exception:
+                    LOGGER.warning("Challenge retry warmup failed", exc_info=True)
 
         # Purge des reponses reseau captees pendant le warmup (home "For You",
         # etc.): a partir d'ici, on ne veut compter QUE les videos du profil
@@ -1736,8 +1806,19 @@ def _scrape_with_browser(
         max_consecutive_empty_scrolls = _env_int("TIKTOK_MAX_EMPTY_SCROLLS", 2)
         consecutive_empty_scrolls = 0
 
-        # Soft-block (squelette sans ancres /video/): ne pas scroller 4 fois
-        # ni re-attendre 25s — on fait un extract rapide puis on sort.
+        def _safe_collect_from_page() -> list[dict]:
+            cards: list[dict] = []
+            try:
+                cards.extend(_extract_video_cards(page, profile_url))
+            except Exception:
+                LOGGER.debug("DOM extract failed during soft-block recovery", exc_info=True)
+            try:
+                cards.extend(_extract_posts_from_page_html(page, profile_url))
+            except Exception:
+                LOGGER.debug("HTML extract failed during soft-block recovery", exc_info=True)
+            return cards
+
+        # Soft-block (squelette): extract HTML/DOM immediat, puis 1 scroll max.
         if not grid_ready:
             LOGGER.info(
                 "Profile grid soft-blocked (no /video/ links); fail-fast extract",
@@ -1745,10 +1826,25 @@ def _scrape_with_browser(
             )
             max_scroll_iterations = 1
             max_consecutive_empty_scrolls = 1
+            for card in _safe_collect_from_page():
+                sig = _video_signature(card)
+                if sig in seen or not _card_belongs_to_profile(card, target_username):
+                    seen.add(sig)
+                    continue
+                seen.add(sig)
+                all_posts.append(card)
+                if len(all_posts) >= max_posts:
+                    break
+            if all_posts:
+                LOGGER.info(
+                    "Recovered %d posts from soft-blocked page HTML/DOM",
+                    len(all_posts),
+                    extra={"url": profile_url},
+                )
 
         # Scroll progressif pour charger davantage de posts.
         iteration = 0
-        while iteration < max_scroll_iterations:
+        while iteration < max_scroll_iterations and len(all_posts) < max_posts:
             iteration += 1
 
             if _looks_like_tiktok_challenge(page):
@@ -2353,13 +2449,12 @@ def _dismiss_cookie_banner(page):
 
 
 def _auto_warm_sticky_session(page, identity: str) -> None:
-    """Chauffe AUTOMATIQUEMENT une sticky froide (sans action manuelle).
+    """Chauffe une IP sans cookies valides, puis stocke cookies.json pour CETTE IP.
 
     Visite TikTok via LE proxy du profil persistant, accepte cookies, scrolle
-    legerement pour que Chrome ecrive ttwid/msToken/etc. dans le profil.
-    Pas de login manuel: session anonyme liee a cette IP.
+    legerement pour que Chrome ecrive ttwid/msToken/etc. Pas de login manuel.
     """
-    LOGGER.info("Auto-warming cold sticky session", extra={"url": identity})
+    LOGGER.info("Warming cookies for sticky IP (missing/invalid)", extra={"url": identity})
     page.goto("https://www.tiktok.com/", wait_until="domcontentloaded", timeout=60000)
     _dismiss_cookie_banner(page)
     _human_pause(2.0, 1.0)
@@ -2374,19 +2469,54 @@ def _auto_warm_sticky_session(page, identity: str) -> None:
         _human_pause(1.5, 0.8)
     except Exception:
         LOGGER.debug("Auto-warm foryou navigation failed", exc_info=True)
-    LOGGER.info("Auto-warm sticky session done", extra={"url": identity})
+    try:
+        cookies = page.context.cookies()
+        sticky_sessions.mark_session_warmed(identity, cookies)
+        LOGGER.info(
+            "Stored warmed cookies for sticky IP",
+            extra={"url": f"{identity} cookies={len(cookies)}"},
+        )
+    except Exception:
+        LOGGER.warning("Failed to persist warmed cookies for sticky IP", exc_info=True)
+        sticky_sessions.mark_session_warmed(identity, None)
+
+
+def _profile_has_loading_skeleton(page) -> bool:
+    """True si le profil est la mais la grille semble encore en chargement."""
+    try:
+        return bool(
+            page.evaluate(
+                r"""
+                () => {
+                  const anchors = document.querySelectorAll('a[href*="/video/"]').length;
+                  if (anchors > 0) return false;
+                  const body = (document.body && document.body.innerText) || '';
+                  const hasProfile = body.includes('Followers') || body.includes('Following')
+                    || body.includes('Likes') || !!document.querySelector('[data-e2e="user-page"]');
+                  if (!hasProfile) return false;
+                  // Spinner / skeleton frequent sur soft-block lent.
+                  return true;
+                }
+                """
+            )
+        )
+    except Exception:
+        return False
 
 
 def _warmup_and_open_profile(page, profile_url: str, sticky_identity: str | None = None) -> bool:
-    """Fait un warmup TikTok puis ouvre le profil cible.
-
-    Si la sticky est froide (1er usage), lance d'abord un auto-warm plus long
-    pour creer des cookies lies a CETTE IP, sans intervention humaine.
+    """Ouvre le profil: reutilise cookies IP si valides, sinon chauffe + stocke.
 
     Retourne True si au moins un lien /video/ est apparu (grille hydratee).
     """
     if sticky_identity and sticky_sessions.sticky_enabled():
-        if sticky_sessions.is_cold_session(sticky_identity):
+        if sticky_sessions.has_valid_cookies(sticky_identity):
+            LOGGER.info(
+                "Reusing valid cookies for sticky IP",
+                extra={"url": sticky_identity},
+            )
+        else:
+            # IP connue sans cookies, ou IP nouvelle (slot deja reserve via LRU).
             _auto_warm_sticky_session(page, sticky_identity)
 
     page.goto("https://www.tiktok.com/", wait_until="domcontentloaded", timeout=60000)
@@ -2395,9 +2525,26 @@ def _warmup_and_open_profile(page, profile_url: str, sticky_identity: str | None
     page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_selector("body", timeout=15000)
     _dismiss_cookie_banner(page)
-    # domcontentloaded != grille hydratee: attendre les ancres /video/ avant
-    # de scroller, sinon on marque 2 empty scrolls et on abandonne trop tot.
     links_ok = _wait_for_profile_video_links(page)
+    # Souvent le profil est la avec un spinner: la grille hydrate 10-30s plus tard.
+    if not links_ok and _profile_has_loading_skeleton(page):
+        extra_ms = max(5000, _env_int("TIKTOK_WAIT_VIDEO_LINKS_EXTEND_MS", 20000))
+        LOGGER.info(
+            "Profile skeleton still loading; extended wait for video grid",
+            extra={"url": f"timeout_ms={extra_ms}"},
+        )
+        try:
+            page.mouse.wheel(0, 800)
+        except Exception:
+            pass
+        links_ok = _wait_for_profile_video_links(page, timeout_ms=extra_ms)
+        if not links_ok:
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=60000)
+                _dismiss_cookie_banner(page)
+                links_ok = _wait_for_profile_video_links(page, timeout_ms=extra_ms)
+            except Exception:
+                LOGGER.debug("Profile reload during hydration wait failed", exc_info=True)
     _human_pause(1.0 if links_ok else 0.4, 0.4)
     return links_ok
 
@@ -2509,11 +2656,23 @@ def scrape_tiktok_page(
                     )
                 )
                 if try_index < attempts_per_proxy and not rotate_now:
+                    # Timeout/tunnel flaky: garder les cookies, retenter la meme IP.
+                    # N'invalider QUE si auth proxy morte (credentials).
+                    if proxy_cfg is not None and sticky_sessions.sticky_enabled():
+                        if "invalid_auth" in error_code or "err_invalid_auth_credentials" in error_code:
+                            sticky_sessions.invalidate_sticky_cookies(_proxy_identity(proxy_cfg))
                     scoped_logger.warning(
                         "Soft failure on proxy; retrying same proxy",
                         extra={"error": error_code[:120], "url": _describe_proxy(proxy_cfg)},
                     )
                     continue
+
+                # Soft-block / captcha: NE PAS supprimer cookies.json.
+                # Les cookies chauffes restent utiles quand l'IP sort du cooldown.
+                # Invalider seulement auth morte.
+                if proxy_cfg is not None and sticky_sessions.sticky_enabled():
+                    if "invalid_auth" in error_code or "err_invalid_auth_credentials" in error_code:
+                        sticky_sessions.invalidate_sticky_cookies(_proxy_identity(proxy_cfg))
 
                 if _should_blacklist_error(error_code):
                     _blacklist_proxy(proxy_cfg, error_code)

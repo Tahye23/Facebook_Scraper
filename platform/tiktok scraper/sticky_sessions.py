@@ -1,19 +1,20 @@
-"""Sessions sticky TikTok: 1 proxy sticky = 1 profil Chrome persistant.
+"""Sessions sticky TikTok: 1 adresse IP (sticky Webshare) = 1 slot cookies.
 
-Pourquoi:
-  Injecter le meme `tiktok_cookies.json` sur des IP aleatoires declenche le
-  soft-block TikTok (grille vide). Ici chaque identite Webshare (`sdwopfmy-N`)
-  a son propre dossier de profil; les cookies naissent et vivent avec CETTE IP.
-
-LRU:
-  On borne le nombre de dossiers (defaut 50). Avant d'en creer un nouveau, on
-  supprime les plus anciens (moins recemment utilises), sauf ceux lockes.
+Modele (slots LRU, defaut 50):
+  - Chaque IP `sdwopfmy-N` a son dossier `tiktok_sessions/<id>/` + cookies.json
+  - Si on prend une IP qui a deja des cookies valides -> on les reutilise
+  - Si l'IP existe mais cookies absents/invalides -> on chauffe et on remplace
+    les cookies DE CETTE IP
+  - Si l'IP est nouvelle et le plafond de slots est atteint -> on supprime le
+    slot le plus ancien (LRU / .last_used), on chauffe la nouvelle IP, on
+    stocke ses cookies a la place
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -24,6 +25,19 @@ LOGGER = get_logger(__name__, platform="tiktok", service="sticky_sessions")
 _LOCK = threading.Lock()
 _LAST_USED_NAME = ".last_used"
 _LOCK_NAME = ".in_use"
+_WARMED_NAME = ".warmed"
+
+# Noms de cookies TikTok qui indiquent une session exploitable.
+_VALID_COOKIE_NAMES = frozenset(
+    {
+        "ttwid",
+        "msToken",
+        "tt_chain_token",
+        "sessionid",
+        "sid_tt",
+        "sid_guard",
+    }
+)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -76,6 +90,11 @@ def session_exists(identity: str) -> bool:
     return path.is_dir() and any(path.iterdir())
 
 
+def cookies_path_for_identity(identity: str) -> Path:
+    """Fichier cookies lie a UNE sticky (warmup / export)."""
+    return session_dir_for_identity(identity) / "cookies.json"
+
+
 def _last_used_path(session_dir: Path) -> Path:
     return session_dir / _LAST_USED_NAME
 
@@ -105,14 +124,11 @@ def acquire_session_lock(session_dir: Path) -> bool:
     try:
         if lock.exists():
             age = time.time() - lock.stat().st_mtime
-            # 10 min suffit: un scrape sticky dure rarement plus longtemps.
-            # Les locks laisses par un conteneur recreate sont toujours "stale".
             if age < 600:
                 try:
                     old_pid = int(lock.read_text(encoding="utf-8").strip() or "0")
                 except ValueError:
                     old_pid = 0
-                # Si le PID existe encore sur CETTE machine, le profil est vraiment pris.
                 if old_pid and _pid_alive(old_pid):
                     return False
         lock.write_text(str(os.getpid()), encoding="utf-8")
@@ -143,21 +159,11 @@ def release_session_lock(session_dir: Path) -> None:
 
 
 def clear_chrome_profile_locks(session_dir: Path) -> list[str]:
-    """Supprime les fichiers Singleton* laisses par un Chrome tue / crash.
-
-    Sans ca, le prochain launch_persistent_context echoue immediatement avec:
-    "The profile appears to be in use by another Google Chrome process".
-    """
+    """Supprime les fichiers Singleton* laisses par un Chrome tue / crash."""
     removed: list[str] = []
     if not session_dir.exists():
         return removed
-    names = (
-        "SingletonLock",
-        "SingletonCookie",
-        "SingletonSocket",
-        "lockfile",
-    )
-    for name in names:
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"):
         path = session_dir / name
         try:
             if path.exists() or path.is_symlink():
@@ -185,7 +191,7 @@ def is_session_busy(identity: str) -> bool:
 
 
 def _session_score(session_dir: Path) -> float:
-    """Plus petit = plus ancien / moins utilise (candidat eviction)."""
+    """Plus petit = plus ancien / moins utilise (candidat eviction LRU)."""
     marker = _last_used_path(session_dir)
     try:
         if marker.exists():
@@ -205,112 +211,167 @@ def list_session_dirs() -> list[Path]:
     return [p for p in root.iterdir() if p.is_dir()]
 
 
-def enforce_lru_limit(exclude: Path | None = None) -> list[str]:
-    """Supprime les sessions les plus anciennes si on depasse max_sessions.
+def has_valid_cookies(identity: str) -> bool:
+    """True si cette IP a un `cookies.json` TikTok exploitable.
 
-    Ne touche pas aux dossiers lockes ni a `exclude` (session qu'on s'apprete
-    a utiliser). Retourne les identites effacees.
+    IMPORTANT: ne PAS se fier au fichier SQLite Chrome `Default/Cookies`.
+    Chrome le cree vide des le launch_persistent_context -> faux positif
+    "Reusing valid cookies" sur une IP toute neuve, sans jamais chauffer.
+    """
+    cookies_path = cookies_path_for_identity(identity)
+    try:
+        if not cookies_path.exists() or cookies_path.stat().st_size <= 80:
+            return False
+        raw = json.loads(cookies_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return False
+    if not isinstance(raw, list) or not raw:
+        return False
+    names = {str(c.get("name") or "") for c in raw if isinstance(c, dict)}
+    # ttwid / msToken = signaux reels d'une session TikTok chauffee.
+    return bool(names & _VALID_COOKIE_NAMES)
+
+
+def invalidate_sticky_cookies(identity: str) -> None:
+    """Supprime cookies.json + .warmed pour forcer un re-warm au prochain essai."""
+    session_dir = session_dir_for_identity(identity)
+    for name in ("cookies.json", _WARMED_NAME):
+        path = session_dir / name
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError:
+            LOGGER.debug("Failed to invalidate sticky cookie file %s", name, exc_info=True)
+    LOGGER.info("Invalidated sticky cookies for IP", extra={"url": safe_identity(identity)})
+
+
+def identities_with_valid_cookies() -> set[str]:
+    """Identites sticky qui ont un slot cookies valide."""
+    return {p.name for p in list_session_dirs() if has_valid_cookies(p.name)}
+
+
+def _can_evict(session_dir: Path, exclude: Path | None) -> bool:
+    if exclude is not None and session_dir.resolve() == exclude.resolve():
+        return False
+    if _lock_path(session_dir).exists():
+        return False
+    return True
+
+
+def enforce_lru_limit(exclude: Path | None = None) -> list[str]:
+    """Si on depasse max_sessions, supprime le(s) slot(s) le(s) plus ancien(s).
+
+    Regle utilisateur: le plus ancien (`.last_used`) part pour faire de la place
+    a une nouvelle IP. On ne touche pas aux dossiers lockes ni a `exclude`.
     """
     limit = max_sessions()
     deleted: list[str] = []
     with _LOCK:
-        dirs = list_session_dirs()
-        if len(dirs) <= limit:
-            return deleted
-
-        # Plus ancien d'abord.
-        ranked = sorted(dirs, key=_session_score)
-        for session_dir in ranked:
-            if len(list_session_dirs()) <= limit:
+        while True:
+            dirs = list_session_dirs()
+            if len(dirs) <= limit:
                 break
-            if exclude is not None and session_dir.resolve() == exclude.resolve():
-                continue
-            if _lock_path(session_dir).exists():
-                continue
+            ranked = sorted(
+                [d for d in dirs if _can_evict(d, exclude)],
+                key=_session_score,
+            )
+            if not ranked:
+                break
+            session_dir = ranked[0]
             try:
-                # rmtree manuel pour eviter d'importer shutil en haut si inutile
-                import shutil
-
                 shutil.rmtree(session_dir, ignore_errors=False)
                 deleted.append(session_dir.name)
                 LOGGER.info(
-                    "LRU evicted sticky session",
+                    "LRU evicted oldest sticky cookie slot",
                     extra={"url": session_dir.name},
                 )
             except OSError:
                 LOGGER.warning("Failed to evict sticky session", exc_info=True)
+                break
     return deleted
 
 
-def prepare_session_dir(identity: str) -> Path:
-    """Cree/touche le dossier sticky, applique le LRU, retourne le chemin."""
+def ensure_slot_for_identity(identity: str) -> Path:
+    """Reserve le slot cookies pour cette IP (cree ou reutilise).
+
+    - IP deja connue: reutilise son dossier, met a jour `.last_used`
+    - IP nouvelle + plafond atteint: evince le slot le plus ancien, puis cree
+    """
     session_dir = session_dir_for_identity(identity)
     sessions_root().mkdir(parents=True, exist_ok=True)
-    enforce_lru_limit(exclude=session_dir if session_dir.exists() else None)
-    session_dir.mkdir(parents=True, exist_ok=True)
-    touch_session(session_dir)
+    is_new = not session_dir.exists()
+
+    with _LOCK:
+        if is_new:
+            # Liberer 1 place AVANT creation si on est deja au max.
+            while len(list_session_dirs()) >= max_sessions():
+                ranked = sorted(
+                    [d for d in list_session_dirs() if _can_evict(d, None)],
+                    key=_session_score,
+                )
+                if not ranked:
+                    break
+                victim = ranked[0]
+                try:
+                    shutil.rmtree(victim, ignore_errors=False)
+                    LOGGER.info(
+                        "LRU replaced oldest cookie slot for new IP",
+                        extra={"url": f"evicted={victim.name} new={safe_identity(identity)}"},
+                    )
+                except OSError:
+                    LOGGER.warning("Failed to evict oldest sticky for new IP", exc_info=True)
+                    break
+        session_dir.mkdir(parents=True, exist_ok=True)
+        touch_session(session_dir)
+
+    # Filet de securite si d'autres process ont cree des slots en parallele.
+    enforce_lru_limit(exclude=session_dir)
     return session_dir
 
 
+def prepare_session_dir(identity: str) -> Path:
+    """Alias public: prepare le slot cookies pour l'IP (LRU si nouvelle)."""
+    return ensure_slot_for_identity(identity)
+
+
 def is_cold_session(identity: str) -> bool:
-    """True si le profil sticky n'a encore jamais ete chauffe (pas de cookies)."""
-    cookies = cookies_path_for_identity(identity)
-    try:
-        if cookies.exists() and cookies.stat().st_size > 80:
-            return False
-    except OSError:
-        pass
-    session_dir = session_dir_for_identity(identity)
-    warmed_marker = session_dir / ".warmed"
-    if warmed_marker.exists():
-        return False
-    # Apres un 1er run Chrome, le sous-dossier Default apparait avec des cookies.
-    default_dir = session_dir / "Default"
-    chrome_cookie_candidates = [
-        default_dir / "Cookies",
-        default_dir / "Network" / "Cookies",
-    ]
-    for candidate in chrome_cookie_candidates:
-        try:
-            if candidate.exists() and candidate.stat().st_size > 0:
-                return False
-        except OSError:
-            continue
-    return True
+    """True si cette IP n'a pas encore de cookies valides -> il faut chauffer."""
+    return not has_valid_cookies(identity)
 
 
 def mark_session_warmed(identity: str, cookies: list[dict] | None = None) -> None:
-    """Persiste les cookies du navigateur + touch LRU apres un chauffe auto."""
-    session_dir = prepare_session_dir(identity)
+    """Persiste les cookies chauffes pour CETTE IP + marque `.warmed`.
+
+    N'ecrit `.warmed` que si cookies.json contient un signal TikTok (ttwid...).
+    """
+    session_dir = ensure_slot_for_identity(identity)
+    names: set[str] = set()
     if cookies:
         try:
-            save_sticky_cookies(identity, cookies)
+            path = session_dir / "cookies.json"
+            path.write_text(json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8")
+            names = {str(c.get("name") or "") for c in cookies if isinstance(c, dict)}
         except OSError:
             LOGGER.warning("Failed to persist auto-warm cookies", exc_info=True)
-    marker = session_dir / ".warmed"
-    try:
-        marker.write_text(str(time.time()), encoding="utf-8")
-    except OSError:
-        pass
+    if names & _VALID_COOKIE_NAMES:
+        marker = session_dir / _WARMED_NAME
+        try:
+            marker.write_text(str(time.time()), encoding="utf-8")
+        except OSError:
+            pass
     touch_session(session_dir)
 
 
+def proven_warmed_identities() -> set[str]:
+    """Identites avec marqueur `.warmed` (chauffe ou scrape reussi)."""
+    return {p.name for p in list_session_dirs() if (p / _WARMED_NAME).exists()}
+
+
 def warmed_identities() -> set[str]:
-    """Identites sticky qui ont deja un profil non vide / marque chauffe."""
-    result = set()
-    for p in list_session_dirs():
-        if (p / ".warmed").exists() or (p / "cookies.json").exists():
-            result.add(p.name)
-            continue
-        if any(p.iterdir()):
-            # Profil Chrome deja cree (Default/...) meme sans marqueur.
-            result.add(p.name)
-    return result
-
-
-def cookies_path_for_identity(identity: str) -> Path:
-    """Fichier cookies optionnel lie a UNE sticky (warmup / export)."""
-    return session_dir_for_identity(identity) / "cookies.json"
+    """Compat: identites avec cookies valides ou profil non vide."""
+    return identities_with_valid_cookies() | {
+        p.name for p in list_session_dirs() if any(p.iterdir())
+    }
 
 
 def load_sticky_cookies(identity: str) -> list[dict]:
@@ -357,8 +418,8 @@ def load_sticky_cookies(identity: str) -> list[dict]:
 
 
 def save_sticky_cookies(identity: str, cookies: list[dict]) -> Path:
-    """Persiste un export cookies dans le dossier sticky."""
-    session_dir = prepare_session_dir(identity)
+    """Persiste un export cookies dans le dossier sticky de CETTE IP."""
+    session_dir = ensure_slot_for_identity(identity)
     path = session_dir / "cookies.json"
     path.write_text(json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8")
     touch_session(session_dir)

@@ -1676,9 +1676,12 @@ def _process_csv_batch_task(
     report_json_path = _build_batch_pages_report(scrape_id, source_rows, failed_pages, output_dir)
     videos_json_path = _save_batch_videos_json(scrape_id=scrape_id, videos=videos_payload, output_dir=output_dir)
 
+    # Rapports 24h: STRICTEMENT apres le scraping. Toute erreur ici est logguee
+    # mais ne doit JAMAIS empecher le COMPLETED ni casser le worker.
     gemini_report_path = None
     mauritanie_html_path = None
     mauritanie_pdf_path = None
+    mauritanie_docx_path = None
     gemini_report_obj = None
     try:
         if videos_payload:
@@ -1698,10 +1701,14 @@ def _process_csv_batch_task(
     except FuturesTimeoutError:
         scoped_logger.warning("Gemini batch report generation timed out; using fallback report")
     except Exception:
-        scoped_logger.exception("Failed to build Gemini/PDF Mauritanie 24h report")
+        scoped_logger.exception("Failed to build Gemini batch report (non-fatal)")
 
     if videos_payload and not gemini_report_obj:
-        gemini_report_obj = _build_fallback_ar_report_from_videos(videos_payload)
+        try:
+            gemini_report_obj = _build_fallback_ar_report_from_videos(videos_payload)
+        except Exception:
+            scoped_logger.exception("Failed to build fallback Arabic report (non-fatal)")
+            gemini_report_obj = None
 
     if videos_payload and gemini_report_obj:
         try:
@@ -1713,6 +1720,10 @@ def _process_csv_batch_task(
                 failed_pages=failed_pages,
                 output_dir=output_dir,
             )
+        except Exception:
+            scoped_logger.exception("Failed to generate Mauritanie 24h HTML (non-fatal)")
+
+        try:
             mauritanie_pdf_path = _build_mauritanie_24h_pdf(
                 scrape_id=scrape_id,
                 source_rows=source_rows,
@@ -1722,7 +1733,20 @@ def _process_csv_batch_task(
                 output_dir=output_dir,
             )
         except Exception:
-            scoped_logger.exception("Failed to generate fallback Mauritanie 24h PDF")
+            scoped_logger.exception("Failed to generate Mauritanie 24h PDF (non-fatal)")
+
+        # Word optionnel: lazy-import pour ne jamais casser le demarrage du worker.
+        try:
+            from mauritanie_24h_docx import build_mauritanie_24h_docx
+
+            mauritanie_docx_path = build_mauritanie_24h_docx(
+                scrape_id=scrape_id,
+                gemini_report=gemini_report_obj,
+                videos_payload=videos_payload,
+                output_dir=output_dir,
+            )
+        except Exception:
+            scoped_logger.exception("Failed to generate Mauritanie 24h DOCX (non-fatal)")
 
     has_results = published_count > 0
     if not has_results:
@@ -1743,6 +1767,7 @@ def _process_csv_batch_task(
             "jsonPath": report_json_path,
             "htmlPath": mauritanie_html_path,
             "pdfPath": mauritanie_pdf_path,
+            "docxPath": mauritanie_docx_path,
             "videosJsonPath": videos_json_path,
             "geminiJsonPath": gemini_report_path,
         },

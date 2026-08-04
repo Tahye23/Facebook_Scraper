@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Handoff Développeurs — Facebook / TikTok Scraper</title>
+  <style>
+    :root {
+      --bg: #f6f3ee;
+      --surface: #fffdf9;
+      --ink: #1c2430;
+      --muted: #5b6573;
+      --line: #d9d2c5;
+      --accent: #0f6b5c;
+      --accent-soft: #e4f3ef;
+      --warn: #8a4b12;
+      --warn-soft: #f8ead8;
+      --code-bg: #eef2f4;
+      --shadow: 0 10px 30px rgba(28, 36, 48, 0.06);
+      --radius: 14px;
+      --max: 980px;
+      --font: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+      --mono: "Cascadia Code", "Consolas", "Courier New", monospace;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font-family: var(--font);
+      color: var(--ink);
+      background:
+        radial-gradient(1200px 500px at 10% -10%, #dff3ee 0%, transparent 55%),
+        radial-gradient(900px 400px at 100% 0%, #f3e7d5 0%, transparent 50%),
+        var(--bg);
+      line-height: 1.55;
+    }
+    .wrap { max-width: var(--max); margin: 0 auto; padding: 32px 20px 80px; }
+    header.hero {
+      background: linear-gradient(135deg, #123d36 0%, #0f6b5c 55%, #1f8f7a 100%);
+      color: #f7fffc;
+      border-radius: 22px;
+      padding: 36px 32px;
+      box-shadow: var(--shadow);
+      margin-bottom: 28px;
+    }
+    header.hero .eyebrow {
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      font-size: 12px;
+      opacity: .85;
+      margin: 0 0 10px;
+    }
+    header.hero h1 {
+      margin: 0 0 10px;
+      font-size: clamp(1.7rem, 3vw, 2.4rem);
+      line-height: 1.15;
+      font-weight: 700;
+    }
+    header.hero p { margin: 0; max-width: 62ch; opacity: .95; }
+    header.hero .meta {
+      margin-top: 18px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .pill {
+      display: inline-block;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: rgba(255,255,255,.14);
+      border: 1px solid rgba(255,255,255,.2);
+      font-size: 12px;
+    }
+    nav.toc {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 20px 22px;
+      margin-bottom: 28px;
+      box-shadow: var(--shadow);
+    }
+    nav.toc h2 { margin: 0 0 12px; font-size: 1.05rem; }
+    nav.toc ol { margin: 0; padding-left: 1.2rem; columns: 1; }
+    @media (min-width: 720px) {
+      nav.toc ol { columns: 2; column-gap: 28px; }
+    }
+    nav.toc a { color: var(--accent); text-decoration: none; }
+    nav.toc a:hover { text-decoration: underline; }
+    section {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 26px 28px;
+      margin-bottom: 18px;
+      box-shadow: var(--shadow);
+    }
+    section h2 {
+      margin: 0 0 14px;
+      padding-bottom: 10px;
+      border-bottom: 2px solid var(--accent-soft);
+      font-size: 1.35rem;
+    }
+    h3 { margin: 18px 0 8px; font-size: 1.05rem; color: #244038; }
+    p { margin: 0 0 12px; color: var(--ink); }
+    ul, ol { margin: 0 0 12px; padding-left: 1.25rem; }
+    li { margin: 4px 0; }
+    code {
+      font-family: var(--mono);
+      font-size: .92em;
+      background: var(--code-bg);
+      padding: 1px 6px;
+      border-radius: 6px;
+    }
+    .table-wrap { overflow-x: auto; margin: 12px 0 4px; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: .95rem;
+      min-width: 560px;
+    }
+    th, td {
+      border: 1px solid var(--line);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: var(--accent-soft);
+      color: #163f37;
+      font-weight: 650;
+    }
+    tr:nth-child(even) td { background: #fcfaf6; }
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px 16px 8px;
+      margin: 14px 0;
+      background: #fffcf7;
+    }
+    .card h3 {
+      margin: 0 0 10px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .badge {
+      font-size: 11px;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      background: var(--warn-soft);
+      color: var(--warn);
+      border: 1px solid #ebc894;
+      border-radius: 999px;
+      padding: 3px 8px;
+      font-weight: 700;
+    }
+    .adr-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+    }
+    @media (min-width: 800px) {
+      .adr-grid { grid-template-columns: 1fr 1fr; }
+      .adr-grid .full { grid-column: 1 / -1; }
+    }
+    .adr-grid > div {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px 12px;
+    }
+    .adr-grid h4 {
+      margin: 0 0 6px;
+      font-size: 12px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    figure.diagram {
+      margin: 14px 0;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      overflow: hidden;
+      background: #111827;
+    }
+    figure.diagram figcaption {
+      background: #1f2937;
+      color: #d1d5db;
+      padding: 8px 12px;
+      font-size: 12px;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+    figure.diagram pre {
+      margin: 0;
+      padding: 14px 16px 18px;
+      overflow-x: auto;
+      color: #e5f6f1;
+      font-family: var(--mono);
+      font-size: 12.5px;
+      line-height: 1.45;
+      white-space: pre;
+    }
+    footer {
+      margin-top: 28px;
+      color: var(--muted);
+      font-size: .92rem;
+      text-align: center;
+    }
+    @media print {
+      body { background: #fff; }
+      header.hero, section, nav.toc {
+        box-shadow: none;
+        break-inside: avoid;
+      }
+      nav.toc { break-after: page; }
+      a { color: inherit; text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="hero">
+      <p class="eyebrow">Documentation technique · Handoff</p>
+      <h1>Facebook / TikTok Scraper</h1>
+      <p>
+        Rapport explicatif pour les développeurs qui feront évoluer le projet :
+        architecture, flux, choix techniques, incidents résolus, proxies sticky,
+        streaming Gemini, et règles Mongo.
+      </p>
+      <div class="meta">
+        <span class="pill">Généré 2026-07-28 16:35 UTC</span>
+        <span class="pill">Docker Compose</span>
+        <span class="pill">Gateway · RabbitMQ · MongoDB · Workers</span>
+      </div>
+    </header>
+
+    <nav class="toc">
+      <h2>Sommaire</h2>
+      <ol><li><a href='#overview'>1. Vue d’ensemble</a></li><li><a href='#architecture'>2. Architecture globale</a></li><li><a href='#decisions'>3. Décisions d’architecture (pourquoi)</a></li><li><a href='#docker'>4. Déploiement Docker</a></li><li><a href='#flows'>5. Flux métier : profil unique vs CSV</a></li><li><a href='#rabbit'>6. Messaging RabbitMQ</a></li><li><a href='#streaming'>7. Streaming &amp; Gemini</a></li><li><a href='#mongo'>8. MongoDB — modèle &amp; cache</a></li><li><a href='#proxies'>9. Pool proxies, sticky, blacklist, 0 posts</a></li><li><a href='#pipeline'>10. Pipeline scrape TikTok</a></li><li><a href='#reports'>11. Rapports métier</a></li><li><a href='#logs'>12. Système de logs</a></li><li><a href='#incidents'>13. Problèmes rencontrés &amp; solutions</a></li><li><a href='#code'>14. Carte du code</a></li><li><a href='#debug'>15. Guide debug</a></li><li><a href='#traps'>16. Pièges à ne pas casser</a></li><li><a href='#roadmap'>17. Évolutions prioritaires</a></li><li><a href='#onboarding'>18. 10 tâches premier jour</a></li></ol>
+    </nav>
+
+    <section id='overview'><h2>1. Vue d’ensemble</h2><p>Système de scraping multi-plateforme (Facebook + TikTok) orienté <strong>métadonnées de posts</strong> + analyse IA Gemini, exposé via une API Gateway Spring Boot, orchestré par RabbitMQ, persisté dans MongoDB, packagé entièrement en <strong>Docker Compose</strong>.</p><p>Objectif TikTok : scraper un profil ou un CSV, streamer vite les résultats à l’utilisateur, enrichir ensuite avec Gemini, et gérer le re-scrape sans historique inutile.</p><div class='table-wrap'><table><thead><tr><th>Couche</th><th>Techno</th></tr></thead><tbody><tr><td>API / orchestration</td><td>Spring Boot (gateway)</td></tr><tr><td>Messaging</td><td>RabbitMQ</td></tr><tr><td>Persistence</td><td>MongoDB</td></tr><tr><td>Workers</td><td>Python + Playwright / Chrome</td></tr><tr><td>IA</td><td>Google Gemini</td></tr><tr><td>Déploiement</td><td>Docker Compose</td></tr></tbody></table></div></section><section id='architecture'><h2>2. Architecture globale</h2><figure class='diagram'><figcaption>Schéma composants</figcaption><pre>
+┌─────────────┐     HTTP      ┌──────────────┐
+│ Postman /   │──────────────▶│   Gateway    │
+│ Frontend    │◀──────────────│ Spring Boot  │
+└─────────────┘   poll GET    └──────┬───────┘
+                                     │ publish job
+                                     ▼
+                              ┌──────────────┐
+                              │   RabbitMQ   │
+                              └──────┬───────┘
+                     ┌───────────────┼───────────────┐
+                     ▼               ▼               ▼
+              scraping_queue   scraping_queue   scrape_result
+                 _tiktok          _facebook         _queue
+                     │               │               ▲
+                     ▼               ▼               │
+              ┌────────────┐  ┌────────────┐        │
+              │worker-tiktok│  │worker-fb   │────────┘
+              │Playwright   │  └────────────┘
+              │Chrome+Xvfb  │
+              └──────┬──────┘
+                     │ sticky IP
+                     ▼
+              ┌────────────┐     ┌─────────┐
+              │  Webshare  │────▶│ TikTok  │
+              └────────────┘     └─────────┘
+                     │
+                     ▼
+              ┌────────────┐
+              │   Gemini   │  (video_report)
+              └────────────┘
+
+Gateway upsert ──▶ MongoDB (1 doc / platform+postId)
+</pre></figure><div class='table-wrap'><table><thead><tr><th>Service</th><th>Fait</th><th>Ne fait pas</th></tr></thead><tbody><tr><td>gateway</td><td>API, jobs, Rabbit, upsert Mongo, TTL, cache reports</td><td>Ne scrape pas TikTok</td></tr><tr><td>worker-tiktok</td><td>Browser scrape, proxies, Gemini, rapports batch</td><td>N’est pas la source de vérité Mongo</td></tr><tr><td>worker-facebook</td><td>Scrape Facebook via sa queue</td><td>—</td></tr><tr><td>rabbitmq</td><td>Transport async, découplage</td><td>—</td></tr><tr><td>mongodb</td><td>Jobs + résultats</td><td>Pas d’historique de versions</td></tr></tbody></table></div></section><section id='decisions'><h2>3. Décisions d’architecture (pourquoi)</h2><article class='card'><h3>Gateway + workers (pas monolithe)<span class='badge'>ADR</span></h3><div class='adr-grid'><div><h4>Contexte</h4><p>Le scrape Playwright est long, fragile, CPU/RAM lourd.</p></div><div><h4>Décision</h4><p>API Spring séparée des workers Python.</p></div><div><h4>Pourquoi</h4><p>API responsive ; scale workers indépendamment ; isolation des crashes browser.</p></div><div><h4>Conséquences</h4><p>Évolutions résultats = souvent gateway + worker.</p></div><div class='full'><h4>Alternatives rejetées</h4><p>Scrape synchrone dans l’API = timeouts HTTP et blocage.</p></div></div></article><article class='card'><h3>RabbitMQ (pas HTTP synchrone worker)<span class='badge'>ADR</span></h3><div class='adr-grid'><div><h4>Contexte</h4><p>Besoin de buffer, retry, multi-plateformes.</p></div><div><h4>Décision</h4><p>Exchange <code>scrape.exchange</code> + queues dédiées + result queue + DLQ.</p></div><div><h4>Pourquoi</h4><p>Découplage, résilience, plusieurs consumers possibles.</p></div><div><h4>Conséquences</h4><p>Observer les files (UI :15672) en debug.</p></div><div class='full'><h4>Alternatives rejetées</h4><p>Appels HTTP gateway→worker : couplage fort, pas de buffer.</p></div></div></article><article class='card'><h3>Mongo 1 doc / (platform, postId)<span class='badge'>ADR</span></h3><div class='adr-grid'><div><h4>Contexte</h4><p>Besoin de l’état actuel d’une vidéo, pas d’un journal.</p></div><div><h4>Décision</h4><p>Upsert unique ; <code>scrapeId</code> rattache au dernier job.</p></div><div><h4>Pourquoi</h4><p>Simplifie cache Gemini et GET results.</p></div><div><h4>Conséquences</h4><p>Pas de timeline metrics historique (sauf évolution future).</p></div><div class='full'><h4>Alternatives rejetées</h4><p>Historique complet = complexité et coût stockage.</p></div></div></article><article class='card'><h3>Streaming métadonnées puis Gemini<span class='badge'>ADR</span></h3><div class='adr-grid'><div><h4>Contexte</h4><p>Gemini est lent/coûteux ; l’utilisateur veut voir tôt.</p></div><div><h4>Décision</h4><p>Publish RESULT immédiat, puis ENRICHMENT async.</p></div><div><h4>Pourquoi</h4><p>UX streaming + économie IA via cache <code>video_report</code>.</p></div><div><h4>Conséquences</h4><p>Deux messages Rabbit par post enrichi.</p></div><div class='full'><h4>Alternatives rejetées</h4><p>Attendre Gemini avant tout affichage = UX mauvaise.</p></div></div></article><article class='card'><h3>Sticky proxy = sticky Chrome profile<span class='badge'>ADR</span></h3><div class='adr-grid'><div><h4>Contexte</h4><p>Cookie global sur IP aléatoires → soft-block TikTok (grille vide).</p></div><div><h4>Décision</h4><p><code>sdwopfmy-N</code> → <code>tiktok_sessions/sdwopfmy-N/</code> persistent context.</p></div><div><h4>Pourquoi</h4><p>Cookies/fingerprint nés sous la même IP sticky.</p></div><div><h4>Conséquences</h4><p>Volume Docker obligatoire pour survivre aux recreate.</p></div><div class='full'><h4>Alternatives rejetées</h4><p>Un seul profil Chrome partagé = détection / locks.</p></div></div></article><article class='card'><h3>Pool 20k + sample + blacklist<span class='badge'>ADR</span></h3><div class='adr-grid'><div><h4>Contexte</h4><p>Beaucoup d’IP meurent (tunnel, auth, soft-block).</p></div><div><h4>Décision</h4><p>Sample N IP/job, blacklist ciblée, rotation fail-fast.</p></div><div><h4>Pourquoi</h4><p>Résilience sans dépendre d’une seule IP.</p></div><div><h4>Conséquences</h4><p>Surveiller <code>proxy_blacklist.json</code> pour éviter pool brûlé.</p></div><div class='full'><h4>Alternatives rejetées</h4><p>IP unique fixe = SPOF.</p></div></div></article><article class='card'><h3>Chrome headed + Xvfb<span class='badge'>ADR</span></h3><div class='adr-grid'><div><h4>Contexte</h4><p>Headless pur plus souvent détecté.</p></div><div><h4>Décision</h4><p><code>TIKTOK_HEADLESS=false</code> + <code>DISPLAY=:99</code> sous Xvfb.</p></div><div><h4>Pourquoi</h4><p>Fingerprint plus proche d’un navigateur réel en Docker.</p></div><div><h4>Conséquences</h4><p>Image plus lourde ; besoin Xvfb dans le container.</p></div><div class='full'><h4>Alternatives rejetées</h4><p>Headless seul = plus de soft-blocks observés.</p></div></div></article><article class='card'><h3>TTL metrics 12h + exception null<span class='badge'>ADR</span></h3><div class='adr-grid'><div><h4>Contexte</h4><p>Re-scrape fréquent ne doit pas écraser metrics fraîches, ni bloquer un 1er scrape sans likes.</p></div><div><h4>Décision</h4><p>Si metrics présentes et &lt;12h → garder ; si null → accepter incoming.</p></div><div><h4>Pourquoi</h4><p>Équilibre fraîcheur / coût scrape.</p></div><div><h4>Conséquences</h4><p>Bug historique corrigé : TTL bloquait likes même quand null.</p></div><div class='full'><h4>Alternatives rejetées</h4><p>Toujours écraser = charge inutile ; jamais écraser = metrics figées null.</p></div></div></article></section><section id='docker'><h2>4. Déploiement Docker</h2><p>Commande : <code>docker compose up --build</code></p><ul><li><code>scraper_gateway</code> :8080</li><li><code>scraper_worker_tiktok</code> / <code>scraper_worker_facebook</code></li><li><code>scraper_rabbitmq</code> :5672 + UI :15672</li><li><code>scraper_mongodb</code> :27017</li></ul><div class='table-wrap'><table><thead><tr><th>Volume host</th><th>Rôle</th></tr></thead><tbody><tr><td>tiktok_sessions/</td><td>Profils Chrome sticky persistants</td></tr><tr><td>webshare_residential_proxies.txt</td><td>Pool ~20k IPs</td></tr><tr><td>proxy_blacklist.json</td><td>Cooldownoldown IP</td></tr><tr><td>video_reports/</td><td>Artefacts Gemini / PDF</td></tr></tbody></table></div><p><strong>Piège</strong> : sans volume <code>tiktok_sessions</code>, chaque recreate perd les profils chauffés.</p></section><section id='flows'><h2>5. Flux métier : profil unique vs CSV</h2><h3>5.1 Profil unique</h3><figure class='diagram'><figcaption>Séquence</figcaption><pre>
+User → Gateway: POST /scrape
+Gateway → Mongo: job QUEUED
+Gateway → Rabbit: task tiktok
+Gateway → User: scrape_id
+
+Rabbit → Worker: consume
+Worker → TikTok: profile via sticky proxy
+loop chaque vidéo
+  Worker → Rabbit: RESULT (text + metrics)
+  Rabbit → Gateway → Mongo: upsert
+User → Gateway: GET results (déjà visibles)
+
+loop enrichissement
+  Worker → Gateway: cache video_report?
+  alt hit: reuse
+  else: Gemini(description)
+  Worker → Rabbit: ENRICHMENT
+  Gateway → Mongo: merge video_report
+
+Worker → Rabbit: COMPLETED
+Gateway → Mongo: job SUCCESS
+</pre></figure><h3>5.2 CSV batch</h3><figure class='diagram'><figcaption>Lanes parallèles</figcaption><pre>
+CSV URLs
+   │
+   ├─ Lane 1 (IP A) ── page ── page ── page
+   ├─ Lane 2 (IP B) ── page ── page
+   └─ Lane N (IP N) ── page ── …
+         │
+         ├─ IP morte → blacklist + replacement proxy
+         └─ posts streamés comme profil unique
+   │
+   └─ fin → rapport Gemini HTML/PDF → COMPLETED
+</pre></figure><div class='table-wrap'><table><thead><tr><th></th><th>Profil unique</th><th>CSV</th></tr></thead><tbody><tr><td>Proxies</td><td>Sample + rotation séquentielle</td><td>1 IP dédiée / lane</td></tr><tr><td>Parallelisme</td><td>1 scrape (+ enrich async)</td><td>N lanes</td></tr><tr><td>Rapport</td><td>API + reports/post</td><td>+ rapport agrégé batch</td></tr></tbody></table></div></section><section id='rabbit'><h2>6. Messaging RabbitMQ</h2><ul><li>Exchange : <code>scrape.exchange</code></li><li>Queues jobs : <code>scraping_queue_tiktok</code>, <code>scraping_queue_facebook</code></li><li>Résultats : <code>scrape_result_queue</code></li><li>DLQ : <code>scraping_queue_dlq</code></li></ul><p>Le gateway publie selon <code>platform</code>. Les workers publient RESULT / ENRICHMENT / COMPLETED / ERROR.</p></section><section id='streaming'><h2>7. Streaming &amp; Gemini</h2><ol><li>Dès qu’une vidéo est trouvée → publish métadonnées + metrics (si dispo)</li><li>Après scrape → pour chaque post : cache DB <code>video_report</code> ou appel Gemini sur la <strong>description texte</strong></li><li>Publish enrichment update → le client voit le report apparaître</li></ol><p>Gemini est surtout text-only ici → <code>confidence.level = low/medium</code> est <strong>normal</strong> sans audio/visuel.</p></section><section id='mongo'><h2>8. MongoDB — modèle &amp; cache</h2><p><strong>ScrapeResult</strong> : 1 document par <code>(platform, postId)</code>. Champs clés : author, textContent, hashtags, metrics, videoReport, publishedAt, scrapedAt, scrapeId.</p><figure class='diagram'><figcaption>Règles upsert</figcaption><pre>
+Incoming result
+    │
+    ├─ pas de doc (platform,postId) → INSERT
+    └─ doc existe → UPDATE même _id
+           │
+           ├─ metrics présentes ET scrapedAt &lt; 12h → garder metrics
+           ├─ sinon (ou metrics null) → mergeMetrics(incoming)
+           └─ videoReport incoming ? merge : garder existant
+</pre></figure><p>Avant Gemini, le worker appelle l’API interne gateway pour récupérer les reports déjà connus et <strong>sauter</strong> l’analyse IA.</p></section><section id='proxies'><h2>9. Pool proxies, sticky, blacklist, 0 posts</h2><h3>Modèle mental sticky</h3><figure class='diagram'><figcaption>1 sticky = 1 IP = 1 Chrome</figcaption><pre>sdwopfmy-42 → IP Webshare sticky → tiktok_sessions/sdwopfmy-42/</pre></figure><h3>Sélection d’IP</h3><figure class='diagram'><figcaption>Algorithme</figcaption><pre>
+pool 20k
+  → drop blacklist
+  → prioriser STICKY_POOL_SIZE (compléter si trop peu)
+  → drop .in_use
+  → prefer warmed &gt; cold
+  → shuffle + take PROXY_MAX_PER_JOB
+  → pour chaque IP:
+       soft-block/auth → blacklist courte + next IP (pas de retry inutile)
+       tunnel/timeout → retry flaky puis blacklist longue
+  → toutes échouent → FAILED count=0
+</pre></figure><h3>Blacklist</h3><div class='table-wrap'><table><thead><tr><th>Situation</th><th>Blacklist ?</th><th>Durée défaut</th></tr></thead><tbody><tr><td>no_posts_found</td><td>Oui</td><td>2h (soft)</td></tr><tr><td>challenge/captcha</td><td>Oui</td><td>2h (soft)</td></tr><tr><td>403 / HTTP failure</td><td>Oui</td><td>24h</td></tr><tr><td>timeout / tunnel</td><td>Oui</td><td>24h</td></tr><tr><td>INVALID_AUTH_CREDENTIALS</td><td>Oui</td><td>6h</td></tr><tr><td>SingletonLock / profile in use</td><td>Non</td><td>rotation soft</td></tr><tr><td>scrape réussi</td><td>Non</td><td>—</td></tr><tr><td>pause normale entre pages</td><td>Non</td><td>—</td></tr></tbody></table></div><p>Fichier : <code>platform/tiktok scraper/proxy_blacklist.json</code></p><p><strong>0 posts</strong> : toutes les IP du sample ont échoué → <code>status=FAILED</code>, message friendly, <code>count=0</code>.</p></section><section id='pipeline'><h2>10. Pipeline scrape TikTok</h2><ol><li><code>launch_persistent_context</code> sur profil sticky</li><li>Warmup homepage (+ auto-warm si session froide)</li><li>Open profil + wait ancres <code>/video/</code></li><li>Extract DOM + SIGI/universal data + réseau (hors For You)</li><li>Scroll jusqu’à max_posts / empty scrolls</li><li>Enrich : ouvrir pages <code>/video/</code> pour stats / statsV2 / DOM counts</li><li>Return posts → worker stream + Gemini</li></ol><p>Fail-fast : si aucune ancre <code>/video/</code> après wait → soft-block → rotate (pas 2×25s inutiles).</p></section><section id='reports'><h2>11. Rapports métier</h2><ul><li>Par vidéo : <code>video_report</code> Gemini (thèmes, résumé, sentiment, keywords, confidence…)</li><li>Batch CSV : rapport agrégé Mauritanie 24h HTML + PDF (+ fallback si timeout Gemini)</li></ul></section><section id='logs'><h2>12. Système de logs</h2><p>Module <code>logging_setup.py</code> → JSON structuré : timestamp, level, logger, message, platform, service, scrape_id, url, post_id.</p><ul><li>Soft proxy fail → WARNING (sans stack Playwright)</li><li>Bug inattendu → ERROR + traceback</li><li>Corréler via scrape_id</li></ul></section><section id='incidents'><h2>13. Problèmes rencontrés &amp; solutions</h2><div class='table-wrap'><table><thead><tr><th>Symptôme</th><th>Cause</th><th>Solution</th></tr></thead><tbody><tr><td>Chrome profile in use</td><td>SingletonLock / concurrence</td><td>clear locks + .in_use + launch dans try</td></tr><tr><td>Profil OK, 0 vidéos</td><td>Soft-block grille squelette</td><td>wait /video/, parse HTML, sticky, fail-fast</td></tr><tr><td>Likes null API alors logs OK</td><td>TTL 12h bloquait metrics null</td><td>si metrics missing → merge incoming</td></tr><tr><td>Enrichissement partiel</td><td>Tunnel pages vidéo</td><td>retries + statsV2</td></tr><tr><td>Soft-block massif</td><td>cookie ≠ IP</td><td>1 sticky = 1 Chrome profile</td></tr><tr><td>Build/perte sessions</td><td>sockets / pas de volume</td><td>dockerignore + volume sessions</td></tr><tr><td>Logs bruyants</td><td>stack Playwright</td><td>soft errors WARNING</td></tr><tr><td>Pool brûlé trop vite</td><td>retries longs soft-block</td><td>fail-fast + soft blacklist 2h</td></tr><tr><td>Gemini redondant</td><td>pas de cache</td><td>API interne reports + reuse</td></tr></tbody></table></div></section><section id='code'><h2>14. Carte du code</h2><figure class='diagram'><figcaption>Arborescence</figcaption><pre>Facebook_Scraper/
+├── docker-compose.yml
+├── .env
+├── logging_setup.py
+├── docs/
+│   ├── HANDOFF_DEVELOPERS.md
+│   └── generate_handoff_report.py   ← ce générateur
+├── scraper/   # Gateway Spring Boot
+│   └── .../messaging/listener/ScrapeResultListener.java
+└── platform/
+    ├── tiktok scraper/
+    │   ├── worker.py
+    │   ├── scraper.py
+    │   ├── sticky_sessions.py
+    │   ├── video_analysis.py
+    │   ├── webshare_residential_proxies.txt
+    │   ├── proxy_blacklist.json
+    │   └── tiktok_sessions/
+    └── facebook scraper/</pre></figure></section><section id='debug'><h2>15. Guide debug</h2><ol><li><code>docker compose ps</code> — services healthy</li><li><code>docker compose logs -f worker-tiktok</code></li><li>Chercher : Selected proxy sample / no_posts_found / enrichment ok likes=</li><li>Vérifier proxy_blacklist.json</li><li>Vérifier volume tiktok_sessions</li><li>Metrics null → logs enrich + TTL gateway</li><li>RabbitMQ UI :15672</li></ol></section><section id='traps'><h2>16. Pièges à ne pas casser</h2><ol><li>Ne pas réinjecter cookies globaux sur IP aléatoires en mode sticky</li><li>Ne pas lancer 2 Chrome sur le même tiktok_sessions/&lt;id&gt;/</li><li>Ne pas traiter no_posts_found comme succès vide sans rotation</li><li>Ne pas relancer Gemini si video_report existe</li><li>Ne pas oublier le volume Docker des sessions</li><li>Ne pas logger les passwords proxies</li><li>Ne pas retirer l’exception TTL « metrics null »</li></ol></section><section id='roadmap'><h2>17. Évolutions prioritaires</h2><ol><li>Healthcheck proxy avant d’ouvrir Chrome</li><li>Dashboard succès / blacklist / latence</li><li>Mode metrics-only refresh sans Gemini</li><li>Historique optionnel des metrics</li><li>Téléchargement média seulement si confidence basse</li><li>Tests intégration mock TikTok + TTL gateway</li><li>Alerte quota Webshare (INVALID_AUTH en rafale)</li></ol></section><section id='onboarding'><h2>18. 10 tâches premier jour</h2><ol><li>Lire ce rapport + docker-compose + .env</li><li>Monter la stack, scraper un profil via Postman</li><li>Suivre un scrape_id dans les logs</li><li>Voir l’upsert Mongo (platform, postId)</li><li>Relancer &lt;12h et observer reuse video_report</li><li>Observer rotation sur soft-block</li><li>Lire sticky_sessions.py + launch_persistent_context</li><li>Lire ScrapeResultListener.upsertResult</li><li>Lancer un petit CSV batch</li><li>Proposer une PR mineure (log / test / doc)</li></ol></section>
+
+    <footer>
+      Généré par <code>docs/generate_handoff_report.py</code> —
+      source aussi disponible dans <code>docs/HANDOFF_DEVELOPERS.md</code>.
+      Pour imprimer en PDF : ouvrir le HTML → Ctrl+P → Enregistrer en PDF.
+    </footer>
+  </div>
+</body>
+</html>

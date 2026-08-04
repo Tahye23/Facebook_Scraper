@@ -145,6 +145,8 @@ services:
       TIKTOK_STICKY_SESSIONS_ENABLED: "true"
       TIKTOK_STICKY_SESSIONS_DIR: "tiktok_sessions"
       TIKTOK_STICKY_MAX_SESSIONS: "50"
+      # false = cookies par IP + LRU (voir sticky_sessions.py).
+      TIKTOK_WARMED_ONLY: "false"
       # Cache de re-scraping: URL interne du gateway (nom de service Docker).
       GATEWAY_INTERNAL_URL: "http://gateway:8080"
     volumes:
@@ -164,10 +166,26 @@ services:
       - "./platform/tiktok scraper/proxy_blacklist.json:/app/platform/tiktok-scraper/proxy_blacklist.json"
       - "./logs:/app/logs"
     # Xvfb = ecran virtuel pour Chrome headed (anti-bot moins agressif qu'headless).
+    # Important: si Xvfb meurt ou laisse un lock stale (/tmp/.X99-lock), Chrome
+    # plante avec "Target page, context or browser has been closed" et le worker
+    # blackliste a tort des proxies. On (re)demarre Xvfb proprement a chaque boot.
     command:
       - "sh"
       - "-c"
-      - "Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp >/tmp/xvfb.log 2>&1 & sleep 2 && exec python worker.py"
+      - >-
+        rm -f /tmp/.X99-lock /tmp/.X11-unix/X99;
+        Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp >/tmp/xvfb.log 2>&1 &
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+          if [ -S /tmp/.X11-unix/X99 ]; then break; fi;
+          sleep 0.5;
+        done;
+        if [ ! -S /tmp/.X11-unix/X99 ]; then
+          echo "ERROR: Xvfb failed to start on :99" >&2;
+          cat /tmp/xvfb.log >&2 || true;
+          exit 1;
+        fi;
+        exec python worker.py
+
     depends_on:
       rabbitmq:
         condition: service_healthy

@@ -1,5 +1,14 @@
 # Prompt Gemini — générer le rapport développeurs
 
+> **Alternative recommandée** : générer directement le rapport HTML/PDF localement :
+>
+> ```bash
+> python docs/generate_handoff_report.py
+> python docs/generate_handoff_report.py --pdf
+> ```
+>
+> Sortie : `docs/output/handoff_developers_latest.html` (le plus joli — ouvrir dans le navigateur).
+
 Copie-colle **tout ce bloc** dans Gemini (et attache / colle aussi le contenu de `docs/HANDOFF_DEVELOPERS.md`).
 
 ---

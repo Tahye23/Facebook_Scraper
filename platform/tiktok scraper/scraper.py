@@ -27,6 +27,7 @@ from browser_session import (
     force_www_tiktok_url,
     goto_catch_http,
     goto_strict,
+    install_resource_blocker,
     install_webdriver_mask,
     is_antibot_http_status,
     is_http_blocked_status,
@@ -46,7 +47,11 @@ from profile_extractor import (
     extract_posts_from_hydration_payload,
     extract_posts_from_profile_page,
     post_has_usable_metrics,
+    probe_hydration_signals,
 )
+from response_classifier import classify_from_result
+import scrape_metrics
+import identity_pool
 from tiktok_parser import normalize_www_tiktok_url, posts_have_profile_metrics
 
 
@@ -56,6 +61,24 @@ COOKIES_FILE = "tiktok_cookies.json"
 PROXY_BLACKLIST_FILE = "proxy_blacklist.json"
 _PROXY_BLACKLIST_LOCK = threading.Lock()
 LOGGER = get_logger(__name__, platform="tiktok", service="scraper")
+# Derniere tentative (diagnostic_runner lit bandwidth apres scrape).
+_LAST_ATTEMPT_BANDWIDTH: dict = {"bytes": 0, "aborted": 0}
+
+_MOBILE_UA_DEFAULT = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+    "Mobile/15E148 Safari/604.1"
+)
+_MOBILE_SEC_CH_UA = '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"'
+
+
+def _cookies_file_path() -> str:
+    """Chemin cookies: TIKTOK_COOKIES_FILE / TIKTOK_DIAG_SESSION_COOKIES_FILE / defaut."""
+    for key in ("TIKTOK_DIAG_SESSION_COOKIES_FILE", "TIKTOK_COOKIES_FILE"):
+        raw = (os.getenv(key) or "").strip()
+        if raw:
+            return raw
+    return COOKIES_FILE
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -79,6 +102,91 @@ def _env_int(name: str, default: int) -> int:
         return int(str(raw).strip())
     except ValueError:
         return default
+
+
+def _finalize_classified_result(
+    result: dict | None,
+    *,
+    country: str = "",
+    identity: str = "",
+    record: bool = True,
+) -> dict:
+    """Attache classification fine + metriques (Phase 0) sans changer le scrape."""
+    out = dict(result or {})
+    soft_cc = scrape_metrics.consecutive_soft_block_country_count()
+    clf = classify_from_result(out, consecutive_soft_block_countries=soft_cc)
+    out["classification"] = clf.scrape_class.value
+    out["classification_action"] = clf.action.value
+    out["classification_reason"] = clf.reason
+    if clf.signals:
+        merged = dict(out.get("classification_signals") or {})
+        for key, value in clf.signals.items():
+            if key not in merged or merged.get(key) in (None, "", [], 0):
+                merged[key] = value
+        out["classification_signals"] = merged
+
+    LOGGER.info(
+        "[CLASSIFIER] class=%s action=%s reason=%s country=%s",
+        clf.scrape_class.value,
+        clf.action.value,
+        clf.reason,
+        (country or "xx"),
+        extra={
+            "url": out.get("url"),
+            "post_id": (identity or "")[:80] or None,
+        },
+    )
+
+    if record and not _env_bool("TIKTOK_DIAG_MODE", False):
+        posts = out.get("posts") or []
+        success = bool(posts) and not str(out.get("error") or "").strip()
+        # Succes partiel (posts + warning) compte comme succes metrique.
+        if posts and str(out.get("warning") or "").strip():
+            success = True
+        scrape_metrics.record_attempt(
+            country=country or "xx",
+            scrape_class=clf.scrape_class.value,
+            success=success,
+            identity=identity,
+            reason=clf.reason,
+        )
+        # Identity pool lifecycle (Phase 1)
+        try:
+            iid = identity_pool.identity_id_from_proxy_username(identity) if identity else ""
+            if iid:
+                identity_pool.apply_classification(
+                    iid,
+                    clf.scrape_class.value,
+                    success=success,
+                )
+        except Exception:
+            LOGGER.debug("identity_pool update failed", exc_info=True)
+    return out
+
+
+def _collect_page_classification_signals(page, base: dict | None = None) -> dict:
+    """Signaux SSR/DOM pour le classifier (page encore ouverte)."""
+    signals = dict(base or {})
+    if page is None:
+        return signals
+    try:
+        probed = probe_hydration_signals(page)
+        if isinstance(probed, dict):
+            for key, value in probed.items():
+                if value not in (None, "", [], 0) or key not in signals:
+                    signals[key] = value
+    except Exception:
+        LOGGER.debug("probe_hydration_signals failed", exc_info=True)
+    try:
+        signals["chrome_error"] = bool(_page_is_chrome_error(page))
+    except Exception:
+        signals.setdefault("chrome_error", False)
+    try:
+        if _looks_like_tiktok_challenge(page):
+            signals["challenge_detected"] = True
+    except Exception:
+        pass
+    return signals
 
 
 def _to_iso_datetime(raw_value) -> str | None:
@@ -132,21 +240,22 @@ def _is_post_within_hours(post: dict, hours: int) -> bool | None:
 
 
 def load_cookies() -> list:
-    """Charge et normalise les cookies TikTok depuis `tiktok_cookies.json`.
+    """Charge et normalise les cookies TikTok depuis le fichier cookies configure.
 
     Objectif:
     - Accepter un export JSON de cookies (liste d'objets).
     - Garder uniquement les champs utiles pour Playwright.
     - Retourner une liste prete pour `context.add_cookies(...)`.
     """
-    if not os.path.exists(COOKIES_FILE):
+    path = _cookies_file_path()
+    if not os.path.exists(path):
         return []
 
     try:
-        with open(COOKIES_FILE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
     except Exception as e:
-        LOGGER.warning("Failed to read cookies file", exc_info=True)
+        LOGGER.warning("Failed to read cookies file %s", path, exc_info=True)
         return []
 
     if not isinstance(raw, list):
@@ -189,7 +298,24 @@ def load_cookies() -> list:
 
 
 def _normalize_profile_url(url: str) -> str:
-    """Valide et nettoie une URL TikTok de profil (www uniquement, jamais m.)."""
+    """Valide et nettoie une URL TikTok de profil.
+
+    Par defaut www uniquement. Si TIKTOK_ALLOW_MOBILE_HOST=true (diagnostic
+    mobile_ua), conserve m.tiktok.com.
+    """
+    allow_mobile = _env_bool("TIKTOK_ALLOW_MOBILE_HOST", False)
+    raw = (url or "").strip()
+    if allow_mobile and "m.tiktok.com" in raw.lower():
+        parsed = urlparse(raw)
+        username = ""
+        for segment in (parsed.path or "").split("/"):
+            if segment.startswith("@"):
+                username = segment[1:].lower()
+                break
+        if username:
+            return f"https://m.tiktok.com/@{username}"
+        return f"https://m.tiktok.com{(parsed.path or '').rstrip('/')}" or "https://m.tiktok.com"
+
     # Interdit m.tiktok.com (404 natif) → www + username minuscule.
     forced = force_www_tiktok_url(url) or url
     normalized = normalize_www_tiktok_url(forced)
@@ -452,6 +578,9 @@ def _assign_webshare_sticky_session(proxy_cfg: dict | None) -> dict | None:
     -rotate change d'IP a CHAQUE requete HTTP → cookies ttwid/msToken
     emis sur IP A, profil vu depuis IP B → squelette / WAF.
     Sticky = 1 session_id = 1 IP pour toute la duree du browser.
+
+    Phase 1: prefere une identite warm du Identity Pool pour le pays choisi;
+    sinon cree une sticky virgin et l'enregistre.
     """
     if not proxy_cfg:
         return None
@@ -461,8 +590,34 @@ def _assign_webshare_sticky_session(proxy_cfg: dict | None) -> dict | None:
     out = dict(proxy_cfg)
     base = _webshare_username_base(str(out.get("username") or ""))
     country = random.choice(_webshare_sticky_countries())
-    # Session ID numerique (doc Webshare: username-us-1234).
-    session_id = str(random.randint(10_000_000, 99_999_999))
+    session_id: str | None = None
+    # Reutiliser une sticky warm/active si disponible (meme pays).
+    try:
+        if identity_pool.enabled():
+            reused = identity_pool.acquire_for_country(
+                country, base_user=base, prefer_warm=True
+            )
+            if reused and reused.session_id:
+                session_id = reused.session_id
+                country = reused.country or country
+                LOGGER.info(
+                    "[IDENTITY] assigning reused sticky %s",
+                    reused.identity_id,
+                )
+    except Exception:
+        LOGGER.debug("identity_pool acquire failed", exc_info=True)
+
+    if not session_id:
+        # Session ID numerique (doc Webshare: username-us-1234).
+        session_id = str(random.randint(10_000_000, 99_999_999))
+        try:
+            if identity_pool.enabled():
+                identity_pool.create_virgin(
+                    base_user=base, country=country, session_id=session_id
+                )
+        except Exception:
+            LOGGER.debug("identity_pool create_virgin failed", exc_info=True)
+
     sticky_user = f"{base}-{country}-{session_id}"
     out["username"] = sticky_user
     # Conserve le pays pour aligner locale/timezone Playwright (etape 2).
@@ -843,6 +998,7 @@ def _is_retryable_soft_error(error_code: str) -> bool:
     if err in {
         "challenge_detected",
         "no_posts_found",
+        "empty_feed_or_softblock",
         "proxy_blocked",
         "proxy_soft_blocked",
         "all_proxies_blocked",
@@ -850,7 +1006,12 @@ def _is_retryable_soft_error(error_code: str) -> bool:
         "antibot_blocked",
     }:
         return True
-    if "proxy_blocked" in err or "proxy_soft_blocked" in err or "antibot" in err:
+    if (
+        "proxy_blocked" in err
+        or "proxy_soft_blocked" in err
+        or "antibot" in err
+        or "empty_feed_or_softblock" in err
+    ):
         return True
     if _is_profile_lock_error(err):
         return True
@@ -1671,6 +1832,7 @@ def _ingest_forced_item_list(
     body_len = int(result.get("bodyLen") or 0)
     item_len = int(result.get("itemListLen") or 0)
     status_code = result.get("statusCode")
+    fetch_err = str(result.get("error") or "")
     LOGGER.info(
         "Forced item_list result: HTTP=%s bodyLen=%s itemListLen=%s "
         "tiktokStatus=%s hasItemList=%s",
@@ -1684,6 +1846,8 @@ def _ingest_forced_item_list(
 
     payload = result.get("payload")
     if not isinstance(payload, dict):
+        if fetch_err or http_status == 0:
+            return -1  # fetch failed (TypeError / network) — signal classifier
         return 0
     if not _api_payload_status_ok(payload) and item_len <= 0:
         LOGGER.warning(
@@ -1803,6 +1967,24 @@ _CHROME_SEC_CH_UA = '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";
 def _chrome_user_agent() -> str:
     """User-Agent Chrome recent (override possible via TIKTOK_USER_AGENT)."""
     return (os.getenv("TIKTOK_USER_AGENT") or "").strip() or _CHROME_UA_WINDOWS
+
+
+def _sec_ch_ua() -> str:
+    return (os.getenv("TIKTOK_SEC_CH_UA") or "").strip() or _CHROME_SEC_CH_UA
+
+
+def _sec_ch_ua_mobile() -> str:
+    return (os.getenv("TIKTOK_SEC_CH_UA_MOBILE") or "").strip() or "?0"
+
+
+def _sec_ch_ua_platform() -> str:
+    return (os.getenv("TIKTOK_SEC_CH_UA_PLATFORM") or "").strip() or '"Windows"'
+
+
+def _browser_viewport() -> dict:
+    w = max(320, _env_int("TIKTOK_VIEWPORT_WIDTH", 1365))
+    h = max(480, _env_int("TIKTOK_VIEWPORT_HEIGHT", 768))
+    return {"width": w, "height": h}
 
 
 def _resolve_headless_channel(headless: bool, browser_channel: str) -> str:
@@ -2640,18 +2822,20 @@ def _scrape_with_browser(
     browser_geo = _browser_geo_for_country(sticky_cc)
     _set_active_browser_geo(browser_geo)
     context_options = {
-        "viewport": {"width": 1365, "height": 768},
+        "viewport": _browser_viewport(),
         "locale": browser_geo["locale"],
         "timezone_id": browser_geo["timezone_id"],
         "ignore_https_errors": True,
+        "is_mobile": _env_bool("TIKTOK_IS_MOBILE", False),
+        "has_touch": _env_bool("TIKTOK_HAS_TOUCH", False),
     }
+    # UA override aussi sur vrai Chrome en mode diagnostic mobile.
+    if _env_bool("TIKTOK_FORCE_USER_AGENT", False) or not using_real_chrome:
+        context_options["user_agent"] = _chrome_user_agent()
     # Geoloc optionnelle (permissions + coords) — alignee sur le pays sticky.
     if _env_bool("TIKTOK_BROWSER_GEOLOCATION", True):
         context_options["geolocation"] = dict(browser_geo["geolocation"])
         context_options["permissions"] = ["geolocation"]
-    # UA Chrome recent: Chromium embarque / new headless. Vrai Chrome: UA natif.
-    if not using_real_chrome:
-        context_options["user_agent"] = _chrome_user_agent()
     LOGGER.info(
         "Browser geo aligned to sticky country=%s locale=%s tz=%s lang=%s",
         browser_geo.get("country"),
@@ -2683,6 +2867,15 @@ def _scrape_with_browser(
     # rotations puisqu'on ne fait qu'ajouter/vider son contenu (pas de
     # reassignation), donc pas besoin de `nonlocal` pour lui.
     network_posts: list[dict] = []
+    # Signaux Response Classifier (Phase 0) — mutables pendant la tentative.
+    attempt_signals: dict = {
+        "item_list_xhr_seen": False,
+        "fetch_failed": None,
+        "ssr_universal_len": 0,
+        "country": sticky_cc,
+    }
+    # Cell mutable: install_resource_blocker retourne le dict mute par les routes.
+    bandwidth_cell: list[dict] = [{"aborted": 0, "bytes": 0}]
 
     def handle_response(response):
         """Capture active des JSON grille profil (`/api/post/item_list/`, user/detail).
@@ -2693,6 +2886,7 @@ def _scrape_with_browser(
         rurl = response.url
         if not _is_profile_grid_api_url(rurl):
             return
+        attempt_signals["item_list_xhr_seen"] = True
         try:
             http_status = int(getattr(response, "status", 0) or 0)
         except (TypeError, ValueError):
@@ -2813,9 +3007,9 @@ def _scrape_with_browser(
                     "application/signed-exchange;v=b3;q=0.7"
                 ),
                 "Upgrade-Insecure-Requests": "1",
-                "Sec-CH-UA": _CHROME_SEC_CH_UA,
-                "Sec-CH-UA-Platform": '"Windows"',
-                "Sec-CH-UA-Mobile": "?0",
+                "Sec-CH-UA": _sec_ch_ua(),
+                "Sec-CH-UA-Platform": _sec_ch_ua_platform(),
+                "Sec-CH-UA-Mobile": _sec_ch_ua_mobile(),
             }
             context.set_extra_http_headers(chrome_headers)
 
@@ -2846,6 +3040,28 @@ def _scrape_with_browser(
                         context.add_cookies(cookies)
                     except Exception:
                         LOGGER.warning("Failed to inject cookies", exc_info=True)
+
+        # Diagnostic logged_in: injecter un cookie jar session (hors sticky reuse).
+        diag_cookies_path = (os.getenv("TIKTOK_DIAG_SESSION_COOKIES_FILE") or "").strip()
+        if diag_cookies_path:
+            try:
+                diag_cookies = load_cookies()
+                if diag_cookies:
+                    context.add_cookies(diag_cookies)
+                    LOGGER.info(
+                        "[DIAG] Injected %d session cookies from %s",
+                        len(diag_cookies),
+                        diag_cookies_path,
+                    )
+            except Exception:
+                LOGGER.warning("[DIAG] Failed to inject session cookies", exc_info=True)
+
+        # Phase 3: bloquer image/media/font (10GB/mois Webshare).
+        # Toggle runtime: TIKTOK_BLOCK_HEAVY_ASSETS=true|false (pas de rebuild).
+        try:
+            bandwidth_cell[0] = install_resource_blocker(context)
+        except Exception:
+            LOGGER.debug("resource blocker install failed", exc_info=True)
 
         page = context.new_page()
         # playwright-stealth: jamais sur vrai Chrome (casse item_list).
@@ -3059,6 +3275,7 @@ def _scrape_with_browser(
                 )
 
         # 3b) SPA n'a jamais emis item_list → fetch signe in-page (etape 1 Claude).
+        attempt_signals["ssr_universal_len"] = int(ssr_uni_len or 0)
         if not all_posts and (ssr_uni_len > 50000 or grid_ready):
             forced_n = _ingest_forced_item_list(
                 page,
@@ -3067,7 +3284,10 @@ def _scrape_with_browser(
                 target_username=target_username,
                 count=min(30, max_posts) if max_posts else 30,
             )
-            if forced_n:
+            if forced_n == -1:
+                attempt_signals["fetch_failed"] = True
+            elif forced_n:
+                attempt_signals["fetch_failed"] = False
                 api_ingested = _ingest_network_posts(force=True)
                 if api_ingested:
                     LOGGER.info(
@@ -3348,14 +3568,33 @@ def _scrape_with_browser(
                 return {"posts": http_posts[:max_posts], "total": min(len(http_posts), max_posts), "url": profile_url}
             if _looks_like_tiktok_challenge(page):
                 _save_challenge_artifacts(page)
-                return {"posts": [], "total": 0, "error": "challenge_detected", "url": profile_url}
+                return {
+                    "posts": [],
+                    "total": 0,
+                    "error": "challenge_detected",
+                    "url": profile_url,
+                    "http_status": 200,
+                    "classification_signals": _collect_page_classification_signals(
+                        page,
+                        {**attempt_signals, "challenge_detected": True},
+                    ),
+                }
             # Aucun challenge reconnu, mais aucune video non plus: capturer
             # quand meme un screenshot/HTML, ce cas etant souvent aussi
             # difficile a diagnostiquer qu'un challenge classique (page vide,
             # redirection silencieuse, geo-restriction du proxy...).
             # Ne JAMAIS arriver ici si network_posts avait des elements.
             _save_challenge_artifacts(page, label="no_posts_found")
-            return {"posts": [], "total": 0, "error": "no_posts_found", "url": profile_url}
+            return {
+                "posts": [],
+                "total": 0,
+                "error": "no_posts_found",
+                "url": profile_url,
+                "http_status": 200,
+                "classification_signals": _collect_page_classification_signals(
+                    page, attempt_signals
+                ),
+            }
 
         # Post-traitements: enrichment conditionnel (skip si metrics profil
         # OU si le budget 35s est deja epuise — on renvoie les posts bruts).
@@ -3411,6 +3650,9 @@ def _scrape_with_browser(
             "error": "proxy_blocked:attempt_timeout",
             "error_detail": str(e)[:160],
             "url": profile_url,
+            "classification_signals": _collect_page_classification_signals(
+                page, attempt_signals
+            ),
         }
     except (ProxyBlockedException, AntibotBlockedException) as e:
         kind = getattr(e, "kind", None) or "blocked"
@@ -3460,6 +3702,9 @@ def _scrape_with_browser(
             "error": error_code,
             "error_detail": str(e)[:200],
             "url": profile_url,
+            "classification_signals": _collect_page_classification_signals(
+                page, attempt_signals
+            ),
         }
     except Exception as e:
         # Beaucoup d'exceptions ici sont ATTENDUES et deja gerees par la rotation
@@ -3503,6 +3748,31 @@ def _scrape_with_browser(
             )
         return {"posts": [], "error": str(e), "url": profile_url}
     finally:
+        # Bandwidth attempt (Phase 0/3) — Content-Length approx + assets abortes.
+        try:
+            bw = bandwidth_cell[0] if bandwidth_cell else {}
+            nbytes = int(bw.get("bytes") or 0)
+            naborted = int(bw.get("aborted") or 0)
+            mb = nbytes / (1024.0 * 1024.0)
+            _LAST_ATTEMPT_BANDWIDTH["bytes"] = nbytes
+            _LAST_ATTEMPT_BANDWIDTH["aborted"] = naborted
+            LOGGER.info(
+                "[BANDWIDTH] attempt bytes≈%s (%.2f MB) aborted_assets=%s",
+                nbytes,
+                mb,
+                naborted,
+                extra={"url": profile_url},
+            )
+            if sticky_identity and mb > 0:
+                identity_pool.add_bandwidth_mb(
+                    identity_pool.identity_id_from_proxy_username(sticky_identity),
+                    mb,
+                )
+            if not _env_bool("TIKTOK_DIAG_MODE", False):
+                scrape_metrics.record_bandwidth_mb(sticky_cc, mb)
+        except Exception:
+            LOGGER.debug("bandwidth accounting failed", exc_info=True)
+
         # Cycle de vie cookies:
         # - Succes (+ REUSE): persister ttwid/msToken + mark success=True
         # - Echec: mark success=False + purge VIRGIN (pas de reinjection au retry)
@@ -4988,12 +5258,19 @@ def scrape_tiktok_page(
                     rotate_every_n_posts=rotate_every_n_posts,
                     skip_homepage_warmup=False,
                 )
+                result = _finalize_classified_result(
+                    result,
+                    country=_sticky_country_from_proxy(proxy_cfg),
+                    identity=_proxy_identity(proxy_cfg) if proxy_cfg else "",
+                    record=True,
+                )
                 last_result = result
                 error_code = str(result.get("error") or "").strip().lower()
+                scrape_class = str(result.get("classification") or "").strip().lower()
                 retryable_soft = _is_retryable_soft_error(error_code)
 
                 # Auth Webshare: abort IMMEDIAT — ne pas boucler sur la meme credential.
-                if _is_fatal_proxy_auth_error(error_code):
+                if _is_fatal_proxy_auth_error(error_code) or scrape_class == "auth":
                     scoped_logger.warning(
                         "[PROXY] Webshare AUTH/CONNECTION FAILURE — aborting further IP retries "
                         "(fix PROXY_URL / username / password / residential host)",
@@ -5016,6 +5293,7 @@ def scrape_tiktok_page(
                     tok in error_code
                     for tok in (
                         "no_posts_found",
+                        "empty_feed_or_softblock",
                         "challenge_detected",
                         "proxy_blocked",
                         "tls_timeout",
@@ -5028,7 +5306,15 @@ def scrape_tiktok_page(
                         "http_403",
                         "http_429",
                     )
-                )
+                ) or scrape_class in {
+                    "soft_block",
+                    "structural_change",
+                    "platform_change_suspected",
+                    "hard_block",
+                    "attempt_timeout",
+                    "proxy_infra",
+                    "rate_limited",
+                }
                 if rotate_now:
                     scoped_logger.info(
                         "Next attempt: new IP + VIRGIN cookies + homepage warmup",
@@ -5045,9 +5331,27 @@ def scrape_tiktok_page(
                     )
                     continue
 
-                # Distinguer Timeout TLS vs Block HTTP dans les logs de rotation.
-                if "tls_timeout" in error_code or (
-                    "timeout" in error_code and "http_" not in error_code
+                # Distinguer attempt_timeout / TLS-NAV / HTTP block (pas le meme signal).
+                if scrape_class == "attempt_timeout" or "attempt_timeout" in error_code:
+                    scoped_logger.warning(
+                        "[PERF] Rotating after ATTEMPT BUDGET TIMEOUT (not TLS/NAV)",
+                        extra={"error": error_code[:160], "url": _describe_proxy(proxy_cfg)},
+                    )
+                elif scrape_class == "structural_change" or scrape_class == "platform_change_suspected":
+                    scoped_logger.warning(
+                        "[CLASSIFIER] Rotating after %s — do not quarantine identity as proxy WAF",
+                        scrape_class,
+                        extra={"error": error_code[:160], "url": _describe_proxy(proxy_cfg)},
+                    )
+                elif scrape_class == "soft_block" or "empty_feed" in error_code or "no_posts_found" in error_code:
+                    scoped_logger.warning(
+                        "[CLASSIFIER] Rotating after soft empty feed (HTTP 200, 0 posts)",
+                        extra={"error": error_code[:160], "url": _describe_proxy(proxy_cfg)},
+                    )
+                elif "tls_timeout" in error_code or (
+                    "timeout" in error_code
+                    and "http_" not in error_code
+                    and "attempt_timeout" not in error_code
                 ):
                     scoped_logger.warning(
                         "[ANTIBOT] Rotating after TLS/NAV TIMEOUT (blacklist 24h)",
@@ -5087,9 +5391,25 @@ def scrape_tiktok_page(
                         "timeout",
                         "503",
                         "no_posts_found",
+                        "empty_feed_or_softblock",
                     )
-                    is_real_waf = any(tok in error_code for tok in real_waf_tokens)
-                    is_soft = any(tok in error_code for tok in soft_purge_tokens)
+                    # structural_change / platform_change: ne pas mark_waf
+                    # (le probleme n'est pas l'identite proxy).
+                    is_structural = scrape_class in {
+                        "structural_change",
+                        "platform_change_suspected",
+                    }
+                    is_real_waf = (
+                        any(tok in error_code for tok in real_waf_tokens)
+                        and not is_structural
+                        and scrape_class not in ("soft_block", "attempt_timeout")
+                    )
+                    is_soft = any(tok in error_code for tok in soft_purge_tokens) or scrape_class in {
+                        "soft_block",
+                        "structural_change",
+                        "platform_change_suspected",
+                        "attempt_timeout",
+                    }
                     if _env_bool("PURGE_STICKY_ON_BLOCK", True) and (is_real_waf or is_soft):
                         sticky_sessions.purge_sticky_cookies(
                             identity,

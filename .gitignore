@@ -7,6 +7,12 @@ platform/facebook scraper/fb_cookies.json
 # Profil Chrome complet (cookies/cache/session Facebook) - jamais committer.
 platform/facebook scraper/fb_profile/
 platform/tiktok scraper/tiktok_cookies.json
+platform/tiktok scraper/tiktok_session_cookies.json
+platform/tiktok scraper/diagnostic_results.jsonl
+platform/tiktok scraper/diagnostic_metrics.json
+platform/tiktok scraper/diagnostic_identity_pool.json
+platform/tiktok scraper/identity_pool.json
+platform/tiktok scraper/scrape_metrics.json
 # Pool Webshare (credentials) + blacklist locale des proxies en cooldown
 platform/tiktok scraper/webshare_residential_proxies.txt
 platform/tiktok scraper/proxy_blacklist.json

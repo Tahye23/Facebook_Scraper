@@ -462,6 +462,57 @@ def goto_strict(
     return response
 
 
+def install_resource_blocker(context: Any) -> dict:
+    """Bloque images/videos/fonts pour economiser le bandwidth (Phase 3).
+
+    Garde document / script / xhr / fetch / websocket — necessaires au SSR
+    et a l'API item_list. Retourne un compteur mutable `{"aborted": int, "bytes": int}`.
+    Desactivable: TIKTOK_BLOCK_HEAVY_ASSETS=false.
+    """
+    counters = {"aborted": 0, "bytes": 0}
+    raw = os.getenv("TIKTOK_BLOCK_HEAVY_ASSETS")
+    enabled = True if raw is None else raw.strip().lower() in ("1", "true", "yes", "y", "on")
+    if not enabled:
+        return counters
+
+    blocked_types = {"image", "media", "font"}
+    # Stylesheets: laisser passer (layout DOM) — cout faible vs video.
+
+    def _on_route(route: Any) -> None:
+        try:
+            req = route.request
+            rtype = (getattr(req, "resource_type", None) or "").lower()
+            if rtype in blocked_types:
+                counters["aborted"] += 1
+                route.abort()
+                return
+            route.continue_()
+        except Exception:
+            try:
+                route.continue_()
+            except Exception:
+                pass
+
+    def _on_response(response: Any) -> None:
+        try:
+            headers = getattr(response, "headers", None) or {}
+            cl = headers.get("content-length") or headers.get("Content-Length")
+            if cl:
+                counters["bytes"] += max(0, int(cl))
+        except Exception:
+            pass
+
+    try:
+        context.route("**/*", _on_route)
+        context.on("response", _on_response)
+        LOGGER.info(
+            "Heavy asset blocker ON (image/media/font) — bandwidth saver for 10GB plan"
+        )
+    except Exception:
+        LOGGER.debug("install_resource_blocker failed", exc_info=True)
+    return counters
+
+
 def install_webdriver_mask(context: Any) -> None:
     """Masque navigator.webdriver + shim chrome.app AVANT toute navigation.
 

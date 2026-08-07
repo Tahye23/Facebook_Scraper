@@ -142,6 +142,15 @@ services:
       TIKTOK_STICKY_MAX_SESSIONS: "50"
       # false = cookies par IP + LRU (voir sticky_sessions.py).
       TIKTOK_WARMED_ONLY: "false"
+      # anti-detection-v2 MVP + harden (subprocess kill / cooldown / assets toggle)
+      TIKTOK_JOB_HARD_TIMEOUT_S: "90"
+      TIKTOK_SCRAPE_SUBPROCESS: "true"
+      TIKTOK_CHROME_WATCHDOG_ENABLED: "true"
+      TIKTOK_BLOCK_HEAVY_ASSETS: "true"
+      TIKTOK_IDENTITY_POOL_ENABLED: "true"
+      TIKTOK_IDENTITY_POOL_FILE: "identity_pool.json"
+      TIKTOK_QUARANTINE_COOLDOWN_HOURS: "2"
+      TIKTOK_SCRAPE_METRICS_FILE: "scrape_metrics.json"
       # Cache de re-scraping: URL interne du gateway (nom de service Docker).
       GATEWAY_INTERNAL_URL: "http://gateway:8080"
     volumes:

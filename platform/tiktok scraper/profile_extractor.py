@@ -624,6 +624,70 @@ def extract_posts_from_hydration(page: Any, profile_url: str = "") -> tuple[int,
     return uni_len, posts
 
 
+def probe_hydration_signals(page: Any) -> dict:
+    """Signaux SSR legers pour Response Classifier (pas d'extraction posts)."""
+    try:
+        result = page.evaluate(
+            r"""
+            () => {
+              const el = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__')
+                || document.getElementById('SIGI_STATE')
+                || document.getElementById('sigi-persisted-data');
+              if (!el || !el.textContent) {
+                return {
+                  ssr_universal_len: 0,
+                  ssr_scope_keys: [],
+                  ssr_has_user_info: false,
+                  ssr_has_post_list: false,
+                  item_list_len: 0,
+                };
+              }
+              let data = null;
+              try { data = JSON.parse(el.textContent); } catch (e) {
+                return {
+                  ssr_universal_len: el.textContent.length,
+                  ssr_scope_keys: [],
+                  ssr_has_user_info: false,
+                  ssr_has_post_list: false,
+                  item_list_len: 0,
+                  parse_error: String(e),
+                };
+              }
+              const scope = (data && data.__DEFAULT_SCOPE__) || data || {};
+              const keys = Object.keys(scope).slice(0, 40);
+              const ud = scope['webapp.user-detail'] || {};
+              const upl = scope['webapp.user-post-list'] || {};
+              const items = upl.itemList || upl.item_list || [];
+              const hasUser = !!(ud.userInfo || ud.user || ud.statusCode !== undefined);
+              return {
+                ssr_universal_len: el.textContent.length,
+                ssr_scope_keys: keys,
+                ssr_has_user_info: hasUser || keys.includes('webapp.user-detail'),
+                ssr_has_post_list: keys.includes('webapp.user-post-list')
+                  && Array.isArray(items) && items.length > 0,
+                item_list_len: Array.isArray(items) ? items.length : 0,
+              };
+            }
+            """
+        )
+    except Exception:
+        LOGGER.debug("probe_hydration_signals failed", exc_info=True)
+        return {
+            "ssr_universal_len": 0,
+            "ssr_scope_keys": [],
+            "ssr_has_user_info": False,
+            "ssr_has_post_list": False,
+            "item_list_len": 0,
+        }
+    return result if isinstance(result, dict) else {
+        "ssr_universal_len": 0,
+        "ssr_scope_keys": [],
+        "ssr_has_user_info": False,
+        "ssr_has_post_list": False,
+        "item_list_len": 0,
+    }
+
+
 def extract_posts_from_profile_page(page: Any, profile_url: str = "") -> list[dict]:
     """Lit #__UNIVERSAL_DATA_FOR_REHYDRATION__ / SIGI_STATE depuis la page profil."""
     # Preferer parse in-browser (fiable pour payloads ~255KB).

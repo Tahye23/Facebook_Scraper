@@ -17,7 +17,9 @@ import json
 import os
 import queue
 import random
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -35,6 +37,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from logging_setup import get_logger, with_context
+from chrome_watchdog import kill_process_tree, start_chrome_watchdog
 from scraper import get_proxy_pool, pick_replacement_proxy, scrape_tiktok_page
 from scraper import _is_blacklisted as is_proxy_blacklisted
 from scraper import _proxy_identity as proxy_identity
@@ -48,6 +51,151 @@ from video_analysis import (
 
 
 LOGGER = get_logger(__name__, platform="tiktok", service="worker")
+
+_SCRAPE_RUNNER = Path(__file__).resolve().parent / "scrape_job_runner.py"
+
+
+def _job_hard_timeout_s() -> float:
+    """Budget dur worker: kill process scrape+Chrome apres N secondes.
+
+    Defaut 90s (>= attempt budget scraper ~45s + marge). Env: TIKTOK_JOB_HARD_TIMEOUT_S.
+    """
+    raw = (os.getenv("TIKTOK_JOB_HARD_TIMEOUT_S") or "90").strip()
+    try:
+        return max(45.0, float(raw))
+    except ValueError:
+        return 90.0
+
+
+def _env_bool_local(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _scrape_with_hard_timeout(**kwargs) -> dict:
+    """Execute scrape dans un subprocess isole; kill tree au timeout (1.1).
+
+    Fallback in-process (thread) si TIKTOK_SCRAPE_SUBPROCESS=false.
+    `on_post` n'est pas propage au subprocess — les posts sont publies
+    depuis le resultat final (comportement deja present cote worker).
+    """
+    timeout_s = _job_hard_timeout_s()
+    if not _env_bool_local("TIKTOK_SCRAPE_SUBPROCESS", True):
+        return _scrape_with_thread_timeout(timeout_s, **kwargs)
+
+    # on_post non serialisable — ignore volontairement en subprocess.
+    job = {
+        "url": kwargs.get("url"),
+        "max_posts": kwargs.get("max_posts", 20),
+        "max_age_hours": kwargs.get("max_age_hours"),
+        "analyze_video_content": bool(kwargs.get("analyze_video_content") or False),
+        "headless_override": kwargs.get("headless_override"),
+        "proxy_override": kwargs.get("proxy_override"),
+    }
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="tiktok_scrape_"))
+    in_path = tmp_dir / "job.json"
+    out_path = tmp_dir / "result.json"
+    in_path.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+
+    cmd = [
+        sys.executable,
+        str(_SCRAPE_RUNNER),
+        "--input",
+        str(in_path),
+        "--output",
+        str(out_path),
+    ]
+    popen_kwargs: dict = {
+        "cwd": str(Path(__file__).resolve().parent),
+        "env": os.environ.copy(),
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if sys.platform == "win32":
+        # Nouveau process group Windows pour taskkill /T.
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+    LOGGER.info(
+        "[PERF] scrape subprocess pid=%s timeout=%.0fs url=%s",
+        proc.pid,
+        timeout_s,
+        str(kwargs.get("url") or "")[:80],
+    )
+    try:
+        proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        LOGGER.error(
+            "[PERF] HARD TIMEOUT %.0fs — killing scrape process tree pid=%s",
+            timeout_s,
+            proc.pid,
+            extra={"url": kwargs.get("url")},
+        )
+        kill_process_tree(proc.pid)
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        return {
+            "posts": [],
+            "total": 0,
+            "error": "proxy_blocked:attempt_timeout",
+            "error_detail": f"worker_hard_timeout_kill_{int(timeout_s)}s",
+            "classification": "attempt_timeout",
+            "classification_action": "rotate_identity",
+            "classification_reason": "worker_hard_timeout_process_kill",
+            "url": kwargs.get("url"),
+        }
+
+    if out_path.exists():
+        try:
+            result = json.loads(out_path.read_text(encoding="utf-8"))
+            if isinstance(result, dict):
+                return result
+        except Exception:
+            LOGGER.warning("Failed to parse scrape subprocess result", exc_info=True)
+
+    return {
+        "posts": [],
+        "total": 0,
+        "error": f"scrape_subprocess_exit_{proc.returncode}",
+        "url": kwargs.get("url"),
+    }
+
+
+def _scrape_with_thread_timeout(timeout_s: float, **kwargs) -> dict:
+    """Fallback legacy: thread + abandon (pas de kill Chrome)."""
+    # Retirer on_post si present pour homogeniser avec subprocess.
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(scrape_tiktok_page, **kwargs)
+        try:
+            result = future.result(timeout=timeout_s)
+            return result if isinstance(result, dict) else {"posts": [], "error": "invalid_result"}
+        except FuturesTimeoutError:
+            LOGGER.error(
+                "[PERF] HARD TIMEOUT %.0fs — abandoning scrape thread (no process kill)",
+                timeout_s,
+                extra={"url": kwargs.get("url")},
+            )
+            return {
+                "posts": [],
+                "total": 0,
+                "error": "proxy_blocked:attempt_timeout",
+                "error_detail": f"worker_hard_timeout_thread_{int(timeout_s)}s",
+                "classification": "attempt_timeout",
+                "url": kwargs.get("url"),
+            }
+    finally:
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            executor.shutdown(wait=False)
 
 
 def _load_env_file():
@@ -1464,7 +1612,7 @@ def _process_csv_batch_task(
         """
         result = None
         for attempt in range(1, attempts + 1):
-            result = scrape_tiktok_page(
+            result = _scrape_with_hard_timeout(
                 url=page_url,
                 max_posts=max_posts_per_page,
                 max_age_hours=time_window_hours,
@@ -1479,7 +1627,11 @@ def _process_csv_batch_task(
                 break
 
             error_code = str(result.get("error") or "").strip().lower()
-            if error_code not in {"challenge_detected", "no_posts_found"}:
+            if error_code not in {
+                "challenge_detected",
+                "no_posts_found",
+                "empty_feed_or_softblock",
+            }:
                 break
 
             if attempt < attempts:
@@ -1883,41 +2035,37 @@ def on_message(channel, method, properties, body):
         result: dict = {}
         for attempt in range(1, job_max_attempts + 1):
             post_queue = queue.Queue()
-            done_event = threading.Event()
-            worker_result = {"value": None, "error": None}
 
             def on_post(post: dict):
                 post_queue.put(post)
 
-            def run_scrape():
-                try:
-                    scoped_logger.info("Starting scrape thread", extra={"attempt": attempt})
-                    worker_result["value"] = scrape_tiktok_page(
-                        url=url,
-                        max_posts=max_posts,
-                        on_post=on_post,
-                        analyze_video_content=False,
-                    )
-                except Exception as exc:
-                    scoped_logger.exception("Scrape thread failed")
-                    worker_result["error"] = exc
-                finally:
-                    done_event.set()
+            scoped_logger.info(
+                "Starting scrape with hard timeout=%.0fs",
+                _job_hard_timeout_s(),
+                extra={"attempt": attempt},
+            )
+            # Phase 2: ThreadPoolExecutor + timeout dur (plus de hang infini).
+            # Les posts streamés via on_post sont drainés apres le retour.
+            try:
+                result = _scrape_with_hard_timeout(
+                    url=url,
+                    max_posts=max_posts,
+                    on_post=on_post,
+                    analyze_video_content=False,
+                )
+            except Exception:
+                scoped_logger.exception("Scrape failed")
+                raise
 
-            threading.Thread(target=run_scrape, daemon=True).start()
-
+            # Vider la file des posts publies pendant le scrape.
             while True:
                 try:
-                    post = post_queue.get(timeout=0.5)
+                    post = post_queue.get_nowait()
                     _publish_post_if_new(post)
                 except queue.Empty:
-                    if done_event.is_set():
-                        break
+                    break
 
-            if worker_result["error"] is not None:
-                raise worker_result["error"]
-
-            result = worker_result["value"] or {}
+            result = result or {}
             for post in result.get("posts") or []:
                 _publish_post_if_new(post)
 
@@ -2122,6 +2270,12 @@ def main():
     Declare exchange/queues/bindings, configure la QoS, puis demarre la
     consommation des messages TikTok jusqu'a interruption.
     """
+    # Filet de securite: tue Chrome orphelins (parent mort / PPID=1).
+    try:
+        start_chrome_watchdog()
+    except Exception:
+        LOGGER.debug("chrome watchdog failed to start", exc_info=True)
+
     connection = connect_with_retry()
     channel = connection.channel()
 

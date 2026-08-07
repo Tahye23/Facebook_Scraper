@@ -109,14 +109,9 @@ services:
       - scraper_net
 
   # ─── Worker TikTok ─────────────────────────────────────────────────────────
-  # Reste desormais sur le reseau bridge "scraper_net" comme les autres
-  # services: la rotation d'IP se fait via TIKTOK_PROXY_LIST (proxies
-  # Webshare externes, joignables depuis n'importe quel reseau Docker), donc
-  # on n'a plus besoin de network_mode: "host" pour atteindre un proxy local
-  # sur 127.0.0.1 (l'ancienne rotation IPv6, desactivee par defaut - voir .env).
-  # Si vous reactivez un jour tools/ipv6_rotating_proxy.py sur l'hote, remettez
-  # `network_mode: "host"` (et RABBITMQ_HOST: 127.0.0.1) a la place de
-  # "networks"/"RABBITMQ_HOST: rabbitmq" ci-dessous.
+  # Reseau bridge "scraper_net". Rotation IP via Webshare Rotating Residential
+  # (TIKTOK_PROXY_MODE=rotate, http://p.webshare.io:80) — plus de pool 20k.
+  # network_mode: host seulement si proxy IPv6 local reactive (voir .env).
   worker-tiktok:
     build:
       context: .
@@ -160,9 +155,9 @@ services:
       # Cookies globaux (legacy / fallback hors sticky). En mode sticky on
       # prefere cookies.json DANS chaque dossier de session.
       - "./platform/tiktok scraper/tiktok_cookies.json:/app/platform/tiktok-scraper/tiktok_cookies.json:ro"
-      # Pool Webshare 20k sessions (lu a la volee, sample aleatoire par job).
+      # Legacy pool 20k (ignore si TIKTOK_PROXY_MODE=rotate).
       - "./platform/tiktok scraper/webshare_residential_proxies.txt:/app/platform/tiktok-scraper/webshare_residential_proxies.txt:ro"
-      # Blacklist persistante des proxies en cooldown 24h.
+      # Blacklist locale (desactivee en mode rotate).
       - "./platform/tiktok scraper/proxy_blacklist.json:/app/platform/tiktok-scraper/proxy_blacklist.json"
       - "./logs:/app/logs"
     # Xvfb = ecran virtuel pour Chrome headed (anti-bot moins agressif qu'headless).

@@ -5,6 +5,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote, urlparse, urlsplit, urlunsplit
 
@@ -19,6 +20,34 @@ if str(REPO_ROOT) not in sys.path:
 
 from logging_setup import get_logger, with_context
 import sticky_sessions
+from browser_session import (
+    AntibotBlockedException,
+    ProxyBlockedException,
+    browser_launch_args,
+    force_www_tiktok_url,
+    goto_catch_http,
+    goto_strict,
+    install_webdriver_mask,
+    is_antibot_http_status,
+    is_http_blocked_status,
+    is_http_nav_failure,
+    is_proxy_auth_error,
+    nav_timeout_ms,
+    parse_playwright_proxy,
+    prepare_virgin_sticky_for_next_ip,
+    purge_sticky_after_failure,
+    raise_antibot_blocked,
+    raise_proxy_blocked,
+    sanitize_playwright_proxy,
+)
+from oembed import fetch_oembed_fallback
+from profile_extractor import (
+    extract_posts_from_hydration,
+    extract_posts_from_hydration_payload,
+    extract_posts_from_profile_page,
+    post_has_usable_metrics,
+)
+from tiktok_parser import normalize_www_tiktok_url, posts_have_profile_metrics
 
 
 COOKIES_FILE = "tiktok_cookies.json"
@@ -160,15 +189,22 @@ def load_cookies() -> list:
 
 
 def _normalize_profile_url(url: str) -> str:
-    """Valide et nettoie une URL TikTok de profil.
-
-    Retourne une URL sans query string ni fragment pour eviter les doublons.
-    """
-    parsed = urlparse(url)
-    if "tiktok.com" not in parsed.netloc:
+    """Valide et nettoie une URL TikTok de profil (www uniquement, jamais m.)."""
+    # Interdit m.tiktok.com (404 natif) → www + username minuscule.
+    forced = force_www_tiktok_url(url) or url
+    normalized = normalize_www_tiktok_url(forced)
+    parsed = urlparse(normalized or forced)
+    if "tiktok.com" not in (parsed.netloc or "").lower():
         raise ValueError("URL TikTok invalide")
-    clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
-    return clean
+    username = ""
+    for segment in (parsed.path or "").split("/"):
+        if segment.startswith("@"):
+            username = segment[1:].lower()
+            break
+    if username:
+        return f"https://www.tiktok.com/@{username}"
+    clean = f"https://www.tiktok.com{(parsed.path or '').rstrip('/')}"
+    return clean or "https://www.tiktok.com"
 
 
 def _username_from_url(url: str) -> str:
@@ -194,25 +230,50 @@ def _card_belongs_to_profile(card: dict, target_username: str) -> bool:
     conserve en memoire les videos du feed d'accueil charge pendant le warmup,
     et `_extract_video_cards` les remonte sans distinction d'auteur. On ne
     conserve donc un post que si:
+    - source reseau profile-grid (`_source=network_api`) apres clear homepage, ou
     - son auteur correspond au handle cible (insensible a la casse), ou
     - son `post_url` contient `/@<handle>/` (grille du profil), ou
     - on ne connait pas le handle cible (target vide -> on ne filtre pas).
 
-    Les posts sans auteur ET sans handle dans l'URL sont consideres ambigus et
-    rejetes en mode filtre (ils proviennent quasi toujours de l'etat "For You").
+    Les posts DOM/SSR sans auteur ET sans handle dans l'URL sont rejetes.
     """
     if not target_username:
+        return True
+
+    # Posts interceptes via /api/preload|post/item_list/ sur le profil: fiables
+    # (le buffer homepage a ete vide avant la nav profil).
+    if str(card.get("_source") or "") == "network_api":
         return True
 
     author = str(card.get("author") or "").strip().lower()
     if author and author == target_username:
         return True
 
-    post_url = str(card.get("post_url") or "").strip().lower()
+    post_url = str(card.get("post_url") or card.get("video_url") or "").strip().lower()
     if f"/@{target_username}/" in post_url:
         return True
 
     return False
+
+
+def _stamp_network_api_post(card: dict, target_username: str) -> dict:
+    """Normalise un post capture via XHR grille profil (auteur + URL + source)."""
+    out = dict(card) if isinstance(card, dict) else {}
+    out["_source"] = "network_api"
+    handle = (target_username or "").strip().lstrip("@").lower()
+    author = str(out.get("author") or "").strip().lstrip("@")
+    if not author and handle:
+        out["author"] = handle
+        author = handle
+    post_id = str(out.get("post_id") or out.get("id") or "").strip()
+    if post_id and not out.get("post_url"):
+        if author:
+            out["post_url"] = f"https://www.tiktok.com/@{author}/video/{post_id}"
+        else:
+            out["post_url"] = f"https://www.tiktok.com/video/{post_id}"
+    if post_id and not out.get("post_id"):
+        out["post_id"] = post_id
+    return out
 
 
 def _video_signature(video: dict) -> str:
@@ -234,44 +295,363 @@ def _human_pause(base: float = 1.0, jitter: float = 0.6):
 
 
 def _install_stealth_scripts(context):
-    """Injecte un script de camouflage navigateur au demarrage des pages.
+    """Injecte le camouflage anti-empreinte AVANT creation de page / navigation.
 
-    But: reduire quelques signaux anti-bot evidents sans ajouter de dependances
-    lourdes.
+    Couvre webdriver, chrome.app, languages, plugins, permissions.
+    Toujours applique (sticky virgin inclus) — pas d'opt-out par defaut.
     """
-    # Keep this lightweight to reduce easy bot fingerprints without heavy dependencies.
+    install_webdriver_mask(context)
     context.add_init_script(
         """
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-        Object.defineProperty(navigator, 'language', { get: () => 'en-US' });
-        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4] });
-        window.chrome = window.chrome || { runtime: {} };
+        (() => {
+          try { Object.defineProperty(navigator, 'platform', { get: () => 'Win32' }); } catch (e) {}
+          try { Object.defineProperty(navigator, 'language', { get: () => 'en-US' }); } catch (e) {}
+          try { Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] }); } catch (e) {}
+          try {
+            Object.defineProperty(navigator, 'plugins', {
+              get: () => [1, 2, 3, 4, 5],
+            });
+          } catch (e) {}
+          try {
+            Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
+          } catch (e) {}
+          try {
+            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+          } catch (e) {}
+        })();
         """
     )
 
 
+def _force_direct_mode() -> bool:
+    """True = IP locale, proxy=None (TIKTOK_FORCE_DIRECT=true)."""
+    return _env_bool("TIKTOK_FORCE_DIRECT", False)
+
+
+def _diag_softblock_enabled() -> bool:
+    """Logs diagnostiques soft-block (IP, cookies, HTTP profil, hydration)."""
+    return _env_bool("TIKTOK_DIAG_SOFTBLOCK", True)
+
+
+def _is_webshare_proxy_host(host_or_url: str) -> bool:
+    """True pour hosts Webshare (datacenter OU residentiel).
+
+    Exemples acceptes:
+      - p.webshare.io
+      - p.residential.webshare.io
+      - *.residential.webshare.io
+    """
+    h = (host_or_url or "").strip().lower()
+    if not h:
+        return False
+    return "webshare.io" in h
+
+
+def _rotating_proxy_mode() -> bool:
+    """True si Webshare Rotating Proxy Endpoint (plus de pool 20k).
+
+    Active via TIKTOK_PROXY_MODE=rotate (defaut recommande) ou auto-detect
+    username `*-rotate` / host Webshare (datacenter ou residentiel).
+    """
+    if _force_direct_mode():
+        return False
+    mode = (os.getenv("TIKTOK_PROXY_MODE") or "rotate").strip().lower()
+    if mode in ("rotate", "rotating", "endpoint"):
+        return True
+    if mode in ("sticky", "list", "file", "pool"):
+        return False
+    username = (os.getenv("TIKTOK_PROXY_USERNAME") or "").strip().lower()
+    server = (os.getenv("TIKTOK_PROXY_SERVER") or os.getenv("TIKTOK_PROXY_URL") or "").strip().lower()
+    host = (os.getenv("TIKTOK_PROXY_HOST") or "").strip().lower()
+    if username.endswith("-rotate") or "-rotate" in username:
+        return True
+    if _is_webshare_proxy_host(server) or _is_webshare_proxy_host(host):
+        return True
+    return False
+
+
+def _blacklist_enabled() -> bool:
+    """Blacklist locale desactivee en mode rotate / force-direct."""
+    if _force_direct_mode() or _rotating_proxy_mode():
+        return False
+    return _env_bool("TIKTOK_PROXY_BLACKLIST_ENABLED", True)
+
+
+def _is_real_chrome_channel(channel: str | None = None) -> bool:
+    ch = (channel if channel is not None else (os.getenv("TIKTOK_BROWSER_CHANNEL") or "")).strip().lower()
+    return ch.startswith("chrome") or ch.startswith("msedge")
+
+
+def _force_http_playwright_proxy(
+    *,
+    host: str,
+    port: int | None,
+    username: str,
+    password: str,
+    source_scheme: str = "",
+) -> dict:
+    """Normalise vers le format Playwright HTTP avec auth separee.
+
+    Chromium refuse l'auth SOCKS5:
+      "Browser does not support socks5 proxy authentication"
+    Toute URL socks5://…:1080 (Webshare) → http://host:80.
+    """
+    return sanitize_playwright_proxy(
+        {
+            "server": f"http://{host}:{int(port) if port else 80}",
+            "username": username,
+            "password": password,
+            "_scheme": source_scheme or "http",
+        }
+    ) or {"server": f"http://{host}:{int(port) if port else 80}"}
+
+
+def _parse_proxy_url_env() -> dict | None:
+    """Parse PROXY_URL / TIKTOK_PROXY_URL → dict Playwright (server + user + pass)."""
+    return parse_playwright_proxy(None)
+
+
+def _webshare_username_base(raw_username: str) -> str:
+    """Extrait le username Webshare de base (sans -rotate / -us / session).
+
+    Docs: https://apidocs.webshare.io/proxy-connection
+      sdwopfmy-rotate      → sdwopfmy
+      sdwopfmy-us-1234     → sdwopfmy
+    """
+    u = (raw_username or "").strip()
+    if not u:
+        return "sdwopfmy"
+    lower = u.lower()
+    if "-rotate" in lower:
+        return u[: lower.index("-rotate")].rstrip("-") or "sdwopfmy"
+    parts = u.split("-")
+    # base-country[-session|-city_...]
+    if len(parts) >= 2 and len(parts[1]) == 2 and parts[1].isalpha():
+        return parts[0] or "sdwopfmy"
+    return u
+
+
+def _webshare_sticky_countries() -> list[str]:
+    """Pays cibles (ISO-2) pour sticky Webshare — defaut US/EU."""
+    raw = (os.getenv("TIKTOK_PROXY_COUNTRIES") or "us,fr,de,gb").strip()
+    countries = [
+        c.strip().lower()
+        for c in raw.replace(";", ",").split(",")
+        if c.strip() and len(c.strip()) == 2
+    ]
+    return countries or ["us"]
+
+
+def _assign_webshare_sticky_session(proxy_cfg: dict | None) -> dict | None:
+    """Force sticky session Webshare: MEME IP pour warmup + profil.
+
+    Format officiel (NE PAS combiner avec -rotate):
+      {base}-{country}-{session_id}
+      ex: sdwopfmy-us-84729103
+
+    -rotate change d'IP a CHAQUE requete HTTP → cookies ttwid/msToken
+    emis sur IP A, profil vu depuis IP B → squelette / WAF.
+    Sticky = 1 session_id = 1 IP pour toute la duree du browser.
+    """
+    if not proxy_cfg:
+        return None
+    if not _env_bool("TIKTOK_PROXY_STICKY_SESSION", True):
+        return proxy_cfg
+
+    out = dict(proxy_cfg)
+    base = _webshare_username_base(str(out.get("username") or ""))
+    country = random.choice(_webshare_sticky_countries())
+    # Session ID numerique (doc Webshare: username-us-1234).
+    session_id = str(random.randint(10_000_000, 99_999_999))
+    sticky_user = f"{base}-{country}-{session_id}"
+    out["username"] = sticky_user
+    # Conserve le pays pour aligner locale/timezone Playwright (etape 2).
+    out["_sticky_country"] = country
+    sanitized = sanitize_playwright_proxy(out) or out
+    if isinstance(sanitized, dict):
+        sanitized["_sticky_country"] = country
+    LOGGER.info(
+        "Webshare STICKY session — same IP for warmup+profile "
+        "(not -rotate; new session_id = new IP next attempt)",
+        extra={"url": f"user={sticky_user}"},
+    )
+    return sanitized
+
+
+# Geo Playwright aligne sur le pays sticky (locale / TZ / Accept-Language).
+# Mis a jour au debut de chaque tentative scrape.
+_ACTIVE_BROWSER_GEO: dict = {
+    "country": "us",
+    "locale": "en-US",
+    "timezone_id": "America/New_York",
+    "accept_language": "en-US,en;q=0.9",
+    "geolocation": {"longitude": -74.006, "latitude": 40.7128},
+}
+
+_GEO_BY_COUNTRY: dict[str, dict] = {
+    "us": {
+        "locale": "en-US",
+        "timezone_id": "America/New_York",
+        "accept_language": "en-US,en;q=0.9",
+        "geolocation": {"longitude": -74.006, "latitude": 40.7128},
+    },
+    "fr": {
+        "locale": "fr-FR",
+        "timezone_id": "Europe/Paris",
+        "accept_language": "fr-FR,fr;q=0.9,en;q=0.8",
+        "geolocation": {"longitude": 2.3522, "latitude": 48.8566},
+    },
+    "de": {
+        "locale": "de-DE",
+        "timezone_id": "Europe/Berlin",
+        "accept_language": "de-DE,de;q=0.9,en;q=0.8",
+        "geolocation": {"longitude": 13.405, "latitude": 52.52},
+    },
+    "gb": {
+        "locale": "en-GB",
+        "timezone_id": "Europe/London",
+        "accept_language": "en-GB,en;q=0.9",
+        "geolocation": {"longitude": -0.1276, "latitude": 51.5074},
+    },
+    "uk": {
+        "locale": "en-GB",
+        "timezone_id": "Europe/London",
+        "accept_language": "en-GB,en;q=0.9",
+        "geolocation": {"longitude": -0.1276, "latitude": 51.5074},
+    },
+}
+
+
+def _sticky_country_from_proxy(proxy_cfg: dict | None) -> str:
+    """Extrait le code pays ISO-2 depuis sticky username ou `_sticky_country`."""
+    if not proxy_cfg:
+        return "us"
+    tagged = str(proxy_cfg.get("_sticky_country") or "").strip().lower()
+    if len(tagged) == 2:
+        return tagged
+    username = str(proxy_cfg.get("username") or "").strip().lower()
+    # Formats: base-us-84729103 | base-us-rotate | base-us
+    parts = username.split("-")
+    if len(parts) >= 2 and len(parts[1]) == 2 and parts[1].isalpha():
+        return parts[1]
+    return "us"
+
+
+def _browser_geo_for_country(country: str) -> dict:
+    """Mappe un pays sticky vers locale / timezone / Accept-Language / geoloc."""
+    cc = (country or "us").strip().lower() or "us"
+    base = dict(_GEO_BY_COUNTRY.get(cc) or _GEO_BY_COUNTRY["us"])
+    base["country"] = cc if cc in _GEO_BY_COUNTRY else "us"
+    return base
+
+
+def _set_active_browser_geo(geo: dict | None) -> None:
+    global _ACTIVE_BROWSER_GEO
+    if not geo:
+        return
+    _ACTIVE_BROWSER_GEO = dict(geo)
+
+
+def _active_accept_language() -> str:
+    return str(
+        _ACTIVE_BROWSER_GEO.get("accept_language") or "en-US,en;q=0.9"
+    )
+
+
+def _build_rotating_proxy_config() -> dict | None:
+    """Config de base Playwright pour endpoint Webshare p.webshare.io:80.
+
+    Le username final sticky (country+session) est assigne par
+    `_assign_webshare_sticky_session` a chaque tentative.
+    """
+    if _env_bool("TIKTOK_PROXY_PREFER_SOCKS5", False):
+        LOGGER.warning(
+            "TIKTOK_PROXY_PREFER_SOCKS5=true ignored — Chromium requires HTTP proxy auth"
+        )
+
+    parsed = _parse_proxy_url_env()
+    if parsed:
+        # Normaliser: garder server/password, base username sans -rotate.
+        base = _webshare_username_base(str(parsed.get("username") or ""))
+        parsed = dict(parsed)
+        parsed["username"] = base
+        server = str(parsed.get("server") or "")
+        LOGGER.info(
+            "Webshare proxy base ready (sticky sessions applied per attempt)",
+            extra={
+                "url": server,
+                "post_id": "user_base=" + base,
+            },
+        )
+        return sanitize_playwright_proxy(parsed) or parsed
+
+    username = _webshare_username_base(
+        (os.getenv("TIKTOK_PROXY_USERNAME") or "sdwopfmy").strip()
+    )
+    password = os.getenv("TIKTOK_PROXY_PASSWORD") or ""
+    host = (
+        os.getenv("TIKTOK_PROXY_HOST") or "p.webshare.io"
+    ).strip() or "p.webshare.io"
+    try:
+        port = int((os.getenv("TIKTOK_PROXY_PORT") or "80").strip() or "80")
+    except ValueError:
+        port = 80
+
+    proxy = sanitize_playwright_proxy(
+        {"server": f"http://{host}:{port}", "username": username, "password": password}
+    )
+    LOGGER.info(
+        "Webshare proxy base ready (sticky sessions applied per attempt)",
+        extra={"url": str((proxy or {}).get("server") or "")},
+    )
+    return proxy
+
+
 def _build_proxy_config() -> dict | None:
-    """Construit une configuration proxy unique a partir des variables env."""
+    """Construit la config proxy unique (rotate endpoint ou PROXY_SERVER legacy)."""
+    if _rotating_proxy_mode():
+        return _build_rotating_proxy_config()
+
+    parsed = _parse_proxy_url_env()
+    if parsed:
+        return parsed
+
     server = (os.getenv("TIKTOK_PROXY_SERVER") or "").strip()
     if not server:
         return None
 
-    proxy = {"server": server}
-    username = (os.getenv("TIKTOK_PROXY_USERNAME") or "").strip()
-    password = os.getenv("TIKTOK_PROXY_PASSWORD") or ""
-    if username:
-        proxy["username"] = username
-        proxy["password"] = password
-    return proxy
+    # Forcer HTTP meme si server etait socks5://…
+    source_scheme = "http"
+    try:
+        parsed_srv = urlsplit(server if "://" in server else f"http://{server}")
+        host = parsed_srv.hostname or server
+        port = parsed_srv.port
+        username = unquote(parsed_srv.username) if parsed_srv.username else ""
+        password = unquote(parsed_srv.password) if parsed_srv.password is not None else ""
+        source_scheme = parsed_srv.scheme or "http"
+    except Exception:
+        host = server
+        port = None
+        username = ""
+        password = ""
+    if not username:
+        username = (os.getenv("TIKTOK_PROXY_USERNAME") or "").strip()
+    if not password:
+        password = os.getenv("TIKTOK_PROXY_PASSWORD") or ""
+    return _force_http_playwright_proxy(
+        host=host,
+        port=port,
+        username=username,
+        password=password,
+        source_scheme=source_scheme,
+    )
 
 
 def _proxy_identity(proxy_cfg: dict | None) -> str:
-    """Cle stable d'un proxy pour blacklist / dedup.
+    """Cle stable d'un proxy pour logs / sticky / dedup.
 
-    Pour Webshare sticky (`sdwopfmy-N`), le username est l'identite IP.
-    Fallback: server + username.
+    Rotate: username `…-rotate` (Webshare change l'IP a chaque session).
+    Sticky legacy: username `sdwopfmy-N` = 1 IP.
     """
     if not proxy_cfg:
         return "direct"
@@ -333,18 +713,24 @@ def _save_blacklist(data: dict) -> None:
 
 
 def _is_blacklisted(proxy_cfg: dict | None) -> bool:
-    if not proxy_cfg:
+    if not proxy_cfg or not _blacklist_enabled():
         return False
     with _PROXY_BLACKLIST_LOCK:
         return _proxy_identity(proxy_cfg) in _load_blacklist()
 
 
 def _blacklist_proxy(proxy_cfg: dict | None, reason: str, hours: int | None = None) -> None:
-    """Met un proxy en cooldown.
+    """Met un proxy en cooldown. No-op en mode rotating endpoint Webshare.
 
     `hours` override le defaut env. Soft-block (no_posts) = cooldown court;
     auth/tunnel morts = cooldown long.
     """
+    if not _blacklist_enabled():
+        LOGGER.info(
+            "Blacklist skipped (Webshare rotating endpoint — IP rotation is provider-side)",
+            extra={"error": reason, "url": _describe_proxy(proxy_cfg) if proxy_cfg else "n/a"},
+        )
+        return
     if not proxy_cfg:
         return
     if hours is None:
@@ -365,6 +751,22 @@ def _blacklist_proxy(proxy_cfg: dict | None, reason: str, hours: int | None = No
 
 def _blacklist_hours_for_reason(reason: str) -> int:
     err = (reason or "").strip().lower()
+    # Timeout TLS / HTTP antibot: cooldown long (24h) — IP brulee.
+    if any(
+        tok in err
+        for tok in (
+            "tls_timeout",
+            "proxy_blocked",
+            "err_timed_out",
+            "timeout",
+            "http_403",
+            "http 403",
+            "err_http_response_code_failure",
+            "429",
+            "503",
+        )
+    ):
+        return max(1, _env_int("TIKTOK_PROXY_BLACKLIST_HOURS", 24))
     if "no_posts_found" in err or "challenge_detected" in err:
         return max(1, _env_int("TIKTOK_PROXY_BLACKLIST_SOFT_HOURS", 2))
     if "invalid_auth" in err:
@@ -377,7 +779,10 @@ def _should_blacklist_error(error_code: str) -> bool:
 
     Les collisions de profil Chrome (SingletonLock) ne blacklisent PAS le proxy:
     l'IP est saine, seul le dossier session est momentanement pris.
+    Mode rotate: toujours False (blacklist locale desactivee).
     """
+    if not _blacklist_enabled():
+        return False
     err = (error_code or "").strip().lower()
     if _is_profile_lock_error(err):
         return False
@@ -404,6 +809,21 @@ def _is_profile_lock_error(error_code: str) -> bool:
     )
 
 
+def _is_fatal_proxy_auth_error(error_code: str) -> bool:
+    """Auth/tunnel proxy: ne pas boucler sur la meme credential (abort retries)."""
+    err = (error_code or "").strip().lower()
+    return any(
+        tok in err
+        for tok in (
+            "proxy_blocked:auth",
+            "err_proxy_connection_failed",
+            "err_invalid_auth",
+            "invalid_auth_credentials",
+            "proxy authentication",
+        )
+    )
+
+
 def _is_retryable_soft_error(error_code: str) -> bool:
     """Erreurs pour lesquelles on doit retenter / changer de proxy (pas abandonner).
 
@@ -411,16 +831,26 @@ def _is_retryable_soft_error(error_code: str) -> bool:
     another navigation") qui ne contiennent pas `net::ERR_...` mais sont
     typiques d'un anti-bot / redirect TikTok — sans ca, on arretait apres
     1 seul proxy au lieu d'essayer les 4.
+
+    Auth proxy (ERR_PROXY_CONNECTION_FAILED): NON retryable ici — le caller
+    abort pour ne pas boucler sur la meme credential.
     """
     err = (error_code or "").strip().lower()
     if not err:
         return False
+    if _is_fatal_proxy_auth_error(err):
+        return False
     if err in {
         "challenge_detected",
         "no_posts_found",
+        "proxy_blocked",
+        "proxy_soft_blocked",
         "all_proxies_blocked",
         "sticky_profile_in_use",
+        "antibot_blocked",
     }:
+        return True
+    if "proxy_blocked" in err or "proxy_soft_blocked" in err or "antibot" in err:
         return True
     if _is_profile_lock_error(err):
         return True
@@ -430,11 +860,14 @@ def _is_retryable_soft_error(error_code: str) -> bool:
         "err_http_response_code_failure",
         "err_connection",
         "err_tunnel",
-        "err_proxy",
         "err_aborted",
         "err_name_not_resolved",
         "err_address_unreachable",
         "403",
+        "404",
+        "405",
+        "429",
+        "503",
         "interrupted by another navigation",
         "navigation to",
         "page.goto",
@@ -443,6 +876,10 @@ def _is_retryable_soft_error(error_code: str) -> bool:
         "browser has been closed",
         "connection closed",
         "launch_persistent_context",
+        "http_404",
+        "http_403",
+        "http_429",
+        "http_503",
     )
     return any(tok in err for tok in tokens)
 
@@ -459,11 +896,14 @@ def _resolve_proxy_file_path() -> Path | None:
 
 
 def _iter_proxy_specs_from_sources() -> list[str]:
-    """Collecte les specs proxy: fichier 20k + TIKTOK_PROXY_LIST + PROXY_SERVER.
+    """Collecte les specs proxy (mode legacy pool fichier / LIST).
 
-    On NE met PAS les 20k dans le .env: le fichier est lu a la volee, puis on
-    tire un echantillon aleatoire (voir `_select_proxy_candidates`).
+    En mode rotate, cette liste n'est PAS utilisee — voir
+    `_build_rotating_proxy_config`.
     """
+    if _rotating_proxy_mode():
+        return []
+
     specs: list[str] = []
 
     proxy_file = _resolve_proxy_file_path()
@@ -513,15 +953,47 @@ def _parse_all_proxies() -> list[dict]:
 
 
 def _select_proxy_candidates(limit: int | None = None) -> list[dict | None]:
-    """Tire N proxies NON blacklists.
+    """Candidats proxy pour un job.
 
-    Modele cookies-par-IP:
-      1) Preferer les IP qui ont DEJA un slot cookies valide sur disque
-      2) Completer avec de nouvelles IP du pool sticky (seront chauffees a
-         l'usage; si plafond de slots atteint -> LRU remplace le plus ancien)
+    Mode rotate (defaut): endpoint Webshare unique repete N fois — chaque
+    tentative ouvre une session navigateur neuve; Webshare fournit une nouvelle
+    IP residentielle. Warmup homepage conserve sur chaque tentative.
+
+    Mode legacy (TIKTOK_PROXY_MODE=pool): echantillon depuis fichier 20k.
     """
+    if _force_direct_mode():
+        LOGGER.warning(
+            "TIKTOK_FORCE_DIRECT=true — scraping via IP locale (proxy=None, no rotation)"
+        )
+        return [None]
+
     if limit is None:
-        limit = max(1, _env_int("TIKTOK_PROXY_MAX_PER_JOB", 4))
+        limit = max(
+            1,
+            _env_int("MAX_PROXY_RETRIES", 0) or _env_int("TIKTOK_PROXY_MAX_PER_JOB", 5),
+        )
+
+    if _rotating_proxy_mode():
+        cfg = _build_rotating_proxy_config()
+        if cfg is None:
+            LOGGER.warning("Rotating proxy mode enabled but no proxy config resolved")
+            return [None]
+        # N sticky sessions distinctes (= N IPs fixes warmup+profil, pays US/EU).
+        selected = [_assign_webshare_sticky_session(dict(cfg)) for _ in range(limit)]
+        countries = ",".join(_webshare_sticky_countries())
+        LOGGER.info(
+            "Using Webshare STICKY sessions (same IP warmup+profile; rotate session_id on fail)",
+            extra={
+                "post_id": None,
+                "url": (
+                    f"server={cfg.get('server')} base_user={cfg.get('username')} "
+                    f"countries={countries} attempts={limit} sticky=on"
+                ),
+            },
+        )
+        if _env_bool("TIKTOK_TRY_DIRECT_AFTER_PROXIES", False):
+            selected = list(selected) + [None]
+        return selected
 
     pool = _parse_all_proxies()
     if not pool:
@@ -534,7 +1006,7 @@ def _select_proxy_candidates(limit: int | None = None) -> list[dict | None]:
             by_id[identity] = proxy
 
     with _PROXY_BLACKLIST_LOCK:
-        blocked = set(_load_blacklist().keys())
+        blocked = set(_load_blacklist().keys()) if _blacklist_enabled() else set()
 
     available = [p for p in pool if _proxy_identity(p) not in blocked]
     if not available:
@@ -544,8 +1016,6 @@ def _select_proxy_candidates(limit: int | None = None) -> list[dict | None]:
         )
         available = pool
 
-    # Pool sticky dedie optionnel: priorise les N premieres sessions du fichier,
-    # mais SI trop peu restent (blacklist), complete depuis le reste du pool.
     sticky_pool_size = _env_int("TIKTOK_STICKY_POOL_SIZE", 0)
     if sticky_pool_size > 0:
         dedicated_ids = {_proxy_identity(p) for p in pool[:sticky_pool_size]}
@@ -568,7 +1038,6 @@ def _select_proxy_candidates(limit: int | None = None) -> list[dict | None]:
         if sticky_sessions.sticky_enabled()
         else set()
     )
-    # IP hors pool dedie mais avec cookies: les garder en tete aussi.
     with_cookies: list[dict] = []
     seen_ids: set[str] = set()
     for identity in cookie_ids:
@@ -608,27 +1077,40 @@ def _select_proxy_candidates(limit: int | None = None) -> list[dict | None]:
 
 
 def _load_proxy_candidates() -> list[dict | None]:
-    """Compat: sample dynamique pour un job (4 par defaut), pas toute la liste."""
+    """Compat: candidats proxy pour un job."""
     return _select_proxy_candidates()
 
 
 def get_proxy_pool() -> list[dict]:
-    """Echantillon de proxies pour les lanes batch (hors blacklist).
+    """Proxies pour les lanes batch.
 
-    Ne retourne PAS les 20k: seulement assez pour concurrency + reserve
-    (defaut: max(concurrency*2, PROXY_MAX_PER_JOB)).
+    Mode rotate: N copies du meme endpoint (1 par lane). Webshare alloue une
+    IP residentielle distincte par connexion navigateur.
     """
     concurrency = max(1, _env_int("TIKTOK_BATCH_CONCURRENCY", 6))
-    sample_size = max(concurrency * 2, _env_int("TIKTOK_PROXY_MAX_PER_JOB", 4))
+    if _rotating_proxy_mode():
+        cfg = _build_rotating_proxy_config()
+        if cfg is None:
+            return []
+        # Une sticky session distincte par lane (IP fixe dans la lane).
+        return [_assign_webshare_sticky_session(dict(cfg)) for _ in range(concurrency)]
+
+    sample_size = max(
+        concurrency * 2,
+        _env_int("MAX_PROXY_RETRIES", 0) or _env_int("TIKTOK_PROXY_MAX_PER_JOB", 10),
+    )
     return [p for p in _select_proxy_candidates(limit=sample_size) if p is not None]
 
 
 def pick_replacement_proxy(exclude: set[str] | None = None) -> dict | None:
-    """Tire UNE nouvelle IP hors blacklist et hors `exclude` (pour releve CSV).
+    """Remplacement pour releve CSV.
 
-    Preferre une IP qui a deja des cookies valides; sinon une IP neuve
-    (chauffee a l'usage, slot LRU si besoin).
+    Mode rotate: nouvelle sticky session Webshare (= nouvelle IP geo).
+    Mode pool: tire une IP hors blacklist / hors exclude.
     """
+    if _rotating_proxy_mode():
+        return _assign_webshare_sticky_session(_build_rotating_proxy_config())
+
     excluded = set(exclude or set())
     pool = _parse_all_proxies()
     if not pool:
@@ -639,7 +1121,7 @@ def pick_replacement_proxy(exclude: set[str] | None = None) -> dict | None:
         if identity and identity not in by_id:
             by_id[identity] = proxy
     with _PROXY_BLACKLIST_LOCK:
-        blocked = set(_load_blacklist().keys())
+        blocked = set(_load_blacklist().keys()) if _blacklist_enabled() else set()
 
     if sticky_sessions.sticky_enabled():
         hot = []
@@ -695,66 +1177,24 @@ def _build_user_data_dir() -> str:
 
 
 def _should_apply_stealth(user_data_dir: str) -> bool:
-    """Decide si le mode stealth doit etre applique.
+    """Stealth: OFF sur vrai Chrome (mesure historique: overlays → grid vide).
 
-    En profil persistant reel, on desactive par defaut le stealth agressif,
-    sauf si la variable d'env force son activation.
+    Sur Chromium embarque: opt-in via TIKTOK_APPLY_STEALTH (defaut false).
     """
-    # In persistent real-profile mode, aggressive stealth patches can look less natural.
-    default = False if user_data_dir else True
-    return _env_bool("TIKTOK_APPLY_STEALTH", default)
+    if _is_real_chrome_channel():
+        return False
+    return _env_bool("TIKTOK_APPLY_STEALTH", False)
 
 
 def _parse_proxy_spec(spec: str) -> dict | None:
-    """Parse une ligne proxy en plusieurs formats supportes.
+    """Parse une ligne proxy → dict Playwright (server HTTP + user/pass separes).
 
     Formats acceptes:
     - host:port|username|password
     - scheme://username:password@host:port
-    - host:port:username:password (export brut par defaut du dashboard
-      Webshare, ex: "31.59.20.176:6754:sdwopfmy:v78vnzm50pdj") - permet de
-      copier/coller directement le fichier telecharge sans le reformater.
-    - valeur brute (server)
+    - host:port:username:password (export Webshare brut)
     """
-    raw = (spec or "").strip()
-    if not raw:
-        return None
-
-    if "|" in raw:
-        parts = [part.strip() for part in raw.split("|")]
-        server = parts[0] if parts else ""
-        if not server:
-            return None
-        proxy = {"server": server}
-        if len(parts) > 1 and parts[1]:
-            proxy["username"] = parts[1]
-            proxy["password"] = parts[2] if len(parts) > 2 else ""
-        return proxy
-
-    if "://" not in raw:
-        # Format Webshare brut "host:port:username:password" (4 champs). On
-        # ne le detecte que si le 2e champ est bien un port numerique, pour
-        # ne jamais casser un format "host:port" simple (2 champs) qui doit
-        # rester gere par le fallback `{"server": raw}` plus bas.
-        parts = raw.split(":")
-        if len(parts) == 4 and parts[1].isdigit():
-            host, port, username, password = (part.strip() for part in parts)
-            if host and port and username:
-                return {"server": f"{host}:{port}", "username": username, "password": password}
-
-    parsed = urlsplit(raw)
-    if parsed.scheme and parsed.hostname:
-        netloc = parsed.hostname
-        if parsed.port:
-            netloc = f"{netloc}:{parsed.port}"
-
-        proxy = {"server": urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))}
-        if parsed.username:
-            proxy["username"] = unquote(parsed.username)
-            proxy["password"] = unquote(parsed.password or "")
-        return proxy
-
-    return {"server": raw}
+    return parse_playwright_proxy(spec)
 
 
 def _rotate_ipv6_identity() -> str | None:
@@ -903,11 +1343,7 @@ def _extract_posts_from_html_fallback(profile_url: str) -> list:
     3) Sinon tenter `SIGI_STATE`.
     """
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": _chrome_user_agent(),
         "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Cache-Control": "no-cache",
@@ -1027,6 +1463,504 @@ def _wait_for_profile_video_links(page, timeout_ms: int | None = None) -> bool:
         return False
 
 
+def _is_profile_grid_api_url(url: str) -> bool:
+    """True pour les XHR grille profil (pas le feed For You / explore)."""
+    rurl = (url or "").lower()
+    if any(feed in rurl for feed in ("recommend", "/explore", "for_you", "foryou")):
+        return False
+    return any(
+        key in rurl
+        for key in (
+            "/api/post/item_list",
+            "/api/preload/item_list",
+            "/api/user/detail",
+            "/api/user/post",
+            "post/item_list",
+            "preload/item_list",
+            "user/detail",
+            "item_list",
+            "aweme/post",
+            "user/post",
+        )
+    )
+
+
+def _extract_sec_uid_from_page(page) -> str | None:
+    """secUid depuis __UNIVERSAL_DATA_FOR_REHYDRATION__ / SIGI_STATE."""
+    try:
+        sec = page.evaluate(
+            """() => {
+              const pick = (node) => {
+                if (!node || typeof node !== 'object') return null;
+                const u = (node.userInfo && node.userInfo.user)
+                  || (node.userInfo && node.userInfo.userInfo && node.userInfo.userInfo.user)
+                  || node.user
+                  || null;
+                if (u && (u.secUid || u.sec_uid)) return String(u.secUid || u.sec_uid);
+                return null;
+              };
+              try {
+                const el = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__');
+                if (el && el.textContent) {
+                  const data = JSON.parse(el.textContent);
+                  const scope = data.__DEFAULT_SCOPE__ || data;
+                  for (const key of [
+                    'webapp.user-detail',
+                    'webapp.user-detail.page',
+                    'webapp.user-post-list',
+                  ]) {
+                    const got = pick(scope[key]);
+                    if (got) return got;
+                  }
+                }
+              } catch (e) {}
+              try {
+                if (window.SIGI_STATE) {
+                  const ud = window.SIGI_STATE.UserModule
+                    || window.SIGI_STATE.UserPage
+                    || {};
+                  const users = ud.users || ud;
+                  if (users && typeof users === 'object') {
+                    for (const v of Object.values(users)) {
+                      if (v && (v.secUid || v.sec_uid)) return String(v.secUid || v.sec_uid);
+                    }
+                  }
+                }
+              } catch (e) {}
+              return null;
+            }"""
+        )
+    except Exception:
+        LOGGER.debug("secUid extract failed", exc_info=True)
+        return None
+    if isinstance(sec, str) and sec.strip():
+        return sec.strip()
+    return None
+
+
+def _force_fetch_item_list_from_page(
+    page,
+    *,
+    sec_uid: str,
+    count: int = 30,
+    cursor: int = 0,
+) -> dict:
+    """Appel /api/post/item_list/ depuis le contexte page (cookies + fetch hooke).
+
+    TikTok hooke `window.fetch` via webmssdk pour injecter msToken / X-Bogus /
+    X-Gnarly. Un fetch in-page herite donc de la signature client — plus robuste
+    qu'un requests Python externe (TLS/fingerprint differents).
+    """
+    try:
+        result = page.evaluate(
+            """async ({ secUid, count, cursor }) => {
+              const lang = (navigator.language || 'en-US');
+              const langShort = lang.slice(0, 2) || 'en';
+              const params = new URLSearchParams({
+                WebIdLastTime: String(Math.floor(Date.now() / 1000)),
+                aid: '1988',
+                app_language: langShort,
+                app_name: 'tiktok_web',
+                browser_language: lang,
+                browser_name: 'Mozilla',
+                browser_online: String(navigator.onLine !== false),
+                browser_platform: navigator.platform || 'Win32',
+                browser_version: navigator.userAgent || '',
+                channel: 'tiktok_web',
+                cookie_enabled: String(navigator.cookieEnabled !== false),
+                count: String(count),
+                cursor: String(cursor),
+                device_platform: 'web_pc',
+                focus_state: 'true',
+                from_page: 'user',
+                history_len: String((history && history.length) || 2),
+                is_fullscreen: 'false',
+                is_page_visible: 'true',
+                language: langShort,
+                os: 'windows',
+                priority_region: '',
+                referer: '',
+                region: '',
+                screen_height: String((screen && screen.height) || 768),
+                screen_width: String((screen && screen.width) || 1365),
+                secUid: String(secUid),
+                tz_name: (Intl.DateTimeFormat().resolvedOptions().timeZone) || 'UTC',
+                webcast_language: langShort,
+              });
+              try {
+                const m = document.cookie.match(/(?:^|;\\s*)msToken=([^;]+)/);
+                if (m && m[1]) params.set('msToken', decodeURIComponent(m[1]));
+              } catch (e) {}
+              const url = '/api/post/item_list/?' + params.toString();
+              const res = await fetch(url, {
+                method: 'GET',
+                credentials: 'include',
+                headers: {
+                  'Accept': 'application/json, text/plain, */*',
+                },
+              });
+              const text = await res.text();
+              let json = null;
+              try { json = JSON.parse(text); } catch (e) { json = null; }
+              const itemList = (json && Array.isArray(json.itemList)) ? json.itemList : [];
+              return {
+                status: res.status,
+                bodyLen: text.length,
+                itemListLen: itemList.length,
+                statusCode: (json && (json.statusCode ?? json.status_code ?? null)),
+                hasItemList: itemList.length > 0,
+                finalUrl: (typeof res.url === 'string') ? res.url.slice(0, 180) : '',
+                payload: json,
+              };
+            }""",
+            {"secUid": sec_uid, "count": int(count), "cursor": int(cursor)},
+        )
+    except Exception as exc:
+        LOGGER.warning(
+            "Forced item_list fetch raised: %s",
+            str(exc)[:200],
+        )
+        return {
+            "status": 0,
+            "bodyLen": 0,
+            "itemListLen": 0,
+            "statusCode": None,
+            "hasItemList": False,
+            "payload": None,
+            "error": str(exc)[:200],
+        }
+    return result if isinstance(result, dict) else {}
+
+
+def _ingest_forced_item_list(
+    page,
+    network_posts: list,
+    *,
+    profile_url: str,
+    target_username: str,
+    count: int | None = None,
+) -> int:
+    """Si le SPA n'a pas emis item_list: fetch signe in-page → buffer reseau.
+
+    Retourne le nombre de posts ajoutes au buffer. Loggue status HTTP,
+    taille body, presence itemList (checklist Claude etape 1).
+    """
+    if not _env_bool("TIKTOK_FORCE_ITEM_LIST_FETCH", True):
+        LOGGER.info("TIKTOK_FORCE_ITEM_LIST_FETCH=false — skip forced item_list")
+        return 0
+
+    sec_uid = _extract_sec_uid_from_page(page)
+    if not sec_uid:
+        LOGGER.warning(
+            "Forced item_list skipped — secUid missing from rehydration",
+            extra={"url": profile_url},
+        )
+        return 0
+
+    fetch_count = int(count or _env_int("TIKTOK_FORCE_ITEM_LIST_COUNT", 30))
+    LOGGER.info(
+        "Forced item_list fetch (page.evaluate) secUid=%s… count=%s",
+        sec_uid[:18],
+        fetch_count,
+        extra={"url": profile_url},
+    )
+    result = _force_fetch_item_list_from_page(
+        page, sec_uid=sec_uid, count=fetch_count, cursor=0
+    )
+    http_status = int(result.get("status") or 0)
+    body_len = int(result.get("bodyLen") or 0)
+    item_len = int(result.get("itemListLen") or 0)
+    status_code = result.get("statusCode")
+    LOGGER.info(
+        "Forced item_list result: HTTP=%s bodyLen=%s itemListLen=%s "
+        "tiktokStatus=%s hasItemList=%s",
+        http_status,
+        body_len,
+        item_len,
+        status_code,
+        bool(result.get("hasItemList")),
+        extra={"url": profile_url},
+    )
+
+    payload = result.get("payload")
+    if not isinstance(payload, dict):
+        return 0
+    if not _api_payload_status_ok(payload) and item_len <= 0:
+        LOGGER.warning(
+            "Forced item_list payload not OK (statusCode=%s)",
+            status_code,
+            extra={"url": profile_url},
+        )
+        return 0
+
+    parsed: list[dict] = []
+    try:
+        parsed = extract_posts_from_hydration_payload(payload, profile_url=profile_url)
+    except Exception:
+        parsed = []
+    if not parsed:
+        try:
+            parsed = _extract_posts_from_json_payload(payload)
+        except Exception:
+            parsed = []
+
+    if not parsed:
+        return 0
+
+    stamped = [
+        _stamp_network_api_post(p, target_username)
+        for p in parsed
+        if isinstance(p, dict)
+    ]
+    network_posts.extend(stamped)
+    LOGGER.info(
+        "Forced item_list ingested %d posts into network buffer (buffer=%d)",
+        len(stamped),
+        len(network_posts),
+        extra={"url": profile_url},
+    )
+    return len(stamped)
+
+
+def _page_is_chrome_error(page) -> bool:
+    try:
+        href = (page.url or "").lower()
+    except Exception:
+        return False
+    return href.startswith("chrome-error:") or "chromewebdata" in href
+
+
+def _is_real_waf_block(
+    page=None,
+    *,
+    status: int | None = None,
+    error: str = "",
+) -> bool:
+    """True uniquement pour un VRAI blocage WAF/captcha — pas un profil vide HTTP 200.
+
+    Criteres:
+      - captcha / challenge / VNS visible
+      - HTTP 403 / 429 (ou err_http_response_code_failure)
+      - page chrome-error://
+    """
+    err = (error or "").lower()
+    if status in (403, 429) or is_http_blocked_status(status):
+        if status in (403, 429, 401, 451):
+            return True
+    if any(
+        tok in err
+        for tok in (
+            "http_403",
+            "http_429",
+            "err_http_response_code_failure",
+            "challenge_detected",
+            "captcha",
+            "chrome-error",
+            "chromewebdata",
+        )
+    ):
+        # "no_posts_found" / soft empty profile → PAS un WAF.
+        if "no_posts" in err and "403" not in err and "429" not in err and "captcha" not in err:
+            return False
+        if "no_posts" not in err:
+            return True
+
+    if page is not None:
+        if _page_is_chrome_error(page):
+            return True
+        try:
+            if _looks_like_tiktok_challenge(page):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _api_payload_status_ok(payload: object) -> bool:
+    """True si le JSON TikTok indique statusCode/status_code/code == 0 (ou absent)."""
+    if not isinstance(payload, dict):
+        return False
+    for key in ("statusCode", "status_code", "code", "status"):
+        if key not in payload:
+            continue
+        try:
+            return int(payload[key]) == 0
+        except (TypeError, ValueError):
+            return str(payload[key]).strip() in ("0", "success", "ok", "")
+    # Certains payloads n'ont pas de status mais portent itemList.
+    return any(k in payload for k in ("itemList", "item_list", "items", "userInfo", "userInfoList"))
+
+
+# UA Windows Chrome recent (aligne Sec-CH-UA / Playwright Chromium ~131+).
+_CHROME_UA_WINDOWS = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+_CHROME_SEC_CH_UA = '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'
+
+
+def _chrome_user_agent() -> str:
+    """User-Agent Chrome recent (override possible via TIKTOK_USER_AGENT)."""
+    return (os.getenv("TIKTOK_USER_AGENT") or "").strip() or _CHROME_UA_WINDOWS
+
+
+def _resolve_headless_channel(headless: bool, browser_channel: str) -> str:
+    """Pour headless=True sans channel: force `chromium` (= new headless Playwright).
+
+    channel='chromium' opte pour le new headless (vrai Chrome headless),
+    pas le vieux chromium-headless-shell. channel='chrome' l'utilise deja.
+    """
+    channel = (browser_channel or "").strip()
+    if headless and not channel and _env_bool("TIKTOK_HEADLESS_NEW", True):
+        return "chromium"
+    return channel
+
+
+def _passive_settle_after_profile_nav(page) -> None:
+    """Settle apres goto profil — volontairement court (perf / anti-403).
+
+    Ancien comportement: 3–5s. Trop lent → CDN timeout. Defaut: no-op
+    (TIKTOK_PROFILE_SETTLE_MS=0). Max autorise 500ms si force.
+    """
+    wait_ms = max(0, min(500, _env_int("TIKTOK_PROFILE_SETTLE_MS", 0)))
+    if wait_ms <= 0:
+        return
+    LOGGER.debug("Short settle after profile navigation (%dms)", wait_ms)
+    try:
+        page.wait_for_timeout(wait_ms)
+    except Exception:
+        pass
+
+
+def _grid_wait_ms() -> int:
+    """Fenetre max attente item_list/DOM (defaut 8s, max 20s)."""
+    return max(1500, min(20000, _env_int("TIKTOK_WAIT_VIDEO_LINKS_SOFT_MS", 8000)))
+
+
+def _attempt_timeout_s() -> float:
+    """Timeout global par tentative scrape (warmup+profil), defaut 35s."""
+    return float(max(15, min(60, _env_int("TIKTOK_ATTEMPT_TIMEOUT_S", 35))))
+
+
+class AttemptTimeoutError(Exception):
+    """Budget temps de la tentative scrape depasse."""
+
+
+def _check_attempt_deadline(deadline: float | None, *, phase: str = "") -> None:
+    if deadline is None:
+        return
+    if time.monotonic() >= deadline:
+        raise AttemptTimeoutError(
+            f"attempt_timeout after {_attempt_timeout_s():.0f}s"
+            + (f" ({phase})" if phase else "")
+        )
+
+
+def _random_mouse_jitter(page) -> None:
+    """Petits mouvements souris aleatoires (zone centrale viewport)."""
+    try:
+        vp = page.viewport_size or {"width": 1365, "height": 768}
+        w = int(vp.get("width") or 1365)
+        h = int(vp.get("height") or 768)
+        x = random.randint(int(w * 0.25), int(w * 0.75))
+        y = random.randint(int(h * 0.25), int(h * 0.65))
+        page.mouse.move(x, y)
+        page.mouse.move(
+            x + random.randint(-60, 90),
+            y + random.randint(-40, 70),
+            steps=random.randint(8, 18),
+        )
+        page.wait_for_timeout(random.randint(80, 220))
+    except Exception:
+        LOGGER.debug("Mouse jitter failed", exc_info=True)
+
+
+def _humanize_profile_interaction(page) -> None:
+    """Scroll leger rapide (lazy-load) — budget court pour perf."""
+    try:
+        page.mouse.wheel(0, random.randint(300, 450))
+        page.wait_for_timeout(random.randint(80, 180))
+    except Exception:
+        LOGGER.debug("Humanize profile interaction failed", exc_info=True)
+        try:
+            page.evaluate(
+                """(y) => { window.scrollBy({ top: y, left: 0, behavior: 'instant' }); }""",
+                random.randint(300, 500),
+            )
+        except Exception:
+            pass
+
+
+def _human_scroll_page(page) -> None:
+    """Scroll de feed progressif (remplace window.scrollTo bottom instantane)."""
+    _random_mouse_jitter(page)
+    try:
+        for _ in range(random.randint(2, 5)):
+            page.mouse.wheel(0, random.randint(380, 520))
+            page.wait_for_timeout(random.randint(220, 480))
+            if random.random() < 0.4:
+                _random_mouse_jitter(page)
+    except Exception:
+        LOGGER.debug("Human scroll failed; fallback scrollBy", exc_info=True)
+        try:
+            page.evaluate("() => window.scrollBy(0, Math.floor(window.innerHeight * 0.85))")
+        except Exception:
+            try:
+                page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            except Exception:
+                pass
+    _human_pause(1.2, 0.8)
+
+
+def _dom_has_video_links(page) -> bool:
+    try:
+        return page.locator('a[href*="/video/"]').count() > 0
+    except Exception:
+        return False
+
+
+def _wait_for_profile_grid_data(
+    page,
+    network_posts: list | None,
+    timeout_ms: int | None = None,
+) -> bool:
+    """Attend DOM `/video/` OU JSON API grille (`/api/post/item_list/`, user/detail).
+
+    Poll actif reseau + DOM. Timeout = TIKTOK_WAIT_VIDEO_LINKS_SOFT_MS (defaut 8s).
+    """
+    if timeout_ms is None:
+        timeout_ms = _grid_wait_ms()
+    else:
+        # Respecter le timeout demande (plafonne a 20s, min 1.5s).
+        timeout_ms = max(1500, min(20000, int(timeout_ms)))
+    deadline = time.monotonic() + (timeout_ms / 1000.0)
+    poll_ms = max(100, min(250, _env_int("TIKTOK_GRID_POLL_MS", 150)))
+
+    while time.monotonic() < deadline:
+        if network_posts:
+            LOGGER.info(
+                "Profile grid ready via API JSON (%d posts captured)",
+                len(network_posts),
+            )
+            return True
+        if _dom_has_video_links(page):
+            LOGGER.info("Profile grid ready via DOM /video/ links")
+            return True
+        try:
+            page.wait_for_timeout(poll_ms)
+        except Exception:
+            time.sleep(poll_ms / 1000.0)
+
+    ready = bool(network_posts) or _dom_has_video_links(page)
+    if not ready:
+        LOGGER.info(
+            "Profile grid soft-block window elapsed (no API item_list / no DOM links)",
+            extra={"url": f"timeout_ms={timeout_ms}"},
+        )
+    return ready
+
+
 def _manual_solve_wait_if_enabled(user_data_dir: str, headless: bool):
     """Pause volontaire pour laisser l'utilisateur resoudre un challenge.
 
@@ -1135,7 +2069,17 @@ def _merge_post_data(base: dict, extra: dict) -> dict:
     On complete seulement les champs vides dans `base` avec les donnees de `extra`.
     """
     merged = dict(base)
-    for key in ("author", "message", "published_at", "likes", "comments_count", "shares", "views"):
+    for key in (
+        "author",
+        "message",
+        "text_content",
+        "text",
+        "published_at",
+        "likes",
+        "comments_count",
+        "shares",
+        "views",
+    ):
         current = merged.get(key)
         incoming = extra.get(key)
         if key == "published_at" and incoming not in (None, ""):
@@ -1144,6 +2088,37 @@ def _merge_post_data(base: dict, extra: dict) -> dict:
             incoming = _parse_count_value(incoming)
         if (current is None or current == "") and incoming not in (None, ""):
             merged[key] = incoming
+
+    base_metrics = merged.get("metrics") if isinstance(merged.get("metrics"), dict) else {}
+    extra_metrics = extra.get("metrics") if isinstance(extra.get("metrics"), dict) else {}
+    metrics = dict(base_metrics)
+    for mk, flat in (
+        ("likes", "likes"),
+        ("views", "views"),
+        ("comments", "comments_count"),
+        ("shares", "shares"),
+    ):
+        if metrics.get(mk) not in (None, ""):
+            continue
+        incoming = extra_metrics.get(mk)
+        if incoming in (None, ""):
+            incoming = extra.get(flat)
+        if incoming not in (None, ""):
+            metrics[mk] = _parse_count_value(incoming)
+    if metrics.get("likes") in (None, "") and merged.get("likes") not in (None, ""):
+        metrics["likes"] = merged.get("likes")
+    if metrics.get("views") in (None, "") and merged.get("views") not in (None, ""):
+        metrics["views"] = merged.get("views")
+    if metrics.get("comments") in (None, "") and merged.get("comments_count") not in (None, ""):
+        metrics["comments"] = merged.get("comments_count")
+    if metrics.get("shares") in (None, "") and merged.get("shares") not in (None, ""):
+        metrics["shares"] = merged.get("shares")
+    if metrics:
+        merged["metrics"] = metrics
+    if not merged.get("text_content") and merged.get("message"):
+        merged["text_content"] = merged.get("message")
+    if not merged.get("message") and merged.get("text_content"):
+        merged["message"] = merged.get("text_content")
     return merged
 
 
@@ -1362,16 +2337,56 @@ def _extract_video_detail_from_page(page) -> dict:
 
 
 def _enrich_posts_from_video_pages(context, posts: list[dict]) -> list[dict]:
-    """Enrichit les posts en ouvrant les pages video une a une.
+    """Enrichit UNIQUEMENT les posts incomplets; oEmbed en dernier recours.
 
-    Utilise `_extract_video_detail_from_page` pour completer les stats/auteur
-    quand le listing profil est incomplet.
+    Profile-first: si diggCount/playCount deja presents depuis le profil SSR,
+    on ne navigue PAS sur /video/<id> (TikTok ne livre plus les details fiables).
     """
     if not posts:
         return posts
 
+    always = _env_bool("ENRICH_VIDEO_PAGE_ALWAYS", False)
     enabled = _env_bool("TIKTOK_ENRICH_POST_DETAILS", True)
-    if not enabled:
+    oembed_on = _env_bool("TIKTOK_OEMBED_FALLBACK", True)
+
+    if not always and posts_have_profile_metrics(posts):
+        LOGGER.info(
+            "Skipping video-page enrichment — profile-first metrics present (%d posts)",
+            len(posts),
+        )
+        if not oembed_on:
+            return posts
+        out = []
+        for post in posts:
+            if str(post.get("text_content") or post.get("message") or "").strip():
+                out.append(post)
+            else:
+                out.append(_merge_post_data(post, fetch_oembed_fallback(str(post.get("post_url") or ""))))
+        return out
+
+    if not always and all(post_has_usable_metrics(p) for p in posts):
+        LOGGER.info(
+            "Skipping video-page enrichment — profile-first metrics present (%d posts)",
+            len(posts),
+        )
+        if not oembed_on:
+            return posts
+        out = []
+        for post in posts:
+            if str(post.get("text_content") or post.get("message") or "").strip():
+                out.append(post)
+            else:
+                out.append(_merge_post_data(post, fetch_oembed_fallback(str(post.get("post_url") or ""))))
+        return out
+
+    if not enabled and not always:
+        if oembed_on:
+            return [
+                _merge_post_data(p, fetch_oembed_fallback(str(p.get("post_url") or "")))
+                if not str(p.get("text_content") or p.get("message") or "").strip()
+                else p
+                for p in posts
+            ]
         return posts
 
     raw_limit = (os.getenv("TIKTOK_ENRICH_POST_DETAILS_LIMIT") or "6").strip()
@@ -1380,25 +2395,21 @@ def _enrich_posts_from_video_pages(context, posts: list[dict]) -> list[dict]:
     except ValueError:
         limit = 6
 
-    if limit == 0:
-        return posts
-
     wait_ms = max(2000, _env_int("TIKTOK_ENRICH_WAIT_MS", 12000))
-    max_attempts = max(1, _env_int("TIKTOK_ENRICH_ATTEMPTS", 3))
-    enriched = []
+    max_attempts = max(1, _env_int("TIKTOK_ENRICH_ATTEMPTS", 2))
+    enriched: list[dict] = []
+
     for idx, post in enumerate(posts):
-        if idx >= limit:
+        if not always and post_has_usable_metrics(post):
             enriched.append(post)
             continue
 
-        post_url = str(post.get("post_url") or "").strip()
-        if not post_url or "/video/" not in post_url:
-            enriched.append(post)
-            continue
-
-        # Deja complet: pas besoin de rouvrir la page video.
-        if all(post.get(k) not in (None, "") for k in ("likes", "views", "comments_count")):
-            enriched.append(post)
+        post_url = normalize_www_tiktok_url(str(post.get("post_url") or "").strip())
+        if idx >= limit or not post_url or "/video/" not in post_url:
+            if oembed_on and not str(post.get("text_content") or post.get("message") or "").strip():
+                enriched.append(_merge_post_data(post, fetch_oembed_fallback(post_url)))
+            else:
+                enriched.append(post)
             continue
 
         merged = dict(post)
@@ -1407,8 +2418,16 @@ def _enrich_posts_from_video_pages(context, posts: list[dict]) -> list[dict]:
             detail_page = None
             try:
                 detail_page = context.new_page()
-                detail_page.goto(post_url, wait_until="domcontentloaded", timeout=45000)
-                # Attendre le JSON SSR ou au moins un compteur visible.
+                try:
+                    goto_strict(detail_page, post_url, timeout=nav_timeout_ms())
+                except (ProxyBlockedException, AntibotBlockedException) as blocked:
+                    last_error = str(blocked)[:160]
+                    LOGGER.warning(
+                        "[ANTIBOT] Video page blocked — oEmbed fallback: %s",
+                        last_error,
+                        extra={"url": post_url},
+                    )
+                    break
                 try:
                     detail_page.wait_for_function(
                         """() => {
@@ -1420,33 +2439,21 @@ def _enrich_posts_from_video_pages(context, posts: list[dict]) -> list[dict]:
                         timeout=wait_ms,
                     )
                 except Exception:
-                    _human_pause(1.5, 0.8)
-                else:
-                    _human_pause(0.6, 0.4)
+                    _human_pause(1.0, 0.5)
 
                 detail = _extract_video_detail_from_page(detail_page) or {}
                 merged = _merge_post_data(post, detail)
-                if merged.get("likes") is None and merged.get("views") is None:
-                    last_error = "no_metrics_in_page"
-                    LOGGER.warning(
-                        "Video detail enrichment returned no metrics (attempt %s/%s)",
-                        attempt,
-                        max_attempts,
-                        extra={"url": post_url, "post_id": str(post.get("post_id") or "")},
-                    )
-                    if attempt < max_attempts:
-                        _human_pause(1.2, 0.6)
-                        continue
-                else:
-                    LOGGER.info(
-                        "Video detail enrichment ok likes=%s views=%s comments=%s",
-                        merged.get("likes"),
-                        merged.get("views"),
-                        merged.get("comments_count"),
-                        extra={"url": post_url, "post_id": str(post.get("post_id") or "")},
-                    )
+                if post_has_usable_metrics(merged) or str(
+                    merged.get("text_content") or merged.get("message") or ""
+                ).strip():
                     last_error = None
                     break
+                last_error = "no_metrics_in_page"
+                if attempt < max_attempts:
+                    _human_pause(1.0, 0.5)
+            except (ProxyBlockedException, AntibotBlockedException) as blocked:
+                last_error = str(blocked)[:160]
+                break
             except Exception as exc:
                 last_error = str(exc).splitlines()[0] if str(exc) else "enrich_failed"
                 LOGGER.warning(
@@ -1457,8 +2464,7 @@ def _enrich_posts_from_video_pages(context, posts: list[dict]) -> list[dict]:
                     extra={"url": post_url},
                 )
                 if attempt < max_attempts:
-                    _human_pause(1.5, 0.8)
-                    continue
+                    _human_pause(1.2, 0.6)
             finally:
                 if detail_page is not None:
                     try:
@@ -1466,12 +2472,19 @@ def _enrich_posts_from_video_pages(context, posts: list[dict]) -> list[dict]:
                     except Exception:
                         LOGGER.warning("Failed to close detail page", exc_info=True)
 
-        if last_error and merged.get("likes") is None and merged.get("views") is None:
-            LOGGER.warning(
-                "Video detail enrichment exhausted retries (%s)",
-                last_error,
-                extra={"url": post_url, "post_id": str(post.get("post_id") or "")},
-            )
+        if oembed_on and (
+            not post_has_usable_metrics(merged)
+            or not str(merged.get("text_content") or merged.get("message") or "").strip()
+        ):
+            oembed = fetch_oembed_fallback(post_url)
+            if oembed:
+                merged = _merge_post_data(merged, oembed)
+            elif last_error:
+                LOGGER.warning(
+                    "Video detail enrichment exhausted (%s)",
+                    last_error,
+                    extra={"url": post_url, "post_id": str(post.get("post_id") or "")},
+                )
         enriched.append(merged)
 
     return enriched
@@ -1488,6 +2501,8 @@ def _scrape_with_browser(
     proxy_cfg: dict | None,
     analyze_video_content: bool,
     rotate_every_n_posts: int = 0,
+    *,
+    skip_homepage_warmup: bool = False,
 ) -> dict:
     """Pipeline principal de scraping via Playwright.
 
@@ -1507,25 +2522,64 @@ def _scrape_with_browser(
     context = None
     page = None
 
+    # Playwright exige server HTTP + username/password SEPARES (jamais inline).
+    if proxy_cfg and not _force_direct_mode():
+        sticky_cc_keep = proxy_cfg.get("_sticky_country")
+        proxy_cfg = sanitize_playwright_proxy(proxy_cfg)
+        if proxy_cfg and sticky_cc_keep:
+            proxy_cfg["_sticky_country"] = sticky_cc_keep
+        if not proxy_cfg or not proxy_cfg.get("username"):
+            LOGGER.warning(
+                "[PROXY] Invalid Webshare proxy config after sanitize — "
+                "expected server=http://host:port + username/password"
+            )
+
     # Défini avant le bloc try: même si une exception survient tôt (warmup,
     # ouverture de contexte, etc.), on doit pouvoir renvoyer les posts déjà
     # collectés au lieu de les perdre silencieusement.
     all_posts: list[dict] = []
+    # True uniquement si le scrape a produit des posts (autorise eventuelle persistance).
+    scrape_succeeded = False
     # Handle du profil cible: sert a rejeter les videos "For You" qui trainent
     # dans l'etat JS (SIGI_STATE.ItemModule) apres le warmup homepage.
     target_username = _username_from_url(profile_url)
 
-    # --- Session sticky: 1 proxy = 1 profil Chrome persistant -----------------
-    # Si active et qu'un proxy est fourni, on ignore TIKTOK_USER_DATA_DIR global
-    # au profit de tiktok_sessions/<sticky_id>/ (cookies nes sous CETTE IP).
+    # Test IP locale: proxy=None mais sticky "direct-local" pour persister cookies.
+    if _force_direct_mode():
+        proxy_cfg = None
+        rotate_every_n_posts = 0
+        LOGGER.warning(
+            "TIKTOK_FORCE_DIRECT — browser/context launched with proxy=None (local IP)"
+        )
+
+    # --- Session sticky / warmup ---------------------------------------------
+    # Mode rotate: chaque tentative = nouvelle IP Webshare → cookies TOUJOURS
+    # frais (profil ephemere + VIRGIN). Jamais reinjecter cookies d'une autre IP.
+    reuse_cookies = _env_bool("TIKTOK_REUSE_STICKY_COOKIES", True)
     sticky_identity = _proxy_identity(proxy_cfg) if proxy_cfg else ""
+    if _force_direct_mode():
+        sticky_identity = "direct-local"
+    elif _rotating_proxy_mode() and sticky_identity and sticky_identity != "direct":
+        # Force: 1 session Chrome = 1 IP = 1 jeu de cookies neufs.
+        reuse_cookies = False
+        sticky_identity = f"{sticky_identity}-{uuid.uuid4().hex[:10]}"
+        LOGGER.info(
+            "Rotate mode: fresh cookies for this IP session (no REUSE across IPs)",
+            extra={"url": sticky_identity},
+        )
+    elif (
+        sticky_identity
+        and sticky_identity != "direct"
+        and not reuse_cookies
+    ):
+        sticky_identity = f"{sticky_identity}-{uuid.uuid4().hex[:10]}"
     sticky_session_dir: Path | None = None
     sticky_lock_held = False
     use_sticky = bool(
         sticky_sessions.sticky_enabled()
-        and proxy_cfg is not None
         and sticky_identity
         and sticky_identity != "direct"
+        and (proxy_cfg is not None or _force_direct_mode())
     )
     if use_sticky:
         sticky_session_dir = sticky_sessions.prepare_session_dir(sticky_identity)
@@ -1541,6 +2595,16 @@ def _scrape_with_browser(
                 "url": profile_url,
             }
         sticky_lock_held = True
+        # REUSE=true n'autorise PAS la reinjection si last success=False / WAF.
+        if reuse_cookies and not sticky_sessions.should_reuse_sticky_cookies(sticky_identity):
+            LOGGER.info(
+                "TIKTOK_REUSE_STICKY_COOKIES ignored — last success=False or WAF; VIRGIN start",
+                extra={"url": sticky_identity},
+            )
+            reuse_cookies = False
+        # REUSE=false / invalide: wipe virgin. REUSE=true + OK: garder cookies.
+        prepare_virgin_sticky_for_next_ip(sticky_identity, force=not reuse_cookies)
+        sticky_session_dir = sticky_sessions.session_dir_for_identity(sticky_identity)
         # Locks Chrome laisses par un crash / ancien conteneur -> fail immédiat
         # "profile appears to be in use by another Google Chrome process".
         removed = sticky_sessions.clear_chrome_profile_locks(sticky_session_dir)
@@ -1554,27 +2618,52 @@ def _scrape_with_browser(
         user_data_dir = _build_user_data_dir()
 
     browser_channel = (os.getenv("TIKTOK_BROWSER_CHANNEL") or "").strip()
-    using_real_chrome = bool(browser_channel)
-    browser_args = [
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-blink-features=AutomationControlled",
-        "--window-size=1365,768",
-    ]
+    # headless + pas de channel → channel=chromium (new headless Playwright).
+    browser_channel = _resolve_headless_channel(headless, browser_channel)
+    using_real_chrome = browser_channel in (
+        "chrome",
+        "chrome-beta",
+        "chrome-dev",
+        "chrome-canary",
+        "msedge",
+        "msedge-beta",
+        "msedge-dev",
+        "msedge-canary",
+    )
+    using_new_headless = headless and browser_channel == "chromium"
+    browser_args = browser_launch_args()
     # Playwright ajoute "--enable-automation" par defaut -> navigator.webdriver.
     ignored_default_args = ["--enable-automation"]
 
+    # Locale / TZ / Accept-Language coherents avec le pays sticky (IP proxy).
+    sticky_cc = _sticky_country_from_proxy(proxy_cfg)
+    browser_geo = _browser_geo_for_country(sticky_cc)
+    _set_active_browser_geo(browser_geo)
     context_options = {
         "viewport": {"width": 1365, "height": 768},
-        "locale": "en-US",
-        "timezone_id": "Europe/Paris",
+        "locale": browser_geo["locale"],
+        "timezone_id": browser_geo["timezone_id"],
+        "ignore_https_errors": True,
     }
-    # UA falsifie UNIQUEMENT pour Chromium embarque. Avec vrai Chrome: UA natif.
+    # Geoloc optionnelle (permissions + coords) — alignee sur le pays sticky.
+    if _env_bool("TIKTOK_BROWSER_GEOLOCATION", True):
+        context_options["geolocation"] = dict(browser_geo["geolocation"])
+        context_options["permissions"] = ["geolocation"]
+    # UA Chrome recent: Chromium embarque / new headless. Vrai Chrome: UA natif.
     if not using_real_chrome:
-        context_options["user_agent"] = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
+        context_options["user_agent"] = _chrome_user_agent()
+    LOGGER.info(
+        "Browser geo aligned to sticky country=%s locale=%s tz=%s lang=%s",
+        browser_geo.get("country"),
+        browser_geo.get("locale"),
+        browser_geo.get("timezone_id"),
+        browser_geo.get("accept_language"),
+        extra={"url": profile_url},
+    )
+    if headless and using_new_headless:
+        LOGGER.info(
+            "Launching Chromium new headless (channel=chromium)",
+            extra={"url": profile_url},
         )
 
     # Log informatif si un proxy est actif pour cette tentative.
@@ -1596,27 +2685,63 @@ def _scrape_with_browser(
     network_posts: list[dict] = []
 
     def handle_response(response):
-        """Capture passive des reponses JSON reseau (posts parfois absents du DOM)."""
-        rurl = response.url.lower()
-        # NE JAMAIS capturer le feed de recommandations "For You" (charge par le
-        # warmup homepage) ni l'onglet Explore: ce ne sont PAS les videos du
-        # profil cible. Sans ce garde-fou, `/api/recommend/item_list/` matchait
-        # "item_list" et polluait les resultats avec des videos etrangeres.
-        if any(feed in rurl for feed in ("recommend", "/explore", "for_you", "foryou")):
-            return
-        if not any(k in rurl for k in ("item_list", "aweme", "post/item", "user/post")):
+        """Capture active des JSON grille profil (`/api/post/item_list/`, user/detail).
+
+        Preferer le JSON (statusCode==0 + itemList) au parse DOM quand le grid
+        est soft-bloque (squelette sans ancres `/video/`).
+        """
+        rurl = response.url
+        if not _is_profile_grid_api_url(rurl):
             return
         try:
-            ctype = response.headers.get("content-type", "").lower()
-            if "json" not in ctype:
-                return
+            http_status = int(getattr(response, "status", 0) or 0)
+        except (TypeError, ValueError):
+            http_status = 0
+        if http_status and http_status >= 400:
+            return
+        try:
+            ctype = (response.headers.get("content-type") or "").lower()
         except Exception:
+            ctype = ""
+        # TikTok renvoie parfois JSON sans content-type fiable — tenter quand meme.
+        if ctype and ("json" not in ctype and "javascript" not in ctype and "text/plain" not in ctype):
             return
         try:
             payload = response.json()
-            parsed = _extract_posts_from_json_payload(payload)
+        except Exception:
+            LOGGER.debug("Failed to read grid API JSON body", exc_info=True)
+            return
+        if not _api_payload_status_ok(payload):
+            LOGGER.info(
+                "Profile grid API returned non-zero status (soft-block signal)",
+                extra={"url": rurl.split("?")[0][:120]},
+            )
+            return
+        try:
+            # Priorite: parse hydration-aware (itemList + stats), puis walk generique.
+            parsed = []
+            try:
+                from profile_extractor import extract_posts_from_hydration_payload
+
+                parsed = extract_posts_from_hydration_payload(payload, profile_url=profile_url)
+            except Exception:
+                parsed = []
+            if not parsed:
+                parsed = _extract_posts_from_json_payload(payload)
             if parsed:
-                network_posts.extend(parsed)
+                stamped = [
+                    _stamp_network_api_post(p, target_username)
+                    for p in parsed
+                    if isinstance(p, dict)
+                ]
+                network_posts.extend(stamped)
+                LOGGER.info(
+                    "Captured %d posts from grid API %s (buffer=%d)",
+                    len(stamped),
+                    rurl.split("?")[0][-48:],
+                    len(network_posts),
+                    extra={"url": profile_url},
+                )
         except Exception:
             LOGGER.debug("Failed to parse network JSON response", exc_info=True)
 
@@ -1647,8 +2772,10 @@ def _scrape_with_browser(
             }
             if browser_channel:
                 launch_persistent_args["channel"] = browser_channel
-            if proxy_cfg:
-                launch_persistent_args["proxy"] = proxy_cfg
+            if proxy_cfg and not _force_direct_mode():
+                launch_persistent_args["proxy"] = sanitize_playwright_proxy(proxy_cfg)
+            else:
+                launch_persistent_args.pop("proxy", None)
             context = playwright.chromium.launch_persistent_context(**launch_persistent_args)
             browser = None
         else:
@@ -1660,41 +2787,59 @@ def _scrape_with_browser(
             }
             if browser_channel:
                 launch_args["channel"] = browser_channel
-            if proxy_cfg:
-                launch_args["proxy"] = proxy_cfg
+            if proxy_cfg and not _force_direct_mode():
+                launch_args["proxy"] = sanitize_playwright_proxy(proxy_cfg)
             browser = playwright.chromium.launch(**launch_args)
             context = browser.new_context(**context_options)
 
-        # IMPORTANT: avec un VRAI navigateur (channel="chrome"/"msedge"), on ne
-        # falsifie NI les client-hints Sec-CH-UA NI le fingerprint via stealth.
-        if not browser_channel:
-            context.set_extra_http_headers(
-                {
-                    "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
-                    "Upgrade-Insecure-Requests": "1",
-                    "Sec-CH-UA": '"Chromium";v="124", "Not:A-Brand";v="99"',
-                    "Sec-CH-UA-Platform": '"Windows"',
-                    "Sec-CH-UA-Mobile": "?0",
-                }
+        # Empreinte: sur VRAI Chrome, AUCUN overlay (historique 3e1b957:
+        # Sec-CH-UA / webdriver mask / stealth → grille profil vide).
+        accept_lang = _active_accept_language()
+        if using_real_chrome:
+            LOGGER.info(
+                "Real Chrome channel — native fingerprint (no stealth/webdriver/Sec-CH-UA overlays)"
             )
+            context.set_extra_http_headers({"Accept-Language": accept_lang})
+        else:
             if _should_apply_stealth(user_data_dir):
                 _install_stealth_scripts(context)
+            else:
+                install_webdriver_mask(context)
+            chrome_headers = {
+                "Accept-Language": accept_lang,
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                    "image/avif,image/webp,image/apng,*/*;q=0.8,"
+                    "application/signed-exchange;v=b3;q=0.7"
+                ),
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-CH-UA": _CHROME_SEC_CH_UA,
+                "Sec-CH-UA-Platform": '"Windows"',
+                "Sec-CH-UA-Mobile": "?0",
+            }
+            context.set_extra_http_headers(chrome_headers)
 
-        # Cookies:
-        # - mode sticky: on n'injecte PAS le fichier global tiktok_cookies.json
-        #   (il a ete cree sous une autre IP). On peut injecter cookies.json
-        #   LOCAL au profil sticky s'il existe (produit par warm_sticky_session).
-        # - mode classique: injection globale si pas de profil OU force.
+        # Cookies sticky: reinjection UNIQUEMENT si REUSE + should_reuse (pas success=False).
         if use_sticky and sticky_identity:
-            sticky_cookies = sticky_sessions.load_sticky_cookies(sticky_identity)
-            if sticky_cookies:
-                try:
-                    context.add_cookies(sticky_cookies)
-                except Exception:
-                    LOGGER.warning("Failed to inject sticky cookies", exc_info=True)
+            if reuse_cookies and sticky_sessions.should_reuse_sticky_cookies(sticky_identity):
+                sticky_cookies = sticky_sessions.load_sticky_cookies(sticky_identity)
+                if sticky_cookies:
+                    try:
+                        context.add_cookies(sticky_cookies)
+                        LOGGER.info(
+                            "Reusing sticky cookies for IP (last success OK)",
+                            extra={"url": sticky_identity},
+                        )
+                    except Exception:
+                        LOGGER.warning("Failed to inject sticky cookies", exc_info=True)
+            else:
+                LOGGER.info(
+                    "Opening sticky context VIRGIN (no cookie reinjection)",
+                    extra={"url": sticky_identity},
+                )
         else:
             force_cookie_injection = _env_bool("TIKTOK_FORCE_COOKIE_INJECTION", False)
-            if not user_data_dir or force_cookie_injection:
+            if force_cookie_injection:
                 cookies = load_cookies()
                 if cookies:
                     try:
@@ -1703,6 +2848,15 @@ def _scrape_with_browser(
                         LOGGER.warning("Failed to inject cookies", exc_info=True)
 
         page = context.new_page()
+        # playwright-stealth: jamais sur vrai Chrome (casse item_list).
+        if not using_real_chrome and _should_apply_stealth(user_data_dir):
+            try:
+                from playwright_stealth import stealth_sync  # type: ignore
+
+                stealth_sync(page)
+                LOGGER.info("playwright-stealth applied on page")
+            except Exception:
+                LOGGER.debug("playwright-stealth not available; built-in masks active")
         page.on("response", handle_response)
 
     def _close_current_context() -> None:
@@ -1730,7 +2884,14 @@ def _scrape_with_browser(
         # IMPORTANT: le launch doit etre DANS le try. Sinon un SingletonLock
         # Chrome (TargetClosedError) remonte au worker au lieu d'etre traite
         # comme soft-failure + rotation de proxy.
+        attempt_deadline = time.monotonic() + _attempt_timeout_s()
+        LOGGER.info(
+            "Scrape attempt budget=%.0fs",
+            _attempt_timeout_s(),
+            extra={"url": profile_url},
+        )
         _open_context_and_page()
+        _check_attempt_deadline(attempt_deadline, phase="after_launch")
 
         def _build_partial_result(posts: list[dict], warning: str | None = None) -> dict:
             payload = {
@@ -1744,11 +2905,36 @@ def _scrape_with_browser(
                 payload["warning"] = warning
             return payload
 
+        ssr_posts_out: list[dict] = []
+        # Bypass homepage UNIQUEMENT si on reinjecte vraiment des cookies sticky
+        # d'un SUCCESS precedent. Jamais skip warmup en VIRGIN (sinon WAF ~700B).
+        can_reuse_sticky = bool(
+            reuse_cookies
+            and use_sticky
+            and sticky_identity
+            and sticky_sessions.should_reuse_sticky_cookies(sticky_identity)
+            and sticky_sessions.last_attempt_succeeded(sticky_identity) is True
+        )
+        skip_home = can_reuse_sticky
+        if skip_homepage_warmup and not can_reuse_sticky:
+            LOGGER.info(
+                "Ignoring skip_homepage_warmup — VIRGIN session needs homepage cookies first",
+                extra={"url": profile_url},
+            )
+        if skip_home:
+            LOGGER.info(
+                "Skipping homepage warmup — reusing sticky cookies from prior SUCCESS",
+                extra={"url": profile_url},
+            )
         grid_ready = _warmup_and_open_profile(
             page,
             profile_url,
             sticky_identity=sticky_identity if use_sticky else None,
+            network_posts=network_posts,
+            ssr_posts_out=ssr_posts_out,
+            skip_homepage_warmup=skip_home,
         )
+        _check_attempt_deadline(attempt_deadline, phase="after_warmup_profile")
 
         # Captcha modal reel: inutile de re-attendre 25s / re-warmup.
         # Soft-block squelette (sans captcha) -> on tente l'extract ci-dessous.
@@ -1772,20 +2958,132 @@ def _scrape_with_browser(
                         "url": profile_url,
                     }
                 try:
+                    ssr_posts_out.clear()
+                    # Apres captcha: forcer un vrai warmup homepage.
                     grid_ready = _warmup_and_open_profile(
                         page,
                         profile_url,
                         sticky_identity=sticky_identity if use_sticky else None,
+                        network_posts=network_posts,
+                        ssr_posts_out=ssr_posts_out,
+                        skip_homepage_warmup=False,
                     )
                 except Exception:
                     LOGGER.warning("Challenge retry warmup failed", exc_info=True)
 
-        # Purge des reponses reseau captees pendant le warmup (home "For You",
-        # etc.): a partir d'ici, on ne veut compter QUE les videos du profil
-        # cible chargees dans la boucle de scroll ci-dessous.
-        network_posts.clear()
-
+        # Priorite ABSOLUE: buffer reseau (preload/item_list) deja rempli
+        # pendant warmup/nav — SUCCESS direct, zero wait/scroll/rotation.
         seen = set()
+        ssr_uni_len = 0
+
+        def _ingest_network_posts(*, force: bool = False) -> int:
+            """Drain `network_posts` → `all_posts`. Preserve les non-ingeres."""
+            ingested = 0
+            remaining: list[dict] = []
+            for card in list(network_posts):
+                if not isinstance(card, dict):
+                    continue
+                if len(all_posts) >= max_posts:
+                    remaining.append(card)
+                    continue
+                stamped = (
+                    _stamp_network_api_post(card, target_username)
+                    if force or str(card.get("_source") or "") == "network_api"
+                    else card
+                )
+                sig = _video_signature(stamped)
+                if not sig or sig in seen:
+                    continue
+                if not force and not _card_belongs_to_profile(stamped, target_username):
+                    remaining.append(stamped)
+                    continue
+                seen.add(sig)
+                all_posts.append(stamped)
+                ingested += 1
+            network_posts.clear()
+            network_posts.extend(remaining)
+            return ingested
+
+        # 1) Buffer reseau d'abord (souvent deja rempli avant cette ligne).
+        api_ingested = _ingest_network_posts(force=True)
+        if api_ingested:
+            LOGGER.info(
+                "Network buffer SUCCESS: ingested %d posts (skip SSR wait/scroll)",
+                api_ingested,
+                extra={"url": profile_url},
+            )
+
+        # 2) SSR seulement si buffer reseau vide.
+        if not all_posts:
+            try:
+                if ssr_posts_out:
+                    profile_posts = list(ssr_posts_out)
+                    ssr_uni_len = _probe_universal_len(page)
+                else:
+                    ssr_uni_len, profile_posts = extract_posts_from_hydration(
+                        page, profile_url=profile_url
+                    )
+                    if profile_posts:
+                        ssr_posts_out.extend(profile_posts)
+            except Exception:
+                LOGGER.warning("Profile-first hydration extract failed", exc_info=True)
+                profile_posts = []
+                ssr_uni_len = _probe_universal_len(page)
+
+            for card in profile_posts:
+                sig = _video_signature(card)
+                if sig in seen or not _card_belongs_to_profile(card, target_username):
+                    seen.add(sig)
+                    continue
+                seen.add(sig)
+                all_posts.append(card)
+                if len(all_posts) >= max_posts:
+                    break
+
+        # 3) Attente item_list UNIQUEMENT si toujours 0 post.
+        if not all_posts and (ssr_uni_len > 50000 or grid_ready):
+            wait_ms = _grid_wait_ms()
+            LOGGER.info(
+                "No posts yet (universalLen=%s) — waiting up to %sms for item_list/DOM",
+                ssr_uni_len,
+                wait_ms,
+                extra={"url": profile_url},
+            )
+            _wait_for_profile_grid_data(page, network_posts, timeout_ms=wait_ms)
+            api_ingested = _ingest_network_posts(force=True)
+            if api_ingested:
+                LOGGER.info(
+                    "Ingested %d posts from profile grid API after wait",
+                    api_ingested,
+                    extra={"url": profile_url},
+                )
+
+        # 3b) SPA n'a jamais emis item_list → fetch signe in-page (etape 1 Claude).
+        if not all_posts and (ssr_uni_len > 50000 or grid_ready):
+            forced_n = _ingest_forced_item_list(
+                page,
+                network_posts,
+                profile_url=profile_url,
+                target_username=target_username,
+                count=min(30, max_posts) if max_posts else 30,
+            )
+            if forced_n:
+                api_ingested = _ingest_network_posts(force=True)
+                if api_ingested:
+                    LOGGER.info(
+                        "Ingested %d posts from FORCED item_list fetch",
+                        api_ingested,
+                        extra={"url": profile_url},
+                    )
+
+        # Fast-path si posts presents (reseau ou SSR).
+        ssr_fast_path = bool(all_posts)
+        if all_posts:
+            LOGGER.info(
+                "Profile extract ready with %d posts (network/SSR) — no soft-failure",
+                len(all_posts),
+                extra={"url": profile_url},
+            )
 
         stop_due_to_age = False
 
@@ -1806,6 +3104,25 @@ def _scrape_with_browser(
         max_consecutive_empty_scrolls = _env_int("TIKTOK_MAX_EMPTY_SCROLLS", 2)
         consecutive_empty_scrolls = 0
 
+        if ssr_fast_path:
+            LOGGER.info(
+                "API/SSR fast-path: skipping scroll (posts=%s buffer_left=%s)",
+                len(all_posts),
+                len(network_posts),
+                extra={"url": profile_url},
+            )
+            max_scroll_iterations = 0
+        elif ssr_uni_len > 50000 and not all_posts:
+            max_scroll_iterations = max(
+                1, min(2, _env_int("TIKTOK_SSR_EMPTY_MAX_SCROLLS", 2))
+            )
+            max_consecutive_empty_scrolls = 1
+            LOGGER.info(
+                "SSR empty of posts — allowing %d minimal scroll(s) for item_list",
+                max_scroll_iterations,
+                extra={"url": profile_url},
+            )
+
         def _safe_collect_from_page() -> list[dict]:
             cards: list[dict] = []
             try:
@@ -1816,16 +3133,19 @@ def _scrape_with_browser(
                 cards.extend(_extract_posts_from_page_html(page, profile_url))
             except Exception:
                 LOGGER.debug("HTML extract failed during soft-block recovery", exc_info=True)
+            cards.extend(list(network_posts))
             return cards
 
-        # Soft-block (squelette): extract HTML/DOM immediat, puis 1 scroll max.
-        if not grid_ready:
+        # Grille pas encore prete: extract API/DOM (ne PAS vider le buffer avant ingest).
+        if not all_posts and (not grid_ready or ssr_uni_len > 50000):
             LOGGER.info(
-                "Profile grid soft-blocked (no /video/ links); fail-fast extract",
+                "Profile grid not ready yet — API/DOM extract + short wait (not WAF)",
                 extra={"url": profile_url},
             )
-            max_scroll_iterations = 1
-            max_consecutive_empty_scrolls = 1
+            if max_scroll_iterations == 0:
+                max_scroll_iterations = 1
+            max_consecutive_empty_scrolls = max(1, max_consecutive_empty_scrolls)
+            _ingest_network_posts(force=True)
             for card in _safe_collect_from_page():
                 sig = _video_signature(card)
                 if sig in seen or not _card_belongs_to_profile(card, target_username):
@@ -1837,14 +3157,17 @@ def _scrape_with_browser(
                     break
             if all_posts:
                 LOGGER.info(
-                    "Recovered %d posts from soft-blocked page HTML/DOM",
+                    "Recovered %d posts from API/HTML/DOM (no WAF mark)",
                     len(all_posts),
                     extra={"url": profile_url},
                 )
+                ssr_fast_path = True
+                max_scroll_iterations = 0
 
         # Scroll progressif pour charger davantage de posts.
         iteration = 0
         while iteration < max_scroll_iterations and len(all_posts) < max_posts:
+            _check_attempt_deadline(attempt_deadline, phase=f"scroll_{iteration}")
             iteration += 1
 
             if _looks_like_tiktok_challenge(page):
@@ -1858,8 +3181,9 @@ def _scrape_with_browser(
                     return {"posts": [], "total": 0, "error": "challenge_detected", "url": profile_url}
 
             cards = _extract_video_cards(page, profile_url)
-            batch = cards + network_posts
-            network_posts = []
+            # Ingerer d'abord le buffer reseau (ne jamais le drop avant append).
+            _ingest_network_posts(force=True)
+            batch = cards
 
             new_posts_this_round = 0
             for card in batch:
@@ -1917,7 +3241,13 @@ def _scrape_with_browser(
                 _rotate_ipv6_identity()  # 1) le proxy local choisit une nouvelle IPv6
                 _close_current_context()  # 2) on ferme le navigateur actuel (et ses connexions "vieille IP")
                 _open_context_and_page()  # 3) on ouvre un navigateur neuf: ses connexions utiliseront la nouvelle IPv6
-                _warmup_and_open_profile(page, profile_url)  # 4) on recharge la page profil dans ce nouveau contexte
+                _warmup_and_open_profile(
+                    page,
+                    profile_url,
+                    sticky_identity=sticky_identity if use_sticky else None,
+                    network_posts=network_posts,
+                    skip_homepage_warmup=False,
+                )  # 4) recharge profil dans contexte neuf (warmup homepage OK)
                 posts_at_last_rotation = len(all_posts)
                 consecutive_empty_scrolls = 0
                 # On ne scrolle pas immediatement: la page vient d'etre
@@ -1937,8 +3267,7 @@ def _scrape_with_browser(
             else:
                 consecutive_empty_scrolls = 0
 
-            page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
-            _human_pause(1.7, 1.0)
+            _human_scroll_page(page)
 
             if _looks_like_tiktok_challenge(page):
                 if all_posts:
@@ -1947,27 +3276,53 @@ def _scrape_with_browser(
                 _save_challenge_artifacts(page)
                 return {"posts": [], "total": 0, "error": "challenge_detected", "url": profile_url}
 
+        # Posts API arrives souvent APRES le 1er rendu — drain buffer avant abandon.
+        late_api = _ingest_network_posts(force=True)
+        if late_api:
+            LOGGER.info(
+                "Ingested %d late grid API posts after scroll loop",
+                late_api,
+                extra={"url": profile_url},
+            )
+
         # Fallback final si aucune video n'a pu etre extraite via navigateur.
         if not all_posts:
-            # Si la grille n'est jamais apparue, un 2e wait de 25s est inutile.
-            if grid_ready:
-                _wait_for_profile_video_links(page)
-            else:
-                _wait_for_profile_video_links(page, timeout_ms=max(2000, _env_int("TIKTOK_WAIT_VIDEO_LINKS_SOFT_MS", 5000)))
-            _human_pause(0.8, 0.4)
-            late_cards = _extract_video_cards(page, profile_url)
-            late_html = _extract_posts_from_page_html(page, profile_url)
-            for card in late_cards + late_html + network_posts:
-                sig = _video_signature(card)
-                if sig in seen:
-                    continue
-                if not _card_belongs_to_profile(card, target_username):
+            # Si le buffer a encore des posts: SUCCESS, jamais soft-failure.
+            if network_posts:
+                _ingest_network_posts(force=True)
+            if not all_posts:
+                wait_ms = _grid_wait_ms()
+                LOGGER.info(
+                    "No posts yet — final %sms wait for item_list/DOM (not WAF)",
+                    wait_ms,
+                    extra={"url": profile_url},
+                )
+                _wait_for_profile_grid_data(page, network_posts, timeout_ms=wait_ms)
+                _ingest_network_posts(force=True)
+                _human_pause(0.5, 0.3)
+                late_cards = _extract_video_cards(page, profile_url)
+                late_html = _extract_posts_from_page_html(page, profile_url)
+                for card in late_cards + late_html:
+                    sig = _video_signature(card)
+                    if sig in seen:
+                        continue
+                    if not _card_belongs_to_profile(card, target_username):
+                        seen.add(sig)
+                        continue
                     seen.add(sig)
-                    continue
-                seen.add(sig)
-                all_posts.append(card)
-                if len(all_posts) >= max_posts:
-                    break
+                    all_posts.append(card)
+                    if len(all_posts) >= max_posts:
+                        break
+                _ingest_network_posts(force=True)
+
+        # Securite finale: buffer reseau non vide ⇒ SUCCESS (jamais soft-failure/WAF).
+        if not all_posts and network_posts:
+            _ingest_network_posts(force=True)
+            LOGGER.info(
+                "Final network buffer drain → %d posts (prevent soft-failure)",
+                len(all_posts),
+                extra={"url": profile_url},
+            )
 
         if not all_posts:
             http_posts = _extract_posts_from_html_fallback(profile_url)
@@ -1989,6 +3344,7 @@ def _scrape_with_browser(
                             on_post(dict(post))
                         except Exception:
                             LOGGER.warning("on_post callback error", exc_info=True)
+                scrape_succeeded = True
                 return {"posts": http_posts[:max_posts], "total": min(len(http_posts), max_posts), "url": profile_url}
             if _looks_like_tiktok_challenge(page):
                 _save_challenge_artifacts(page)
@@ -1997,18 +3353,114 @@ def _scrape_with_browser(
             # quand meme un screenshot/HTML, ce cas etant souvent aussi
             # difficile a diagnostiquer qu'un challenge classique (page vide,
             # redirection silencieuse, geo-restriction du proxy...).
+            # Ne JAMAIS arriver ici si network_posts avait des elements.
             _save_challenge_artifacts(page, label="no_posts_found")
             return {"posts": [], "total": 0, "error": "no_posts_found", "url": profile_url}
 
-        # Post-traitements: enrichissement detail + analyse IA optionnelle.
-        enriched_posts = _enrich_posts_from_video_pages(context, all_posts)
-        if analyze_video_content:
-            analyzed_posts = _attach_video_analysis(enriched_posts, on_post=None)
+        # Post-traitements: enrichment conditionnel (skip si metrics profil
+        # OU si le budget 35s est deja epuise — on renvoie les posts bruts).
+        try:
+            _check_attempt_deadline(attempt_deadline, phase="before_enrich")
+            enrich_ok = True
+        except AttemptTimeoutError:
+            LOGGER.warning(
+                "[PERF] Skipping enrichment — attempt budget already spent (%d posts kept)",
+                len(all_posts),
+                extra={"url": profile_url},
+            )
+            enrich_ok = False
+
+        if enrich_ok:
+            enriched_posts = _enrich_posts_from_video_pages(context, all_posts)
+            if analyze_video_content:
+                analyzed_posts = _attach_video_analysis(enriched_posts, on_post=None)
+            else:
+                analyzed_posts = enriched_posts
         else:
-            analyzed_posts = enriched_posts
+            analyzed_posts = all_posts[:max_posts]
 
         warning = "challenge_detected_partial" if _looks_like_tiktok_challenge(page) else None
+        if not enrich_ok:
+            warning = (warning + ";attempt_timeout_no_enrich") if warning else "attempt_timeout_no_enrich"
+        scrape_succeeded = True
         return _build_partial_result(analyzed_posts, warning=warning)
+    except AttemptTimeoutError as e:
+        LOGGER.warning(
+            "[PERF] Attempt budget exceeded (%.0fs) — rotate proxy: %s",
+            _attempt_timeout_s(),
+            str(e)[:120],
+            extra={"url": profile_url},
+        )
+        if all_posts:
+            scrape_succeeded = True
+            return {
+                "posts": all_posts[:max_posts],
+                "total": min(len(all_posts), max_posts),
+                "url": profile_url,
+                "warning": "attempt_timeout_partial",
+            }
+        if use_sticky and sticky_identity:
+            purge_sticky_after_failure(
+                sticky_identity,
+                reason="attempt_timeout",
+                mark_waf=False,
+            )
+        return {
+            "posts": [],
+            "total": 0,
+            "error": "proxy_blocked:attempt_timeout",
+            "error_detail": str(e)[:160],
+            "url": profile_url,
+        }
+    except (ProxyBlockedException, AntibotBlockedException) as e:
+        kind = getattr(e, "kind", None) or "blocked"
+        error_code = f"proxy_blocked:{kind}"
+        # Timeout goto / TLS: toujours soft — le caller rotationne l'IP Webshare.
+        if kind == "auth" or is_proxy_auth_error(str(e)):
+            LOGGER.warning(
+                "[PROXY] AUTH FAILURE — sticky invalidate + abort IP retries "
+                "(worker continues next job)",
+                extra={"error": str(e)[:160], "url": profile_url},
+            )
+            error_code = "proxy_blocked:auth"
+        elif kind == "tls_timeout":
+            LOGGER.warning(
+                "[ANTIBOT] TLS/NAV TIMEOUT on goto — invalidate sticky + rotate next IP "
+                "(worker continues)",
+                extra={"error": str(e)[:160], "url": profile_url},
+            )
+        elif str(kind).startswith("http_") or isinstance(e, AntibotBlockedException):
+            LOGGER.warning(
+                "[ANTIBOT_BLOCKED] HTTP %s on IP — purge sticky + rotate",
+                kind,
+                extra={"error": str(e)[:160], "url": profile_url},
+            )
+        else:
+            LOGGER.warning(
+                "[ANTIBOT] Proxy blocked (%s); purge+rotate required",
+                kind,
+                extra={"error": str(e)[:160], "url": profile_url},
+            )
+        if use_sticky and sticky_identity:
+            # Timeout: invalider cookies (prochain essai = warmup homepage),
+            # mais WAF mark seulement pour HTTP block reel.
+            purge_sticky_after_failure(
+                sticky_identity,
+                reason=error_code,
+                mark_waf=(kind != "tls_timeout")
+                and (
+                    _is_real_waf_block(page, error=error_code)
+                    or str(kind) in ("http_403", "http_429", "http_404", "http_503", "auth")
+                    or isinstance(e, AntibotBlockedException)
+                ),
+            )
+        return {
+            "posts": [],
+            "total": 0,
+            "error": error_code,
+            "error_detail": str(e)[:200],
+            "url": profile_url,
+        }
     except Exception as e:
         # Beaucoup d'exceptions ici sont ATTENDUES et deja gerees par la rotation
         # de proxy en amont (proxy lent/mort/bloque): net::ERR_TIMED_OUT,
@@ -2034,6 +3486,7 @@ def _scrape_with_browser(
                 "Exception occurred but %d posts were already collected; returning them as partial result",
                 len(all_posts),
             )
+            scrape_succeeded = True
             return {
                 "posts": all_posts,
                 "total": len(all_posts),
@@ -2041,22 +3494,48 @@ def _scrape_with_browser(
                 "error": str(e),
                 "warning": "exception_with_partial_posts",
             }
+        if use_sticky and sticky_identity:
+            reason = err_text.splitlines()[0][:160] if err_text else "exception"
+            purge_sticky_after_failure(
+                sticky_identity,
+                reason=reason,
+                mark_waf=_is_real_waf_block(page, error=reason),
+            )
         return {"posts": [], "error": str(e), "url": profile_url}
     finally:
-        # `context`/`browser` peuvent etre None si une exception est survenue
-        # PENDANT une rotation IPv6 (entre la fermeture de l'ancien contexte
-        # et l'ouverture du nouveau) - on protege donc ces appels.
-        if use_sticky and sticky_identity and context is not None:
-            # Persiste les cookies du run. Marque ".warmed" UNIQUEMENT si on a
-            # vraiment recupere des videos: sinon on prefererait a tort des
-            # sticky soft-blockees (grille vide) au prochain job.
+        # Cycle de vie cookies:
+        # - Succes (+ REUSE): persister ttwid/msToken + mark success=True
+        # - Echec: mark success=False + purge VIRGIN (pas de reinjection au retry)
+        reuse_ok = _env_bool("TIKTOK_REUSE_STICKY_COOKIES", True)
+        if use_sticky and sticky_identity:
+            try:
+                sticky_sessions.mark_attempt_result(
+                    sticky_identity,
+                    success=bool(scrape_succeeded),
+                    reason="scrape_ok" if scrape_succeeded else "scrape_failed",
+                )
+            except Exception:
+                LOGGER.debug("Failed to mark sticky attempt result", exc_info=True)
+
+        if use_sticky and sticky_identity and context is not None and scrape_succeeded:
             try:
                 cookies = context.cookies()
-                sticky_sessions.save_sticky_cookies(sticky_identity, cookies)
-                if all_posts:
+                names = {str(c.get("name") or "") for c in (cookies or [])}
+                warm = "ttwid" in names and (
+                    "msToken" in names or any(n.startswith("msToken") for n in names)
+                )
+                if reuse_ok and warm:
+                    sticky_sessions.save_sticky_cookies(sticky_identity, cookies)
                     sticky_sessions.mark_session_warmed(sticky_identity, cookies)
+                    LOGGER.info(
+                        "Persisted sticky cookies (reuse=%s success=%s)",
+                        reuse_ok,
+                        scrape_succeeded,
+                        extra={"url": sticky_identity},
+                    )
             except Exception:
-                LOGGER.debug("Failed to persist sticky cookies after run", exc_info=True)
+                LOGGER.debug("Failed to persist sticky cookies", exc_info=True)
+
         if context is not None:
             try:
                 context.close()
@@ -2067,9 +3546,27 @@ def _scrape_with_browser(
                 browser.close()
             except Exception:
                 LOGGER.warning("Failed to close browser", exc_info=True)
+
+        # Wipe disque apres echec reseau/WAF. no_posts HTTP 200 ≠ WAF.
+        if use_sticky and sticky_identity and not scrape_succeeded:
+            should_purge = _env_bool("PURGE_STICKY_ON_BLOCK", True) or (not reuse_ok)
+            if should_purge:
+                try:
+                    sticky_sessions.purge_sticky_cookies(
+                        sticky_identity,
+                        reason="post_attempt_failure",
+                        mark_waf=_is_real_waf_block(page, error="post_attempt_failure"),
+                    )
+                except Exception:
+                    LOGGER.debug("Failed to wipe sticky after attempt", exc_info=True)
+
         if sticky_session_dir is not None and sticky_lock_held:
-            sticky_sessions.touch_session(sticky_session_dir)
-            sticky_sessions.release_session_lock(sticky_session_dir)
+            try:
+                if sticky_session_dir.exists():
+                    sticky_sessions.touch_session(sticky_session_dir)
+                    sticky_sessions.release_session_lock(sticky_session_dir)
+            except Exception:
+                LOGGER.debug("Failed to release sticky lock", exc_info=True)
             sticky_sessions.enforce_lru_limit()
 
 
@@ -2448,37 +3945,261 @@ def _dismiss_cookie_banner(page):
             continue
 
 
-def _auto_warm_sticky_session(page, identity: str) -> None:
-    """Chauffe une IP sans cookies valides, puis stocke cookies.json pour CETTE IP.
+def _diag_log_external_ip(page, phase: str) -> None:
+    """IP externe vue via le contexte navigateur (passe par le proxy si actif)."""
+    if not _diag_softblock_enabled():
+        return
+    ip = "?"
+    try:
+        resp = page.context.request.get("https://api.ipify.org?format=json", timeout=10000)
+        try:
+            payload = resp.json()
+            ip = str((payload or {}).get("ip") or resp.text() or "?")
+        except Exception:
+            ip = (resp.text() or "?")[:64]
+        LOGGER.warning(
+            "[DIAG] %s external_ip=%s http=%s",
+            phase,
+            ip,
+            getattr(resp, "status", "?"),
+        )
+    except Exception as exc:
+        LOGGER.warning("[DIAG] %s external_ip fetch failed: %s", phase, str(exc)[:120])
 
-    Visite TikTok via LE proxy du profil persistant, accepte cookies, scrolle
-    legerement pour que Chrome ecrive ttwid/msToken/etc. Pas de login manuel.
-    """
-    LOGGER.info("Warming cookies for sticky IP (missing/invalid)", extra={"url": identity})
-    page.goto("https://www.tiktok.com/", wait_until="domcontentloaded", timeout=60000)
-    _dismiss_cookie_banner(page)
-    _human_pause(2.0, 1.0)
+
+def _diag_log_cookies(page, phase: str) -> None:
+    """Liste detaillee des cookies TikTok apres warmup / profil."""
+    if not _diag_softblock_enabled():
+        return
     try:
-        page.mouse.wheel(0, 1200)
+        cookies = page.context.cookies() or []
+    except Exception as exc:
+        LOGGER.warning("[DIAG] %s cookies read failed: %s", phase, str(exc)[:120])
+        return
+    names = sorted({str(c.get("name") or "") for c in cookies if c.get("name")})
+    key_names = (
+        "ttwid",
+        "msToken",
+        "tt_chain_token",
+        "tt_csrf_token",
+        "s_v_web_id",
+        "odin_tt",
+        "passport_csrf_token",
+        "sid_tt",
+        "sessionid",
+    )
+    detail = {}
+    for c in cookies:
+        name = str(c.get("name") or "")
+        if name in key_names:
+            val = str(c.get("value") or "")
+            detail[name] = {
+                "len": len(val),
+                "domain": c.get("domain"),
+                "path": c.get("path"),
+                "preview": (val[:12] + "…") if len(val) > 12 else val,
+            }
+    LOGGER.warning(
+        "[DIAG] %s cookies_total=%d has_ttwid=%s has_msToken=%s names=%s key=%s",
+        phase,
+        len(cookies),
+        "ttwid" in names,
+        any(n.startswith("msToken") or n == "msToken" for n in names),
+        names[:40],
+        detail,
+    )
+
+
+def _diag_log_hydration(page, phase: str) -> None:
+    """Presence __UNIVERSAL_DATA_FOR_REHYDRATION__ / __INIT_DATA__ / liens video."""
+    if not _diag_softblock_enabled():
+        return
+    try:
+        flags = page.evaluate(
+            """() => {
+              const uni = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__');
+              const init = document.getElementById('__INIT_DATA__')
+                || document.querySelector('[id*="__INIT_DATA__"]');
+              const sigi = document.getElementById('SIGI_STATE');
+              let uniLen = 0;
+              try { uniLen = uni && uni.textContent ? uni.textContent.length : 0; } catch (e) {}
+              return {
+                universal: !!uni,
+                universalLen: uniLen,
+                initData: !!init,
+                sigi: !!sigi,
+                videoLinks: document.querySelectorAll('a[href*="/video/"]').length,
+                bodyLen: (document.body && document.body.innerText || '').length,
+                webdriver: navigator.webdriver,
+                ua: navigator.userAgent || '',
+                url: location.href || '',
+              };
+            }"""
+        )
+        LOGGER.warning("[DIAG] %s hydration=%s", phase, flags)
+    except Exception as exc:
+        LOGGER.warning("[DIAG] %s hydration probe failed: %s", phase, str(exc)[:120])
+
+
+def _diag_log_profile_http(response, profile_url: str, exc: BaseException | None = None) -> None:
+    """Code HTTP + headers bruts de la navigation profil."""
+    if not _diag_softblock_enabled():
+        return
+    if response is None:
+        LOGGER.warning(
+            "[DIAG] profile_http response=None url=%s exc=%s",
+            profile_url,
+            (str(exc).splitlines()[0][:200] if exc else None),
+        )
+        return
+    try:
+        headers = {}
+        try:
+            headers = dict(response.headers)
+        except Exception:
+            headers = {}
+        interesting = {
+            k: headers.get(k)
+            for k in (
+                "content-type",
+                "content-length",
+                "server",
+                "x-cache",
+                "x-tt-logid",
+                "x-forbidden-reason",
+                "akamai-grn",
+                "set-cookie",
+            )
+            if headers.get(k) is not None
+        }
+        LOGGER.warning(
+            "[DIAG] profile_http status=%s ok=%s url=%s headers=%s",
+            getattr(response, "status", None),
+            getattr(response, "ok", None),
+            (getattr(response, "url", None) or profile_url)[:180],
+            interesting or {k: headers[k] for k in list(headers)[:12]},
+        )
+    except Exception as exc:
+        LOGGER.warning("[DIAG] profile_http log failed: %s", str(exc)[:120])
+
+
+def _cookies_have_tiktok_warmup(cookies: list | None) -> bool:
+    names = {str(c.get("name") or "") for c in (cookies or []) if isinstance(c, dict)}
+    has_ttwid = "ttwid" in names
+    has_ms = "msToken" in names or any(n.startswith("msToken") for n in names)
+    return has_ttwid and has_ms
+
+
+def _persist_warmup_cookies(page, sticky_identity: str | None) -> None:
+    """Sauvegarde ttwid/msToken apres warmup pour reemploi sur la meme IP."""
+    if not sticky_identity or sticky_identity == "direct":
+        return
+    if not _env_bool("TIKTOK_REUSE_STICKY_COOKIES", True):
+        return
+    try:
+        cookies = page.context.cookies() or []
     except Exception:
-        pass
-    _human_pause(1.5, 0.8)
+        return
+    if not _cookies_have_tiktok_warmup(cookies):
+        LOGGER.warning(
+            "Warmup cookies incomplete — not persisting yet",
+            extra={"url": sticky_identity},
+        )
+        return
     try:
-        page.goto("https://www.tiktok.com/foryou", wait_until="domcontentloaded", timeout=45000)
-        _dismiss_cookie_banner(page)
-        _human_pause(1.5, 0.8)
-    except Exception:
-        LOGGER.debug("Auto-warm foryou navigation failed", exc_info=True)
-    try:
-        cookies = page.context.cookies()
-        sticky_sessions.mark_session_warmed(identity, cookies)
+        sticky_sessions.save_sticky_cookies(sticky_identity, cookies)
+        sticky_sessions.mark_session_warmed(sticky_identity, cookies)
         LOGGER.info(
-            "Stored warmed cookies for sticky IP",
-            extra={"url": f"{identity} cookies={len(cookies)}"},
+            "Persisted warmup cookies for sticky IP (ttwid+msToken)",
+            extra={"url": sticky_identity},
         )
     except Exception:
-        LOGGER.warning("Failed to persist warmed cookies for sticky IP", exc_info=True)
-        sticky_sessions.mark_session_warmed(identity, None)
+        LOGGER.debug("Failed to persist warmup cookies", exc_info=True)
+
+
+def warmup_session(page, sticky_identity: str | None = None) -> None:
+    """Chauffe homepage rapidement AVANT le profil (max ~8s cookies).
+
+    Sequence:
+      1) goto https://www.tiktok.com/
+      2) mini-scroll souris leger
+      3) poll ttwid+msToken (max 8s) — enchaine DES QUE presents (pas de sleep fixe)
+      4) persister cookies sticky si REUSE=true
+    """
+    LOGGER.info(
+        "Warmup session: homepage landing + cookie wait (sticky=%s)",
+        sticky_identity or "none",
+        extra={"url": sticky_identity or "direct"},
+    )
+    # 1) Homepage — fail-fast si HTTP block / TLS timeout.
+    home_resp = goto_strict(page, "https://www.tiktok.com/", timeout=nav_timeout_ms())
+    if _diag_softblock_enabled():
+        try:
+            LOGGER.warning(
+                "[DIAG] warmup_home HTTP status=%s url=%s",
+                getattr(home_resp, "status", None),
+                getattr(home_resp, "url", "https://www.tiktok.com/"),
+            )
+        except Exception:
+            pass
+    _dismiss_cookie_banner(page)
+
+    # 2) Micro-interaction (pas de pause longue).
+    try:
+        page.mouse.move(random.randint(120, 500), random.randint(140, 420))
+        page.mouse.wheel(0, random.randint(150, 350))
+    except Exception:
+        LOGGER.debug("Warmup landing mouse/scroll failed", exc_info=True)
+
+    # 3) Poll cookies WAF — plafond 8s, sortie immédiat si prêts.
+    cookie_budget_ms = max(2000, min(8000, _env_int("TIKTOK_WARMUP_WAIT_MS", 8000)))
+    poll_ms = 250
+    deadline = time.monotonic() + (cookie_budget_ms / 1000.0)
+    warm_ok = False
+    while time.monotonic() < deadline:
+        try:
+            cookies = page.context.cookies() or []
+            if _cookies_have_tiktok_warmup(cookies):
+                warm_ok = True
+                break
+        except Exception:
+            pass
+        try:
+            page.wait_for_timeout(poll_ms)
+        except Exception:
+            time.sleep(poll_ms / 1000.0)
+
+    if warm_ok:
+        LOGGER.info(
+            "Warmup: ttwid+msToken ready — chaining to profile immediately",
+            extra={"url": sticky_identity or "direct"},
+        )
+    else:
+        LOGGER.warning(
+            "Warmup: ttwid/msToken not both ready within %dms — continuing anyway",
+            cookie_budget_ms,
+            extra={"url": sticky_identity or "direct"},
+        )
+
+    try:
+        cookies = page.context.cookies() or []
+        names = {str(c.get("name") or "") for c in cookies}
+        warm_ok = _cookies_have_tiktok_warmup(cookies)
+        LOGGER.info(
+            "Warmup homepage OK — cookies=%s ttwid=%s msToken=%s warm_ok=%s",
+            len(names),
+            "ttwid" in names,
+            "msToken" in names or any(n.startswith("msToken") for n in names),
+            warm_ok,
+            extra={"url": sticky_identity or "direct"},
+        )
+    except Exception:
+        LOGGER.info("Warmup homepage OK", extra={"url": sticky_identity or "direct"})
+
+    _diag_log_external_ip(page, "warmup_home")
+    _diag_log_cookies(page, "warmup_home")
+    _diag_log_hydration(page, "warmup_home")
+    _persist_warmup_cookies(page, sticky_identity)
 
 
 def _profile_has_loading_skeleton(page) -> bool:
@@ -2504,49 +4225,675 @@ def _profile_has_loading_skeleton(page) -> bool:
         return False
 
 
-def _warmup_and_open_profile(page, profile_url: str, sticky_identity: str | None = None) -> bool:
-    """Ouvre le profil: reutilise cookies IP si valides, sinon chauffe + stocke.
+def _apply_chrome_profile_nav_headers(page, *, referer: str = "https://www.tiktok.com/") -> None:
+    """Headers avant navigation profil.
 
-    Retourne True si au moins un lien /video/ est apparu (grille hydratee).
+    Vrai Chrome: Referer + Accept-Language UNIQUEMENT (pas de Sec-CH-UA forge —
+    regression historique documentee: overlays → soft-block grille).
+    Chromium embarque: jeu complet Client-Hints.
+    Accept-Language suit le pays sticky (_ACTIVE_BROWSER_GEO).
     """
-    if sticky_identity and sticky_sessions.sticky_enabled():
-        if sticky_sessions.has_valid_cookies(sticky_identity):
-            LOGGER.info(
-                "Reusing valid cookies for sticky IP",
-                extra={"url": sticky_identity},
-            )
-        else:
-            # IP connue sans cookies, ou IP nouvelle (slot deja reserve via LRU).
-            _auto_warm_sticky_session(page, sticky_identity)
+    accept_lang = _active_accept_language()
+    if _is_real_chrome_channel():
+        headers = {
+            "Referer": referer or "https://www.tiktok.com/",
+            "Accept-Language": accept_lang,
+        }
+    else:
+        headers = {
+            "Referer": referer or "https://www.tiktok.com/",
+            "Accept-Language": accept_lang,
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,image/apng,*/*;q=0.8,"
+                "application/signed-exchange;v=b3;q=0.7"
+            ),
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-User": "?1",
+            "Sec-CH-UA": _CHROME_SEC_CH_UA,
+            "Sec-CH-UA-Platform": '"Windows"',
+            "Sec-CH-UA-Mobile": "?0",
+            "User-Agent": _chrome_user_agent(),
+        }
+    try:
+        page.set_extra_http_headers(headers)
+    except Exception:
+        LOGGER.debug("Failed to set Chrome nav headers on page", exc_info=True)
 
-    page.goto("https://www.tiktok.com/", wait_until="domcontentloaded", timeout=60000)
-    _dismiss_cookie_banner(page)
-    _human_pause(1.2, 0.8)
-    page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_selector("body", timeout=15000)
-    _dismiss_cookie_banner(page)
-    links_ok = _wait_for_profile_video_links(page)
-    # Souvent le profil est la avec un spinner: la grille hydrate 10-30s plus tard.
-    if not links_ok and _profile_has_loading_skeleton(page):
-        extra_ms = max(5000, _env_int("TIKTOK_WAIT_VIDEO_LINKS_EXTEND_MS", 20000))
-        LOGGER.info(
-            "Profile skeleton still loading; extended wait for video grid",
-            extra={"url": f"timeout_ms={extra_ms}"},
+
+def _profile_page_landed(page, username: str) -> bool:
+    """True si l'URL courante ressemble au profil cible (meme apres soft HTTP)."""
+    if not username:
+        return False
+    try:
+        current = (page.url or "").lower()
+    except Exception:
+        return False
+    if current.startswith("chrome-error:") or "chromewebdata" in current:
+        return False
+    handle = username.lower().lstrip("@")
+    if f"/@{handle}" in current:
+        return True
+    # Parfois query/hash; accepter prefix path.
+    return f"tiktok.com/@{handle}" in current.replace("www.", "")
+
+
+def _wait_profile_navigation_settle(page, timeout_ms: int | None = None) -> None:
+    """Attend fin de navigation (court) — evite race Execution context destroyed."""
+    t = min(5000, timeout_ms if timeout_ms is not None else nav_timeout_ms())
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=t)
+    except Exception:
+        pass
+    try:
+        page.wait_for_timeout(random.randint(80, 200))
+    except Exception:
+        pass
+
+
+def _is_hard_cdn_nav_failure(
+    page=None,
+    *,
+    exc: BaseException | str | None = None,
+    status: int | None = None,
+) -> bool:
+    """True pour ERR_HTTP / 403/404/429/503 / chrome-error → fail-fast."""
+    if status in (403, 404, 429, 401, 451, 503):
+        return True
+    err = str(exc or "").lower()
+    if any(
+        tok in err
+        for tok in (
+            "err_http_response_code_failure",
+            "http_403",
+            "http_404",
+            "http_429",
+            "http_503",
+            "http 403",
+            "chrome-error",
+            "chromewebdata",
         )
+    ):
+        return True
+    if page is not None and _page_is_chrome_error(page):
+        return True
+    return False
+
+
+def _response_content_length(response) -> int | None:
+    if response is None:
+        return None
+    try:
+        raw = (response.headers or {}).get("content-length")
+        if raw is None:
+            return None
+        return int(raw)
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _probe_universal_len(page) -> int:
+    """Taille du script #__UNIVERSAL_DATA_FOR_REHYDRATION__ (0 si absent)."""
+    try:
+        return int(
+            page.evaluate(
+                """() => {
+                  const uni = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__');
+                  return uni && uni.textContent ? uni.textContent.length : 0;
+                }"""
+            )
+            or 0
+        )
+    except Exception:
+        return 0
+
+
+def _response_is_silent_soft_block(response, page=None) -> bool:
+    """HTTP 200 + HTML minuscule / pas d'hydration = soft-block silencieux.
+
+    IMPORTANT: le header Content-Length est souvent trompeur (compression,
+    CL partiel, mismatch). Si le DOM contient deja un gros payload
+    __UNIVERSAL_DATA_FOR_REHYDRATION__, ce n'est PAS un soft-block.
+    """
+    # Priorite absolue: hydration SSR presente → jamais soft-block.
+    if page is not None:
+        uni_len = _probe_universal_len(page)
+        if uni_len > 50000:
+            return False
+        if uni_len > 2000:
+            return False
+
+    cl = _response_content_length(response)
+    if page is None:
+        # Sans page, CL seul est un signal faible — seulement les vrais squelettes.
+        return cl is not None and cl < 5000
+
+    try:
+        info = page.evaluate(
+            """() => {
+              const uni = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__');
+              const uniLen = uni && uni.textContent ? uni.textContent.length : 0;
+              const bodyLen = (document.body && document.body.innerText || '').length;
+              const videos = document.querySelectorAll('a[href*="/video/"]').length;
+              return { uniLen, bodyLen, videos };
+            }"""
+        )
+        if not isinstance(info, dict):
+            return False
+        uni_len = int(info.get("uniLen") or 0)
+        videos = int(info.get("videos") or 0)
+        body_len = int(info.get("bodyLen") or 0)
+        # Soft-block reel: pas d'hydration ET pas de videos ET body vide.
+        # Un CL header < 5k ne suffit PAS si uniLen / body disent le contraire.
+        if uni_len > 0 or videos > 0:
+            return False
+        if cl is not None and cl < 5000 and body_len < 200:
+            return True
+        return uni_len == 0 and videos == 0 and body_len < 200
+    except Exception:
+        # En cas d'echec probe: ne pas purger sur CL seul si douteux.
+        return False
+
+
+def _profile_page_usable(page, username: str) -> bool:
+    """True si le profil est vraiment hydrate (pas chrome-error / squelette vide).
+
+    Les logs DIAG ont montre: in-page click → URL @user OK mais universal=False /
+    videoLinks=0 → faux succes puis soft-block. On exige un signal de contenu.
+    """
+    if not _profile_page_landed(page, username):
+        return False
+    try:
+        info = page.evaluate(
+            """() => {
+              const href = location.href || '';
+              if (href.startsWith('chrome-error:') || href.includes('chromewebdata')) {
+                return {ok: false, reason: 'chrome_error', href};
+              }
+              const uni = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__');
+              const uniLen = uni && uni.textContent ? uni.textContent.length : 0;
+              const videos = document.querySelectorAll('a[href*="/video/"]').length;
+              const body = (document.body && document.body.innerText) || '';
+              const hasProfile = /Followers|Following|Likes|Abonn[eé]s|J'aime/i.test(body)
+                || !!document.querySelector(
+                  '[data-e2e="user-page"], [data-e2e="user-title"], [data-e2e="user-post-item"]'
+                );
+              const challenge = /captcha|verify you|unusual traffic|drag the/i.test(body);
+              const ok = !challenge && (uniLen > 2000 || videos > 0 || (hasProfile && body.length > 200));
+              return {
+                ok, reason: ok ? 'content' : (challenge ? 'challenge' : 'skeleton'),
+                uniLen, videos, hasProfile, challenge, bodyLen: body.length, href
+              };
+            }"""
+        )
+        if _diag_softblock_enabled():
+            LOGGER.warning("[DIAG] profile_usable=%s", info)
+        return bool(isinstance(info, dict) and info.get("ok"))
+    except Exception as exc:
+        LOGGER.warning("[DIAG] profile_usable probe failed: %s", str(exc)[:160])
+        return False
+
+
+def _ensure_on_tiktok_home(page) -> None:
+    """Revient sur la homepage si on n'y est plus (contexte conserve)."""
+    try:
+        current = (page.url or "").lower()
+    except Exception:
+        current = ""
+    if current.startswith("https://www.tiktok.com/") and "/@" not in current.split("?", 1)[0]:
+        if "/search" not in current:
+            return
+    _apply_chrome_profile_nav_headers(page, referer="https://www.tiktok.com/")
+    resp, exc, status = goto_catch_http(
+        page,
+        "https://www.tiktok.com/",
+        timeout=nav_timeout_ms(),
+        wait_until="domcontentloaded",
+    )
+    if exc is not None and not is_http_nav_failure(exc, status):
+        LOGGER.debug("Homepage re-nav soft failure: %s", exc)
+
+
+def _navigate_profile_via_inpage_click(page, profile_url: str, username: str) -> bool:
+    """Clic sur lien interne depuis la homepage — Referer same-origin naturel.
+
+    Succes UNIQUEMENT si la page est utilisable (hydration/profil), pas juste l'URL.
+    """
+    LOGGER.info(
+        "Profile CDN blocked — trying in-page link navigation (referrer bypass)",
+        extra={"url": profile_url},
+    )
+    _ensure_on_tiktok_home(page)
+    _dismiss_cookie_banner(page)
+    _apply_chrome_profile_nav_headers(page, referer="https://www.tiktok.com/")
+    try:
+        with page.expect_navigation(
+            wait_until="domcontentloaded",
+            timeout=nav_timeout_ms(),
+        ):
+            page.evaluate(
+                """(url) => {
+                  const a = document.createElement('a');
+                  a.href = url;
+                  a.rel = 'noopener';
+                  a.style.display = 'none';
+                  document.body.appendChild(a);
+                  a.click();
+                }""",
+                profile_url,
+            )
+    except Exception:
+        LOGGER.debug("In-page click navigation failed; trying location.assign", exc_info=True)
         try:
-            page.mouse.wheel(0, 800)
+            page.evaluate("(url) => { window.location.assign(url); }", profile_url)
+        except Exception:
+            return False
+    _wait_profile_navigation_settle(page)
+    _diag_log_hydration(page, "profile_after_inpage")
+    if _profile_page_usable(page, username):
+        return True
+    if _profile_page_landed(page, username):
+        LOGGER.warning(
+            "In-page reached @url but profile unusable (skeleton/soft-block) — will try search UI",
+            extra={"url": profile_url},
+        )
+    return False
+
+
+def _navigate_profile_via_search(page, profile_url: str, username: str) -> bool:
+    """Passe par /search/user?q=… puis clic sur le resultat profil."""
+    handle = (username or "").lower().lstrip("@")
+    if not handle:
+        return False
+    LOGGER.info(
+        "Profile CDN blocked — trying TikTok search UI navigation",
+        extra={"url": profile_url},
+    )
+    _ensure_on_tiktok_home(page)
+    _apply_chrome_profile_nav_headers(page, referer="https://www.tiktok.com/")
+    search_url = f"https://www.tiktok.com/search/user?q={handle}"
+    _resp, exc, status = goto_catch_http(
+        page,
+        search_url,
+        timeout=nav_timeout_ms(),
+        wait_until="domcontentloaded",
+    )
+    if exc is not None and is_http_nav_failure(exc, status) and is_http_blocked_status(status):
+        LOGGER.warning("Search page also HTTP-blocked (%s)", status)
+        return False
+    _dismiss_cookie_banner(page)
+    _human_pause(0.8, 0.4)
+    selectors = [
+        f'a[href="/@{handle}"]',
+        f'a[href*="/@{handle}?"]',
+        f'a[href*="/@{handle}"]',
+        f'[data-e2e="search-user-container"] a[href*="/@{handle}"]',
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            if loc.count() == 0:
+                continue
+            _apply_chrome_profile_nav_headers(
+                page,
+                referer=search_url,
+            )
+            with page.expect_navigation(
+                wait_until="domcontentloaded",
+                timeout=nav_timeout_ms(),
+            ):
+                loc.first.click(timeout=5000)
+            _wait_profile_navigation_settle(page)
+            _diag_log_hydration(page, "profile_after_search_click")
+            if _profile_page_usable(page, handle):
+                return True
+        except Exception:
+            LOGGER.debug("Search result click failed for %s", sel, exc_info=True)
+    # Dernier recours: goto profil avec Referer = page search.
+    _apply_chrome_profile_nav_headers(page, referer=search_url)
+    _resp, exc, status = goto_catch_http(
+        page,
+        profile_url,
+        timeout=nav_timeout_ms(),
+        wait_until="domcontentloaded",
+    )
+    _wait_profile_navigation_settle(page)
+    _diag_log_hydration(page, "profile_after_search_goto")
+    if is_http_nav_failure(exc, status) and not _profile_page_usable(page, handle):
+        return False
+    return _profile_page_usable(page, handle)
+
+
+def _navigate_to_profile_resilient(
+    page,
+    profile_url: str,
+    sticky_identity: str | None = None,
+    ssr_posts_out: list | None = None,
+) -> bool:
+    """Goto profil resilient. Retourne True si page usable / SSR OK.
+
+    Fast-fail (<1s) si ERR_HTTP_RESPONSE_CODE_FAILURE / 403 / chrome-error:
+      → PAS de settle / diag / in-page / search
+      → raise_proxy_blocked pour rotation immediate
+
+    Si goto1 livre deja __UNIVERSAL_DATA_FOR_REHYDRATION__ (>50k):
+      → extraire et return True immediatement
+    """
+    target = _normalize_profile_url(profile_url)
+    username = _username_from_url(target)
+    timeout = nav_timeout_ms()
+
+    def _accept_ssr_goto(phase: str) -> bool:
+        """True seulement si posts SSR deja presents (fast-path).
+
+        Gros SSR (uniLen>50k) SANS posts = squelette profil (pas SUCCESS) —
+        on laisse le caller attendre item_list / scroll.
+        """
+        uni_len, ssr_posts = _read_universal_ssr_posts(page, target)
+        if ssr_posts:
+            LOGGER.info(
+                "Profile %s SSR posts OK (universalLen=%s, posts=%s) — fast-path",
+                phase,
+                uni_len,
+                len(ssr_posts),
+                extra={"url": target},
+            )
+            if ssr_posts_out is not None:
+                ssr_posts_out.extend(ssr_posts)
+            return True
+        if uni_len > 50000:
+            LOGGER.info(
+                "Profile %s SSR skeleton (universalLen=%s, posts=0) — "
+                "NOT success yet; wait item_list/DOM",
+                phase,
+                uni_len,
+                extra={"url": target},
+            )
+        return False
+
+    def _raise_cdn_fast(exc, status) -> None:
+        """Invalide IP + raise immédiatement (<1s, sans settle)."""
+        reason = (
+            f"cdn_http_block status={status} "
+            f"{(str(exc).splitlines()[0][:120] if exc else '')}"
+        ).strip()
+        LOGGER.warning(
+            "[ANTIBOT] Hard CDN/HTTP failure — fail-fast rotate <1s (no settle/in-page): %s",
+            reason[:160],
+            extra={"url": target},
+        )
+        if sticky_identity:
+            purge_sticky_after_failure(
+                sticky_identity, reason=reason[:160], mark_waf=True
+            )
+        if is_antibot_http_status(status):
+            raise_antibot_blocked(target, int(status), reason[:160])
+        if exc is not None and "err_http_response_code_failure" in str(exc).lower():
+            raise_proxy_blocked(target, reason[:160], kind="http_block")
+        kind = "http_403" if (status == 403 or (status is None and exc)) else "http_block"
+        if status == 429:
+            kind = "http_429"
+        elif status == 404:
+            kind = "http_404"
+        elif status == 503:
+            kind = "http_503"
+        raise_proxy_blocked(target, reason[:160], kind=kind)
+
+    _apply_chrome_profile_nav_headers(page, referer="https://www.tiktok.com/")
+
+    # --- Tentative unique: goto direct (pas de fallback UI lent) ---
+    LOGGER.info("Profile nav attempt 1: goto domcontentloaded", extra={"url": target})
+    _resp, exc, status = goto_catch_http(
+        page, target, timeout=timeout, wait_until="domcontentloaded"
+    )
+
+    # Fast-fail IMMEDIAT sur ERR_HTTP / 403/404/429/503 / chrome-error — avant settle/diag.
+    if is_antibot_http_status(status) or is_http_nav_failure(exc, status) or _is_hard_cdn_nav_failure(
+        page, exc=exc, status=status
+    ):
+        _raise_cdn_fast(exc, status)
+
+    _wait_profile_navigation_settle(page, timeout_ms=min(3000, timeout))
+    _diag_log_profile_http(_resp, target, exc=exc)
+    _diag_log_cookies(page, "profile_after_goto1")
+    _diag_log_hydration(page, "profile_after_goto1")
+
+    # Extraction prioritaire immediate (AVANT soft-block check).
+    if _accept_ssr_goto("goto1"):
+        return True
+
+    # Hard CDN / HTTP failure detecte apres settle (chrome-error tardif).
+    if _is_hard_cdn_nav_failure(page, exc=exc, status=status):
+        _raise_cdn_fast(exc, status)
+
+    silent_sb = _response_is_silent_soft_block(_resp, page)
+    cl = _response_content_length(_resp)
+    if silent_sb:
+        # Silent soft-block (HTML minuscule) = aussi fail-fast, pas de search UI.
+        LOGGER.warning(
+            "Silent soft-block (content-length=%s) — fail-fast rotate (no in-page/search)",
+            cl,
+            extra={"url": target},
+        )
+        if sticky_identity:
+            purge_sticky_after_failure(
+                sticky_identity,
+                reason=f"silent_soft_block cl={cl}",
+                mark_waf=True,
+            )
+        raise_proxy_blocked(
+            target,
+            f"silent_soft_block content-length={cl}",
+            kind="http_403",
+        )
+
+    if not is_http_nav_failure(exc, status) and _profile_page_usable(page, username):
+        LOGGER.info("Profile goto OK (domcontentloaded + usable)", extra={"url": target})
+        return True
+
+    if exc is not None and not is_http_nav_failure(exc, status):
+        raise_proxy_blocked(
+            target,
+            f"{str(exc).splitlines()[0][:160]}",
+            kind="blocked",
+        )
+
+    # SSR encore present sans posts → OK (caller attendra item_list court).
+    if _probe_universal_len(page) > 50000:
+        LOGGER.info(
+            "SSR still present (universalLen>50k) — treat nav as OK",
+            extra={"url": target},
+        )
+        return True
+
+    LOGGER.warning(
+        "[ANTIBOT] Profile navigation failed after warmup — rotate (no UI fallback)",
+        extra={"url": target},
+    )
+    raise_proxy_blocked(
+        target,
+        f"profile_nav_fail content-length={cl} status={status}",
+        kind="http_403",
+    )
+    return False  # unreachable
+
+
+def _read_universal_ssr_posts(page, profile_url: str = "") -> tuple[int, list[dict]]:
+    """Lit #__UNIVERSAL_DATA_FOR_REHYDRATION__ et extrait les posts SSR in-browser.
+
+    Retourne (universalLen, posts). Parse dans le navigateur pour eviter
+    le transfert CDP fragile du payload ~255KB.
+    """
+    try:
+        return extract_posts_from_hydration(page, profile_url=profile_url)
+    except Exception:
+        LOGGER.warning("SSR in-browser extract failed", exc_info=True)
+        return 0, []
+
+
+def _warmup_and_open_profile(
+    page,
+    profile_url: str,
+    sticky_identity: str | None = None,
+    network_posts: list | None = None,
+    ssr_posts_out: list | None = None,
+    *,
+    skip_homepage_warmup: bool = False,
+) -> bool:
+    """Warmup homepage (optionnel) puis profil dans le meme contexte.
+
+    Si `skip_homepage_warmup=True` (cookies sticky valides reinjectes):
+      → PAS de goto https://www.tiktok.com/ (evite TLS timeout 15s inutile)
+      → goto direct @profil
+
+    Sinon:
+      1) warmup homepage + persist cookies sticky
+      2) goto @username
+    """
+    if _env_bool("ENABLE_MOBILE_FALLBACK", False):
+        LOGGER.warning("ENABLE_MOBILE_FALLBACK ignored — m.tiktok.com disabled")
+
+    target = _normalize_profile_url(profile_url)
+
+    if skip_homepage_warmup:
+        LOGGER.info(
+            "Skipping homepage warmup — sticky cookies already injected from prior SUCCESS",
+            extra={"url": target},
+        )
+        # Buffer propre avant profil (pas de bruit For You a vider).
+        if network_posts is not None:
+            network_posts.clear()
+    else:
+        # 1) Chauffe homepage + cookies WAF (obligatoire en VIRGIN / nouvelle IP).
+        warmup_session(page, sticky_identity=sticky_identity)
+
+        # 2) Purger UNIQUEMENT le bruit For You de la homepage.
+        if network_posts is not None:
+            network_posts.clear()
+
+        LOGGER.info(
+            "Warmup OK — navigating to target profile in warm context (resilient)",
+            extra={"url": target},
+        )
+
+    # 3) Profil cible — SSR / API prioritaire des le 1er goto.
+    local_ssr: list[dict] = ssr_posts_out if ssr_posts_out is not None else []
+    profile_ok = _navigate_to_profile_resilient(
+        page,
+        target,
+        sticky_identity=sticky_identity,
+        ssr_posts_out=local_ssr,
+    )
+
+    # Priorite ABSOLUE: posts deja capturés par l'intercepteur pendant la nav.
+    if network_posts:
+        LOGGER.info(
+            "Network buffer already has %d posts after profile nav — SUCCESS "
+            "(skip SSR wait/scroll)",
+            len(network_posts),
+            extra={"url": target},
+        )
+        if local_ssr and ssr_posts_out is not None and local_ssr is not ssr_posts_out:
+            ssr_posts_out.extend(local_ssr)
+        return True
+
+    # Posts deja extraits au goto1 → SUCCESS immediat, zero scroll/DOM.
+    if local_ssr:
+        LOGGER.info(
+            "SSR hydration fast-path SUCCESS from goto: posts=%s — "
+            "skip DOM /video/ wait and item_list scroll",
+            len(local_ssr),
+            extra={"url": target},
+        )
+        if ssr_posts_out is not None and local_ssr is not ssr_posts_out:
+            ssr_posts_out.extend(local_ssr)
+        return True
+
+    _diag_log_cookies(page, "profile_landed")
+    _diag_log_hydration(page, "profile_landed")
+
+    # Re-check buffer avant parse SSR / wait (race: XHR peut arriver ici).
+    if network_posts:
+        LOGGER.info(
+            "Network buffer filled during settle (%d posts) — SUCCESS",
+            len(network_posts),
+            extra={"url": target},
+        )
+        return True
+
+    uni_len, ssr_posts = _read_universal_ssr_posts(page, target)
+    usable = profile_ok or _profile_page_usable(page, _username_from_url(target))
+
+    if ssr_posts:
+        LOGGER.info(
+            "SSR hydration fast-path SUCCESS: universalLen=%s posts=%s "
+            "— skip DOM /video/ wait and item_list scroll",
+            uni_len,
+            len(ssr_posts),
+            extra={"url": target},
+        )
+        if ssr_posts_out is not None:
+            ssr_posts_out.extend(ssr_posts)
+        return True
+
+    # SSR posts=0 est NORMAL sur TikTok (grille via XHR). Attendre item_list
+    # seulement si le buffer est encore vide.
+    if uni_len > 50000 or usable:
+        if network_posts:
+            LOGGER.info(
+                "Network buffer has %d posts before wait — SUCCESS",
+                len(network_posts),
+                extra={"url": target},
+            )
+            return True
+        wait_ms = _grid_wait_ms()
+        LOGGER.info(
+            "SSR/usable OK but posts=0 (universalLen=%s) — waiting %sms for item_list "
+            "(NOT a WAF / soft-block)",
+            uni_len,
+            wait_ms,
+            extra={"url": target},
+        )
+        # Pas de passive settle 4s — enchaine direct sur poll API court.
+        try:
+            page.mouse.wheel(0, random.randint(200, 400))
         except Exception:
             pass
-        links_ok = _wait_for_profile_video_links(page, timeout_ms=extra_ms)
-        if not links_ok:
-            try:
-                page.reload(wait_until="domcontentloaded", timeout=60000)
-                _dismiss_cookie_banner(page)
-                links_ok = _wait_for_profile_video_links(page, timeout_ms=extra_ms)
-            except Exception:
-                LOGGER.debug("Profile reload during hydration wait failed", exc_info=True)
-    _human_pause(1.0 if links_ok else 0.4, 0.4)
-    return links_ok
+        grid_ok = _wait_for_profile_grid_data(
+            page, network_posts, timeout_ms=wait_ms
+        )
+        if network_posts:
+            LOGGER.info(
+                "Grid API captured %d posts after empty-SSR wait — SUCCESS "
+                "(buffer preserved for caller)",
+                len(network_posts),
+                extra={"url": target},
+            )
+            return True
+        # Pas de posts API non plus: page OK, laisser le caller scroller 1–2x.
+        # Ne PAS purger / mark_waf (profil vide HTTP 200 ≠ WAF).
+        return bool(grid_ok or uni_len > 50000 or usable)
+
+    # Vrai soft-block seulement si captcha / chrome-error / HTTP block.
+    if sticky_identity and _is_real_waf_block(page, error="profile_not_usable_after_nav"):
+        LOGGER.warning(
+            "Real WAF/challenge after nav — purge sticky",
+            extra={"url": target},
+        )
+        purge_sticky_after_failure(
+            sticky_identity,
+            reason="profile_not_usable_after_nav",
+            mark_waf=True,
+        )
+    else:
+        LOGGER.warning(
+            "Profile not usable after nav — skip scroll (no WAF mark: empty≠block)",
+            extra={"url": target},
+        )
+    return False
 
 
 def scrape_tiktok_page(
@@ -2582,24 +4929,36 @@ def scrape_tiktok_page(
     if analyze_video_content is None:
         analyze_video_content = _env_bool("TIKTOK_ANALYZE_VIDEO_CONTENT", False)
     slow_mo_ms = 0 if headless else 150
-    # Sample dynamique: N proxies aleatoires hors blacklist (pas toute la liste
-    # .env / fichier 20k). `proxy_override` (lanes batch) force UN seul proxy.
-    attempts_per_proxy = max(1, _env_int("TIKTOK_PROXY_ATTEMPTS_PER_PROXY", 2))
-    if proxy_override is not None:
-        proxy_candidates = [proxy_override]
+    # Mode rotate / pool / force-direct.
+    if _force_direct_mode():
+        scoped_logger.warning(
+            "TIKTOK_FORCE_DIRECT=true — local IP only (proxy=None, no sticky purge/rotation)"
+        )
+        proxy_candidates = [None]
+        attempts_per_proxy = 1
+        rotate_every_n_posts = 0
     else:
-        proxy_candidates = _select_proxy_candidates()
-
-    # Rotation IPv6 "toutes les N videos" (0 = desactivee). Voir
-    # `_rotate_ipv6_identity` et `tools/ipv6_rotating_proxy.py` pour le
-    # mecanisme complet. Lu ici (et non code en dur) pour pouvoir l'activer
-    # uniquement sur le serveur qui a le proxy IPv6 en place, sans toucher au
-    # code sur les autres environnements (ex: poste de dev local).
-    rotate_every_n_posts = _env_int("TIKTOK_IPV6_ROTATE_EVERY_N_POSTS", 0)
+        default_attempts = 1 if _rotating_proxy_mode() else 2
+        attempts_per_proxy = max(1, _env_int("TIKTOK_PROXY_ATTEMPTS_PER_PROXY", default_attempts))
+        if proxy_override is not None:
+            if _rotating_proxy_mode():
+                n = max(1, _env_int("MAX_PROXY_RETRIES", 0) or _env_int("TIKTOK_PROXY_MAX_PER_JOB", 5))
+                # Chaque tentative = nouvelle sticky session (nouvelle IP, geo cible).
+                proxy_candidates = [
+                    _assign_webshare_sticky_session(dict(proxy_override)) for _ in range(n)
+                ]
+                attempts_per_proxy = 1
+            else:
+                proxy_candidates = [proxy_override]
+        else:
+            proxy_candidates = _select_proxy_candidates()
+        rotate_every_n_posts = _env_int("TIKTOK_IPV6_ROTATE_EVERY_N_POSTS", 0)
 
     with sync_playwright() as p:
         last_result = None
         tried = 0
+        # Apres echec: TOUJOURS warmup homepage sur la nouvelle IP (cookies frais).
+        # Ne jamais skipper le warmup en VIRGIN (cause WAF content-length~700).
         for proxy_cfg in proxy_candidates:
             # Avant d'essayer: verifie que ce proxy n'a pas ete blackliste entre
             # temps (autre job / lane parallele), sinon on saute.
@@ -2627,10 +4986,20 @@ def scrape_tiktok_page(
                     proxy_cfg,
                     analyze_video_content,
                     rotate_every_n_posts=rotate_every_n_posts,
+                    skip_homepage_warmup=False,
                 )
                 last_result = result
                 error_code = str(result.get("error") or "").strip().lower()
                 retryable_soft = _is_retryable_soft_error(error_code)
+
+                # Auth Webshare: abort IMMEDIAT — ne pas boucler sur la meme credential.
+                if _is_fatal_proxy_auth_error(error_code):
+                    scoped_logger.warning(
+                        "[PROXY] Webshare AUTH/CONNECTION FAILURE — aborting further IP retries "
+                        "(fix PROXY_URL / username / password / residential host)",
+                        extra={"error": error_code[:160], "url": _describe_proxy(proxy_cfg)},
+                    )
+                    return result
 
                 if result.get("posts") or not retryable_soft:
                     if result.get("error"):
@@ -2642,22 +5011,31 @@ def scrape_tiktok_page(
                         scoped_logger.info("Scrape finished successfully")
                     return result
 
-                # Soft failure: retente le MEME proxy SEULEMENT pour erreurs
-                # reseau flaky (tunnel/timeout). Soft-block TikTok / auth morte
-                # -> rotation immediate (retry meme IP = perte de temps +
-                # souvent ERR_TUNNEL juste apres).
+                # Fail-fast antibot / TLS timeout / auth: purge + blacklist 24h + rotate.
                 rotate_now = any(
                     tok in error_code
                     for tok in (
                         "no_posts_found",
                         "challenge_detected",
+                        "proxy_blocked",
+                        "tls_timeout",
                         "invalid_auth",
                         "err_invalid_auth_credentials",
+                        "err_http_response_code_failure",
+                        "err_timed_out",
+                        "timeout",
+                        "http_block",
+                        "http_403",
+                        "http_429",
                     )
                 )
+                if rotate_now:
+                    scoped_logger.info(
+                        "Next attempt: new IP + VIRGIN cookies + homepage warmup",
+                        extra={"error": error_code[:120]},
+                    )
+
                 if try_index < attempts_per_proxy and not rotate_now:
-                    # Timeout/tunnel flaky: garder les cookies, retenter la meme IP.
-                    # N'invalider QUE si auth proxy morte (credentials).
                     if proxy_cfg is not None and sticky_sessions.sticky_enabled():
                         if "invalid_auth" in error_code or "err_invalid_auth_credentials" in error_code:
                             sticky_sessions.invalidate_sticky_cookies(_proxy_identity(proxy_cfg))
@@ -2667,27 +5045,96 @@ def scrape_tiktok_page(
                     )
                     continue
 
-                # Soft-block / captcha: NE PAS supprimer cookies.json.
-                # Les cookies chauffes restent utiles quand l'IP sort du cooldown.
-                # Invalider seulement auth morte.
-                if proxy_cfg is not None and sticky_sessions.sticky_enabled():
-                    if "invalid_auth" in error_code or "err_invalid_auth_credentials" in error_code:
-                        sticky_sessions.invalidate_sticky_cookies(_proxy_identity(proxy_cfg))
+                # Distinguer Timeout TLS vs Block HTTP dans les logs de rotation.
+                if "tls_timeout" in error_code or (
+                    "timeout" in error_code and "http_" not in error_code
+                ):
+                    scoped_logger.warning(
+                        "[ANTIBOT] Rotating after TLS/NAV TIMEOUT (blacklist 24h)",
+                        extra={"error": error_code[:160], "url": _describe_proxy(proxy_cfg)},
+                    )
+                elif "http_403" in error_code or "http 403" in error_code:
+                    scoped_logger.warning(
+                        "[ANTIBOT] Rotating after HTTP 403 BLOCK (blacklist 24h)",
+                        extra={"error": error_code[:160], "url": _describe_proxy(proxy_cfg)},
+                    )
+                elif "http_" in error_code or "err_http_response" in error_code:
+                    scoped_logger.warning(
+                        "[ANTIBOT] Rotating after HTTP BLOCK (blacklist 24h)",
+                        extra={"error": error_code[:160], "url": _describe_proxy(proxy_cfg)},
+                    )
 
-                if _should_blacklist_error(error_code):
-                    _blacklist_proxy(proxy_cfg, error_code)
+                # Purge cookies sticky apres echec reseau → VIRGIN.
+                # no_posts_found seul ≠ WAF (profil vide HTTP 200).
+                if proxy_cfg is not None and sticky_sessions.sticky_enabled():
+                    identity = _proxy_identity(proxy_cfg)
+                    real_waf_tokens = (
+                        "proxy_blocked",
+                        "tls_timeout",
+                        "err_http_response_code_failure",
+                        "err_tunnel_connection_failed",
+                        "err_invalid_auth_credentials",
+                        "invalid_auth",
+                        "challenge_detected",
+                        "http_403",
+                        "http_429",
+                        "http_block",
+                        "403",
+                        "429",
+                    )
+                    soft_purge_tokens = (
+                        "err_timed_out",
+                        "timeout",
+                        "503",
+                        "no_posts_found",
+                    )
+                    is_real_waf = any(tok in error_code for tok in real_waf_tokens)
+                    is_soft = any(tok in error_code for tok in soft_purge_tokens)
+                    if _env_bool("PURGE_STICKY_ON_BLOCK", True) and (is_real_waf or is_soft):
+                        sticky_sessions.purge_sticky_cookies(
+                            identity,
+                            reason=error_code[:160],
+                            mark_waf=is_real_waf,
+                        )
+
+                # Blacklist 24h pour timeout et HTTP block.
+                # Mode rotate: ne PAS blacklister l'identite `-rotate` (meme endpoint,
+                # nouvelle IP a chaque session) — on purge sticky et on continue.
+                if (
+                    _should_blacklist_error(error_code)
+                    and not _rotating_proxy_mode()
+                ):
+                    hours = _blacklist_hours_for_reason(error_code)
+                    _blacklist_proxy(proxy_cfg, error_code, hours=hours)
+                elif _rotating_proxy_mode() and (
+                    "tls_timeout" in error_code
+                    or "timeout" in error_code
+                    or "http_" in error_code
+                    or "err_http" in error_code
+                    or "proxy_blocked" in error_code
+                ):
+                    scoped_logger.info(
+                        "Rotate mode: skip blacklist after CDN/HTTP/TLS fail — next session = new IP",
+                        extra={"error": error_code[:120]},
+                    )
                 scoped_logger.warning(
-                    "Soft failure detected, rotating proxy candidate",
-                    extra={"error": error_code[:120]},
+                    "Soft failure detected, rotating proxy candidate (next IP = virgin context)",
+                    extra={"error": error_code[:160]},
                 )
                 break
 
         # Aucun proxy n'a donne de posts: message clair pour l'API utilisateur.
-        friendly = (
-            "TikTok a bloque les proxies testes (0 video recuperee). "
-            "Les proxies en echec sont mis en pause 24h. "
-            "Reessaie dans quelques minutes avec d'autres IP du pool."
-        )
+        if _rotating_proxy_mode():
+            friendly = (
+                "TikTok a bloque les tentatives via l'endpoint rotatif Webshare "
+                "(0 video recuperee). Reessaie: chaque session obtient une nouvelle IP."
+            )
+        else:
+            friendly = (
+                "TikTok a bloque les proxies testes (0 video recuperee). "
+                "Les proxies en echec sont mis en pause 24h. "
+                "Reessaie dans quelques minutes avec d'autres IP du pool."
+            )
         if last_result is None:
             return {
                 "posts": [],

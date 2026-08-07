@@ -26,6 +26,12 @@ _LOCK = threading.Lock()
 _LAST_USED_NAME = ".last_used"
 _LOCK_NAME = ".in_use"
 _WARMED_NAME = ".warmed"
+_WAF_CHALLENGED_NAME = ".waf_challenged"
+_LAST_RESULT_NAME = ".last_result.json"
+# Dedup purge/WAF logs: 1 action / identity / fenetre courte.
+_PURGE_ONCE_TS: dict[str, float] = {}
+_WAF_ONCE_TS: dict[str, float] = {}
+_ACTION_DEDUP_S = 3.0
 
 # Noms de cookies TikTok qui indiquent une session exploitable.
 _VALID_COOKIE_NAMES = frozenset(
@@ -245,6 +251,167 @@ def invalidate_sticky_cookies(identity: str) -> None:
     LOGGER.info("Invalidated sticky cookies for IP", extra={"url": safe_identity(identity)})
 
 
+def mark_attempt_result(identity: str, *, success: bool, reason: str = "") -> None:
+    """Enregistre le dernier resultat scrape pour cette identite sticky."""
+    if not identity or identity == "direct":
+        return
+    session_dir = ensure_slot_for_identity(identity)
+    path = session_dir / _LAST_RESULT_NAME
+    try:
+        path.write_text(
+            json.dumps(
+                {
+                    "success": bool(success),
+                    "ts": time.time(),
+                    "reason": (reason or "")[:240],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        LOGGER.debug("Failed to write last_result for sticky", exc_info=True)
+
+
+def last_attempt_succeeded(identity: str) -> bool | None:
+    """True/False si un .last_result.json existe, sinon None."""
+    if not identity:
+        return None
+    path = session_dir_for_identity(identity) / _LAST_RESULT_NAME
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(raw, dict) or "success" not in raw:
+        return None
+    return bool(raw.get("success"))
+
+
+def should_reuse_sticky_cookies(identity: str) -> bool:
+    """True seulement si cookies valides ET dernier statut != success=False.
+
+    TIKTOK_REUSE_STICKY_COOKIES ne doit PAS reutiliser une session dont le
+    dernier essai a echoue (soft-block / HTTP / timeout).
+    """
+    if not identity or identity == "direct":
+        return False
+    if not has_valid_cookies(identity):
+        return False
+    if is_waf_challenged(identity):
+        return False
+    last = last_attempt_succeeded(identity)
+    if last is False:
+        return False
+    return True
+
+
+def purge_sticky_cookies(
+    identity: str,
+    *,
+    reason: str = "",
+    mark_waf: bool = False,
+) -> None:
+    """Purge immediate cookies + profil Chrome → etat VIRGIN pour le prochain essai.
+
+    `mark_waf=True` UNIQUEMENT pour un vrai blocage (captcha / 403 / 429 /
+    chrome-error). Un profil vide HTTP 200 ne doit PAS etre WAF-challenged.
+
+    Dedup: une seule purge / identity dans une fenetre de ~3s (evite cascades
+    de logs depuis navigate + finally + outer loop).
+    """
+    if not identity or identity == "direct":
+        return
+    key = safe_identity(identity)
+    now = time.time()
+    last = _PURGE_ONCE_TS.get(key, 0.0)
+    if now - last < _ACTION_DEDUP_S:
+        LOGGER.debug(
+            "Skipping duplicate purge_sticky_cookies for %s (%.1fs ago)",
+            key,
+            now - last,
+        )
+        return
+    _PURGE_ONCE_TS[key] = now
+
+    mark_attempt_result(identity, success=False, reason=reason or "purged")
+    if mark_waf:
+        try:
+            mark_waf_challenged(identity, reason=reason or "purged")
+        except Exception:
+            pass
+    invalidate_sticky_cookies(identity)
+    reset_session_to_virgin(identity)
+    LOGGER.info(
+        "Purged sticky cookies → VIRGIN (mark_waf=%s)",
+        mark_waf,
+        extra={"url": key, "error": (reason or "")[:120]},
+    )
+
+
+def purge_session(identity: str) -> bool:
+    """Supprime entierement le dossier sticky d'une IP compromise (soft-block / HTTP)."""
+    if not identity or identity == "direct":
+        return False
+    session_dir = session_dir_for_identity(identity)
+    if not session_dir.exists():
+        return False
+    try:
+        release_session_lock(session_dir)
+    except Exception:
+        pass
+    try:
+        shutil.rmtree(session_dir, ignore_errors=False)
+        LOGGER.info(
+            "Purged sticky session for compromised IP",
+            extra={"url": safe_identity(identity)},
+        )
+        return True
+    except OSError:
+        LOGGER.warning(
+            "Failed to purge sticky session",
+            extra={"url": safe_identity(identity)},
+            exc_info=True,
+        )
+        return False
+
+
+def reset_session_to_virgin(identity: str) -> Path:
+    """Recree un profil sticky VIERGE (pas de cookies persistants / Chrome vide).
+
+    Utilise pour l'IP suivante apres un blocage: le contexte Playwright ne doit
+    PAS recharger d'anciens cookies d'une session compromise.
+    """
+    session_dir = ensure_slot_for_identity(identity)
+    # Supprimer cookies exportes + marqueurs.
+    for name in ("cookies.json", _WARMED_NAME):
+        path = session_dir / name
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError:
+            LOGGER.debug("Failed to remove %s during virgin reset", name, exc_info=True)
+
+    # Nettoyer le profil Chrome persistant (Cookies SQLite, Local Storage, etc.)
+    # sans supprimer le dossier sticky (locks / structure).
+    for child_name in ("Default", "ShaderCache", "GrShaderCache", "GraphiteDawnCache"):
+        child = session_dir / child_name
+        if child.exists():
+            try:
+                shutil.rmtree(child, ignore_errors=True)
+            except OSError:
+                LOGGER.debug("Failed to wipe Chrome subdir %s", child_name, exc_info=True)
+
+    clear_chrome_profile_locks(session_dir)
+    touch_session(session_dir)
+    LOGGER.info(
+        "Sticky session reset to VIRGIN profile",
+        extra={"url": safe_identity(identity)},
+    )
+    return session_dir
+
+
 def identities_with_valid_cookies() -> set[str]:
     """Identites sticky qui ont un slot cookies valide."""
     return {p.name for p in list_session_dirs() if has_valid_cookies(p.name)}
@@ -359,7 +526,51 @@ def mark_session_warmed(identity: str, cookies: list[dict] | None = None) -> Non
             marker.write_text(str(time.time()), encoding="utf-8")
         except OSError:
             pass
+        # Nouvelle chauffe valide: effacer ancien marqueur WAF.
+        waf = session_dir / _WAF_CHALLENGED_NAME
+        try:
+            if waf.exists():
+                waf.unlink()
+        except OSError:
+            pass
     touch_session(session_dir)
+
+
+def mark_waf_challenged(identity: str, reason: str = "") -> None:
+    """Marque la session IP comme soft-block / challenge silencieux Akamai.
+
+    Dedup: un seul log WARNING / identity dans ~3s.
+    """
+    if not identity:
+        return
+    key = safe_identity(identity)
+    now = time.time()
+    last = _WAF_ONCE_TS.get(key, 0.0)
+    already = (session_dir_for_identity(identity) / _WAF_CHALLENGED_NAME).exists()
+    if already and now - last < _ACTION_DEDUP_S:
+        return
+    _WAF_ONCE_TS[key] = now
+
+    session_dir = ensure_slot_for_identity(identity)
+    path = session_dir / _WAF_CHALLENGED_NAME
+    try:
+        path.write_text(
+            json.dumps({"ts": time.time(), "reason": (reason or "")[:200]}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        if now - last >= _ACTION_DEDUP_S:
+            LOGGER.warning(
+                "Sticky session marked WAF-challenged",
+                extra={"url": key, "error": (reason or "")[:120]},
+            )
+    except OSError:
+        LOGGER.debug("Failed to write WAF-challenged marker", exc_info=True)
+
+
+def is_waf_challenged(identity: str) -> bool:
+    if not identity:
+        return False
+    return (session_dir_for_identity(identity) / _WAF_CHALLENGED_NAME).exists()
 
 
 def proven_warmed_identities() -> set[str]:

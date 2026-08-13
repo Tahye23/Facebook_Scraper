@@ -5229,8 +5229,9 @@ def _scrape_tiktok_page_via_apify(
     profile_url = _normalize_profile_url(url)
     scoped_logger = with_context(LOGGER, url=profile_url)
     scoped_logger.info(
-        "[APIFY] scrape start max_posts=%s (proxies/sticky bypassed)",
+        "[APIFY] scrape start max_posts=%s max_age_hours=%s (proxies/sticky bypassed)",
         max_posts,
+        max_age_hours,
     )
     try:
         from apify_client import scrape_profile

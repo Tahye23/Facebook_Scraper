@@ -45,43 +45,22 @@ public class ScrapeController {
         );
     }
 
+    /**
+     * Batch CSV TikTok: toutes les videos des dernieres N heures (defaut 24h).
+     * Plus de maxPostsPerPage — la fenetre temporelle est la seule contrainte.
+     * Alias historique: /csv-report-24h (meme comportement).
+     */
     @PostMapping(value = "/csv-report", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public ResponseEntity<?> enqueueCsvReport(
-            @RequestPart("file") MultipartFile file,
-            @RequestParam(name = "maxPostsPerPage", defaultValue = "3") int maxPostsPerPage
-    ) {
-        if (maxPostsPerPage < 1 || maxPostsPerPage > 20) {
-            return ResponseEntity.badRequest().body(Map.of("error", "maxPostsPerPage must be between 1 and 20"));
-        }
-
-        List<String> urls;
-        try {
-            urls = CsvUrlExtractor.extractTikTokProfileUrls(file);
-        } catch (IllegalArgumentException ex) {
-            return ResponseEntity.badRequest().body(Map.of("error", ex.getMessage()));
-        }
-
-        if (urls.isEmpty()) {
-            return ResponseEntity.badRequest().body(Map.of("error", "No TikTok profile URLs found in CSV"));
-        }
-
-        try {
-            ScrapeJob job = orchestrationService.enqueueTikTokCsvBatch(urls, maxPostsPerPage);
-            return ResponseEntity.accepted().body(new CsvReportEnqueueResponse(
-                    job.getScrapeId(),
-                    job.getStatus() != null ? job.getStatus().name() : "QUEUED",
-                    urls.size(),
-                    maxPostsPerPage
-            ));
-        } catch (IllegalArgumentException ex) {
-            return ResponseEntity.badRequest().body(Map.of("error", ex.getMessage()));
-        }
+    public ResponseEntity<?> enqueueCsvReport(@RequestPart("file") MultipartFile file) {
+        return enqueueCsvReportWindow(file);
     }
 
     @PostMapping(value = "/csv-report-24h", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public ResponseEntity<?> enqueueCsvReportLast24h(
-            @RequestPart("file") MultipartFile file
-    ) {
+    public ResponseEntity<?> enqueueCsvReportLast24h(@RequestPart("file") MultipartFile file) {
+        return enqueueCsvReportWindow(file);
+    }
+
+    private ResponseEntity<?> enqueueCsvReportWindow(MultipartFile file) {
         List<String> urls;
         try {
             urls = CsvUrlExtractor.extractTikTokProfileUrls(file);
@@ -95,12 +74,13 @@ public class ScrapeController {
 
         try {
             ScrapeJob job = orchestrationService.enqueueTikTokCsvBatchLast24h(urls);
-            return ResponseEntity.accepted().body(Map.of(
-                    "scrape_id", job.getScrapeId(),
-                    "status", job.getStatus() != null ? job.getStatus().name() : "QUEUED",
-                    "urls_count", urls.size(),
-                    "mode", "last_24h",
-                    "time_window_hours", 24
+            int windowHours = orchestrationService.csvReportWindowHours();
+            return ResponseEntity.accepted().body(new CsvReportEnqueueResponse(
+                    job.getScrapeId(),
+                    job.getStatus() != null ? job.getStatus().name() : "QUEUED",
+                    urls.size(),
+                    windowHours,
+                    "last_" + windowHours + "h"
             ));
         } catch (IllegalArgumentException ex) {
             return ResponseEntity.badRequest().body(Map.of("error", ex.getMessage()));

@@ -288,18 +288,51 @@ def apify_item_to_post(raw_item: dict, fallback_author: str = "") -> dict | None
     }
 
 
-def build_actor_input(username: str, max_posts: int) -> dict[str, Any]:
-    """Input officiel clockworks/tiktok-profile-scraper (sans download media)."""
+def build_actor_input(
+    username: str,
+    max_posts: int,
+    *,
+    max_age_hours: int | None = None,
+) -> dict[str, Any]:
+    """Input officiel clockworks/tiktok-profile-scraper (sans download media).
+
+    Champs schema confirmes (console Apify):
+      - resultsPerPage: nb de posts par profil (FIX A: = max_posts demande)
+      - oldestPostDateUnified: filtre date natif (ISO YYYY-MM-DD ou jours "1"/"2")
+        → utilise quand max_age_hours est fourni (CSV 24h) pour economiser le quota
+      - profileSorting=latest: requis pour que les filtres de date fonctionnent
+    """
     handle = (username or "").lstrip("@").strip()
-    results = max(1, min(int(max_posts or 20), 200))
-    return {
+    # Fallback 20 UNIQUEMENT si max_posts absent/invalid — jamais ecraser un 2 explicite.
+    try:
+        requested = int(max_posts) if max_posts is not None else 20
+    except (TypeError, ValueError):
+        requested = 20
+    results = max(1, min(requested if requested > 0 else 20, 200))
+
+    body: dict[str, Any] = {
         "profiles": [handle],
+        "profileScrapeSections": ["videos"],
+        "profileSorting": "latest",
         "resultsPerPage": results,
+        "excludePinnedPosts": False,
         "shouldDownloadVideos": False,
         "shouldDownloadCovers": False,
         "shouldDownloadSlideshowImages": False,
         "shouldDownloadSubtitles": False,
+        "shouldDownloadAvatars": False,
+        "downloadSubtitlesOptions": "NEVER_DOWNLOAD_SUBTITLES",
     }
+
+    # Filtre date natif Apify (add-on payant mais economise les items hors fenetre).
+    # Filet de securite: le worker refiltre encore cote Python sur published_at.
+    if max_age_hours is not None and int(max_age_hours) > 0:
+        hours = int(max_age_hours)
+        oldest = datetime.now(tz=timezone.utc).timestamp() - (hours * 3600)
+        oldest_date = datetime.fromtimestamp(oldest, tz=timezone.utc).strftime("%Y-%m-%d")
+        body["oldestPostDateUnified"] = oldest_date
+
+    return body
 
 
 def _auth_params() -> dict[str, str]:
@@ -316,10 +349,11 @@ def _headers() -> dict[str, str]:
 def _run_sync_get_items(actor_input: dict[str, Any], timeout_s: float) -> list[dict]:
     actor_id = apify_actor_id()
     url = f"{_API_BASE}/acts/{actor_id}/run-sync-get-dataset-items"
+    # DEBUG: payload complet (sans token) pour verifier resultsPerPage / date filter.
     LOGGER.info(
-        "[APIFY] sync run actor=%s resultsPerPage=%s timeout=%.0fs",
+        "[APIFY] sync run actor=%s payload=%s timeout=%.0fs",
         actor_id,
-        actor_input.get("resultsPerPage"),
+        json.dumps(actor_input, ensure_ascii=False),
         timeout_s,
     )
     try:
@@ -455,8 +489,40 @@ def scrape_profile(
             "error_code": "apify_config",
         }
 
-    max_posts = max(1, min(int(max_posts or 20), 200))
-    actor_input = build_actor_input(username, max_posts)
+    try:
+        requested_max = int(max_posts) if max_posts is not None else 20
+    except (TypeError, ValueError):
+        requested_max = 20
+    if requested_max <= 0:
+        requested_max = 20
+    max_posts = max(1, min(requested_max, 200))
+
+    age = int(max_age_hours) if max_age_hours else None
+    # Fenetre temporelle: resultsPerPage = plafond de fetch (pas la limite metier).
+    # Sans fenetre: resultsPerPage = max_posts exact (FIX A).
+    if age and age > 0:
+        fetch_ceiling = max(
+            max_posts,
+            max(1, min(_env_int("APIFY_CSV_FETCH_LIMIT", 100), 200)),
+        )
+    else:
+        fetch_ceiling = max_posts
+
+    actor_input = build_actor_input(
+        username,
+        fetch_ceiling,
+        max_age_hours=age,
+    )
+    LOGGER.info(
+        "[APIFY] scrape @%s requested_max_posts=%s fetch_ceiling=%s max_age_hours=%s "
+        "resultsPerPage=%s oldestPostDateUnified=%s",
+        username,
+        max_posts,
+        fetch_ceiling,
+        age,
+        actor_input.get("resultsPerPage"),
+        actor_input.get("oldestPostDateUnified"),
+    )
 
     try:
         check_quota_or_raise(int(actor_input["resultsPerPage"]))
@@ -503,7 +569,6 @@ def scrape_profile(
 
     posts: list[dict] = []
     seen: set[str] = set()
-    age = int(max_age_hours) if max_age_hours else None
     for item in raw_items:
         post = apify_item_to_post(item, fallback_author=username)
         if not post:
@@ -522,12 +587,28 @@ def scrape_profile(
                         continue
                 except Exception:
                     pass
+            else:
+                # Sans date: en mode fenetre on ne peut pas garantir → skip
+                continue
         seen.add(pid)
         posts.append(post)
-        if len(posts) >= max_posts:
+        # Sans fenetre temporelle: coupe strictement a max_posts.
+        # Avec fenetre: on garde tout ce qui est dans la fenetre (plafond = fetch).
+        if not age and len(posts) >= max_posts:
+            break
+        if age and len(posts) >= fetch_ceiling:
             break
 
     record_quota_usage(len(posts))
+
+    LOGGER.info(
+        "[APIFY] @%s done raw_items=%s kept=%s (max_posts=%s age_h=%s)",
+        username,
+        len(raw_items),
+        len(posts),
+        max_posts,
+        age,
+    )
 
     if not posts:
         return {
@@ -540,6 +621,7 @@ def scrape_profile(
                 "engine": "apify",
                 "username": username,
                 "raw_items": len(raw_items),
+                "requested_max_posts": max_posts,
             },
         }
 
@@ -551,5 +633,7 @@ def scrape_profile(
             "engine": "apify",
             "username": username,
             "raw_items": len(raw_items),
+            "requested_max_posts": max_posts,
+            "results_per_page_sent": actor_input.get("resultsPerPage"),
         },
     }

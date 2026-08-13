@@ -475,8 +475,18 @@ def _analyze_video_with_gemini_sdk(video_path: str) -> dict:
     }
 
 
-def _analyze_description_with_gemini_sdk(description_text: str) -> dict:
-    """Analyse uniquement la description texte d'un post TikTok avec Gemini."""
+def _analyze_description_with_gemini_sdk(
+    description_text: str,
+    *,
+    metrics: dict | None = None,
+    hashtags: list | None = None,
+    author: str | None = None,
+) -> dict:
+    """Analyse uniquement la description texte (+ metriques/hashtags) d'un post TikTok.
+
+    Mode text-only assume: pas d'audio/image/video. Le score de confiance doit
+    refleter la richesse du TEXTE fourni, pas l'absence de media (etat normal).
+    """
     api_key = os.getenv("GEMINI_API_KEY", "").strip().strip('"').strip("'")
     model_name = _resolve_gemini_model_name()
 
@@ -523,11 +533,39 @@ def _analyze_description_with_gemini_sdk(description_text: str) -> dict:
         ],
     }
 
+    metrics = metrics if isinstance(metrics, dict) else {}
+    tags = hashtags if isinstance(hashtags, list) else []
+    tag_str = ", ".join(str(t) for t in tags if t) if tags else "(aucun)"
+    metrics_lines = (
+        f"- likes: {metrics.get('likes')}\n"
+        f"- comments: {metrics.get('comments')}\n"
+        f"- shares: {metrics.get('shares')}\n"
+        f"- views: {metrics.get('views')}"
+    )
+    author_line = (author or "").strip() or "(inconnu)"
+
     prompt = (
-        "Tu es un analyste TikTok. Analyse uniquement la description texte fournie et retourne UNIQUEMENT un JSON valide. "
-        "Ne suppose pas l'audio/visuel reel, indique les limites d'analyse basee sur texte. "
-        "Pour confidence_and_limits.level, utilise uniquement: low, medium, high. "
-        "Description: \n" + (description_text or "")
+        "Tu es un analyste TikTok en mode TEXT-ONLY.\n"
+        "Tu analyses UNIQUEMENT la description textuelle, les hashtags et les metriques "
+        "d'engagement fournis. Tu n'as PAS acces a l'audio, a l'image, ni a la video "
+        "elle-meme — c'est l'etat NORMAL et ATTENDU de cette analyse, PAS une limite "
+        "a signaler a chaque fois.\n\n"
+        "Regles pour confidence_and_limits:\n"
+        "- Base le score (0.0–1.0) et le level (low|medium|high) UNIQUEMENT sur la "
+        "clarte, la longueur et la richesse informative du TEXTE + hashtags fournis.\n"
+        "- Texte long, precis, avec hashtags pertinents → score plus haut (medium/high).\n"
+        "- Texte court, vague ou vide → score plus bas (low) — legitimement.\n"
+        "- N'INCLUS PAS dans limits l'absence d'audio/video/image (constante structurelle).\n"
+        "- limits ne doit contenir que des limites SPECIFIQUES a CE texte "
+        "(ex: langue ambigue, manque de contexte, claims non verifiables).\n"
+        "- visual_elements_detected et champs audio: laisse vides / neutres; "
+        "ne invente pas de contenu visuel.\n"
+        "- transcript_excerpt / transcript_full: reprise fidele ou paraphrase courte "
+        "de la description (pas une fausse transcription audio).\n\n"
+        f"Auteur: {author_line}\n"
+        f"Hashtags: {tag_str}\n"
+        f"Metriques:\n{metrics_lines}\n\n"
+        f"Description:\n{(description_text or '').strip() or '(vide)'}\n"
     )
 
     client = genai.Client(api_key=api_key)
@@ -569,6 +607,38 @@ def _analyze_description_with_gemini_sdk(description_text: str) -> dict:
 
     if not isinstance(parsed, dict):
         raise RuntimeError("Gemini n'a pas retourne un JSON exploitable")
+
+    # Nettoyage post-hoc: retirer les limits "pas de video/audio" repetitives.
+    conf = parsed.get("confidence_and_limits")
+    if isinstance(conf, dict) and isinstance(conf.get("limits"), list):
+        noise = (
+            "audio",
+            "video",
+            "visuel",
+            "visual",
+            "image",
+            "sans acces",
+            "no access",
+            "cannot see",
+            "can't see",
+            "not available",
+            "unavailable",
+            "pas d'acces",
+            "pas d'audio",
+            "pas de video",
+            "only text",
+            "texte seul",
+            "text-only",
+            "text only",
+        )
+        cleaned = []
+        for lim in conf["limits"]:
+            low = str(lim or "").lower()
+            if any(tok in low for tok in noise):
+                continue
+            cleaned.append(lim)
+        conf["limits"] = cleaned
+        parsed["confidence_and_limits"] = conf
 
     return {
         "analysis": parsed,
@@ -731,6 +801,9 @@ def analyze_tiktok_video(
     output_dir: str | None = None,
     save_json_report: bool = True,
     description_text: str | None = None,
+    metrics: dict | None = None,
+    hashtags: list | None = None,
+    author: str | None = None,
 ) -> dict:
     """Pipeline d'analyse TikTok base sur la description (mode leger).
 
@@ -749,9 +822,14 @@ def analyze_tiktok_video(
     # video_path = download_info["video_path"]
     # gemini_result = _analyze_video_with_gemini_sdk(video_path)
 
-    # Mode rapide: analyse uniquement le texte (description/caption).
+    # Mode rapide: analyse uniquement le texte (description/caption) + metriques.
     safe_description = _safe_text(description_text)
-    gemini_result = _analyze_description_with_gemini_sdk(safe_description)
+    gemini_result = _analyze_description_with_gemini_sdk(
+        safe_description,
+        metrics=metrics,
+        hashtags=hashtags,
+        author=author,
+    )
     analysis = gemini_result["analysis"]
 
     # 3) Construction d'un rapport normalise.
@@ -768,12 +846,13 @@ def analyze_tiktok_video(
         ),
         "video_metadata": {
             "title": "",
-            "uploader": "",
+            "uploader": author or "",
             "duration_seconds": None,
             "webpage_url": video_url,
             "media_url": "",
-            "tags": [],
+            "tags": hashtags or [],
             "description_used": safe_description,
+            "metrics": metrics or {},
         },
         "artifacts": {
             "video_path": "",
@@ -781,6 +860,10 @@ def analyze_tiktok_video(
             "model_provider": "google-genai",
             "model_name": gemini_result.get("model_name") or _resolve_gemini_model_name(),
             "analysis_mode": "description_only",
+            # Limite structurelle UNIQUE (pas repetee dans chaque confidence.limits).
+            "structural_limits": [
+                "text_only_analysis: no audio/video/image provided by design"
+            ],
         },
         "gemini_analysis": analysis,
         "gemini_raw": gemini_result.get("raw"),

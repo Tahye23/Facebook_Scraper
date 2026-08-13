@@ -607,15 +607,29 @@ def _fetch_cached_video_reports(post_ids: list[str]) -> dict:
 def _enrich_post_video(post: dict, output_dir: str) -> dict:
     post_copy = dict(post)
     post_url = str(post_copy.get("post_url") or "").strip()
-    post_description = str(post_copy.get("message") or "").strip()
+    post_description = str(post_copy.get("message") or post_copy.get("text") or "").strip()
     if not post_url or "/video/" not in post_url:
         return post_copy
+
+    metrics = {
+        "likes": post_copy.get("likes"),
+        "comments": post_copy.get("comments_count") or post_copy.get("comments"),
+        "shares": post_copy.get("shares"),
+        "views": post_copy.get("views"),
+    }
+    # Hashtags: preferer ceux deja parses, sinon extraire du texte.
+    hashtags = post_copy.get("hashtags")
+    if not isinstance(hashtags, list):
+        hashtags = [w for w in post_description.split() if w.startswith("#")]
 
     report = analyze_tiktok_video(
         video_url=post_url,
         output_dir=output_dir,
         save_json_report=True,
         description_text=post_description,
+        metrics=metrics,
+        hashtags=hashtags,
+        author=str(post_copy.get("author") or ""),
     )
     post_copy["source_media_url"] = report.get("video_metadata", {}).get("media_url")
     post_copy["media_path"] = report.get("artifacts", {}).get("video_path")
@@ -2015,14 +2029,40 @@ def on_message(channel, method, properties, body):
         if max_posts <= 0:
             max_posts = 20
 
+        scoped_logger.info(
+            "Task parsed max_posts=%s (raw=%s keys=%s)",
+            max_posts,
+            raw_max_posts,
+            sorted(str(k) for k in task.keys()),
+        )
+
         if report_mode and report_type in ("csv", "csv_24h") and urls:
-            scoped_logger.info("CSV batch task received")
+            # CSV = fenetre temporelle (APIFY_CSV_REPORT_WINDOW_HOURS), pas max_posts metier.
+            # max_posts du message = plafond de FETCH Apify par profil seulement.
+            window = time_window_hours
+            if window is None or window <= 0:
+                try:
+                    window = int((os.getenv("APIFY_CSV_REPORT_WINDOW_HOURS") or "24").strip())
+                except ValueError:
+                    window = 24
+            fetch_limit = max_posts
+            try:
+                env_fetch = int((os.getenv("APIFY_CSV_FETCH_LIMIT") or "100").strip())
+                fetch_limit = max(fetch_limit, max(1, min(env_fetch, 200)))
+            except ValueError:
+                fetch_limit = max(fetch_limit, 100)
+            scoped_logger.info(
+                "CSV batch task received window_hours=%s fetch_limit=%s urls=%s",
+                window,
+                fetch_limit,
+                len(urls),
+            )
             _process_csv_batch_task(
                 channel=channel,
                 scrape_id=scrape_id,
                 urls=urls,
-                max_posts_per_page=max_posts,
-                time_window_hours=(24 if report_type == "csv_24h" else time_window_hours),
+                max_posts_per_page=fetch_limit,
+                time_window_hours=window,
             )
             scoped_logger.info("CSV batch task completed")
             channel.basic_ack(delivery_tag=method.delivery_tag)

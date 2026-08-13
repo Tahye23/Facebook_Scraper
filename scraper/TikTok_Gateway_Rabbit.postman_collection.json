@@ -191,11 +191,6 @@
               "type": "file",
               "src": "{{csv_file_path}}",
               "description": "CSV file containing TikTok profile URLs"
-            },
-            {
-              "key": "maxPostsPerPage",
-              "value": "{{max_posts_per_page}}",
-              "type": "text"
             }
           ]
         },
@@ -603,8 +598,8 @@
       "value": ""
     },
     {
-      "key": "max_posts_per_page",
-      "value": "3"
+      "key": "csv_window_hours",
+      "value": "24"
     },
     {
       "key": "batch_report_json_path",

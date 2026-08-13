@@ -10,6 +10,7 @@ import com.richatt.scraper.model.ScrapeStatus;
 import com.richatt.scraper.repository.ScrapeJobRepository;
 import com.richatt.scraper.repository.ScrapeResultRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 
@@ -25,6 +26,20 @@ public class ScrapeOrchestrationService {
     private final ScrapeJobRepository jobRepository;
     private final ScrapeResultRepository resultRepository;
     private final ScrapeTaskPublisher taskPublisher;
+
+    /**
+     * Fenetre temporelle CSV (heures). Aligne avec APIFY_CSV_REPORT_WINDOW_HOURS cote worker.
+     * Plafond de fetch Apify par profil (pas une limite metier) = 200.
+     */
+    @Value("${scrape.csv-report-window-hours:24}")
+    private int csvReportWindowHours;
+
+    @Value("${scrape.csv-report-fetch-limit:100}")
+    private int csvReportFetchLimit;
+
+    public int csvReportWindowHours() {
+        return Math.max(1, csvReportWindowHours);
+    }
 
     public ScrapeJob enqueue(ScrapeRequest request) {
         Platform platform;
@@ -68,45 +83,13 @@ public class ScrapeOrchestrationService {
         return job;
     }
 
+    /**
+     * @deprecated Prefer {@link #enqueueTikTokCsvBatchLast24h(List)} — CSV = fenetre temporelle.
+     */
+    @Deprecated
     public ScrapeJob enqueueTikTokCsvBatch(List<String> urls, int maxPostsPerPage) {
-        if (urls == null || urls.isEmpty()) {
-            throw new IllegalArgumentException("No TikTok profile URLs found in uploaded CSV");
-        }
-
-        Instant now = Instant.now();
-        String scrapeId = UUID.randomUUID().toString();
-
-        ScrapeJob job = ScrapeJob.builder()
-                .scrapeId(scrapeId)
-                .url("csv-batch:" + urls.size())
-                .platform(Platform.TIKTOK)
-                .status(ScrapeStatus.QUEUED)
-                .createdAt(now)
-                .updatedAt(now)
-                .build();
-
-        jobRepository.save(job);
-
-        try {
-            taskPublisher.publish(ScrapeTaskMessage.builder()
-                    .scrapeId(scrapeId)
-                    .url(urls.get(0))
-                    .urls(urls)
-                    .platform("tiktok")
-                    .maxPosts(maxPostsPerPage)
-                    .reportMode(true)
-                    .reportType("csv")
-                    .requestedAt(now.toString())
-                    .build());
-        } catch (RuntimeException ex) {
-            job.setStatus(ScrapeStatus.FAILED);
-            job.setErrorMessage("Failed to publish task: " + ex.getMessage());
-            job.setUpdatedAt(Instant.now());
-            jobRepository.save(job);
-            throw ex;
-        }
-
-        return job;
+        // Ignore maxPostsPerPage: meme comportement que le rapport 24h.
+        return enqueueTikTokCsvBatchLast24h(urls);
     }
 
     public ScrapeJob enqueueTikTokCsvBatchLast24h(List<String> urls) {
@@ -116,10 +99,12 @@ public class ScrapeOrchestrationService {
 
         Instant now = Instant.now();
         String scrapeId = UUID.randomUUID().toString();
+        int windowHours = csvReportWindowHours();
+        int fetchLimit = Math.max(1, Math.min(csvReportFetchLimit, 200));
 
         ScrapeJob job = ScrapeJob.builder()
                 .scrapeId(scrapeId)
-                .url("csv-batch-24h:" + urls.size())
+                .url("csv-batch-" + windowHours + "h:" + urls.size())
                 .platform(Platform.TIKTOK)
                 .status(ScrapeStatus.QUEUED)
                 .createdAt(now)
@@ -129,15 +114,17 @@ public class ScrapeOrchestrationService {
         jobRepository.save(job);
 
         try {
+            // max_posts = plafond de FETCH Apify (pas une limite metier).
+            // time_window_hours = contrainte reelle (videos des N dernieres heures).
             taskPublisher.publish(ScrapeTaskMessage.builder()
                     .scrapeId(scrapeId)
                     .url(urls.get(0))
                     .urls(urls)
                     .platform("tiktok")
-                    .maxPosts(200)
+                    .maxPosts(fetchLimit)
                     .reportMode(true)
                     .reportType("csv_24h")
-                    .timeWindowHours(24)
+                    .timeWindowHours(windowHours)
                     .requestedAt(now.toString())
                     .build());
         } catch (RuntimeException ex) {

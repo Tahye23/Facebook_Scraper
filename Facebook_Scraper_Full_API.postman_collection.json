@@ -17,8 +17,13 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/actuator/health",
-              "host": ["{{base_url}}"],
-              "path": ["actuator", "health"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "actuator",
+                "health"
+              ]
             },
             "description": "Verifie que la gateway Spring Boot est UP (et donc que sa connexion a MongoDB/RabbitMQ fonctionne)."
           },
@@ -47,8 +52,12 @@
             "header": [],
             "url": {
               "raw": "{{proxy_control_base_url}}/status",
-              "host": ["{{proxy_control_base_url}}"],
-              "path": ["status"]
+              "host": [
+                "{{proxy_control_base_url}}"
+              ],
+              "path": [
+                "status"
+              ]
             },
             "description": "Verifie que le proxy SOCKS5 de rotation IPv6 (systemd, sur le VPS) est bien demarre. Necessite un tunnel SSH si Postman tourne hors du VPS (voir description de la collection)."
           },
@@ -76,8 +85,12 @@
             "header": [],
             "url": {
               "raw": "{{proxy_control_base_url}}/rotate",
-              "host": ["{{proxy_control_base_url}}"],
-              "path": ["rotate"]
+              "host": [
+                "{{proxy_control_base_url}}"
+              ],
+              "path": [
+                "rotate"
+              ]
             },
             "description": "Force le proxy a choisir immediatement une nouvelle adresse IPv6 aleatoire dans le bloc /64 configure (IPV6_PROXY_PREFIX). C'est le meme endpoint que scraper.py appelle automatiquement toutes les TIKTOK_IPV6_ROTATE_EVERY_N_POSTS videos: utile ici pour tester manuellement la rotation sans lancer un scraping complet.\n\nAppelez deux fois de suite et comparez le corps de la reponse: l'adresse doit changer."
           },
@@ -109,15 +122,24 @@
           "name": "Create Job Facebook - POST /scrape",
           "request": {
             "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"url\": \"https://www.facebook.com/some-page-or-post\",\n  \"platform\": \"facebook\",\n  \"max_posts\": 5\n}"
             },
             "url": {
               "raw": "{{base_url}}/scrape",
-              "host": ["{{base_url}}"],
-              "path": ["scrape"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "scrape"
+              ]
             },
             "description": "Cree un job de scraping Facebook et memorise scrape_id_facebook."
           },
@@ -148,15 +170,24 @@
           "name": "Create Job TikTok - POST /scrape",
           "request": {
             "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"url\": \"https://www.tiktok.com/@bellewarmedia\",\n  \"platform\": \"tiktok\",\n  \"max_posts\": 10\n}"
             },
             "url": {
               "raw": "{{base_url}}/scrape",
-              "host": ["{{base_url}}"],
-              "path": ["scrape"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "scrape"
+              ]
             },
             "description": "Panel news Mauritanie (@bellewarmedia). Lancer aussi @kingmauritan / @tawaturnet separement — pas @tiktok."
           },
@@ -196,19 +227,18 @@
                   "type": "file",
                   "src": "{{csv_file_path}}",
                   "description": "Fichier CSV contenant des URLs de profils TikTok"
-                },
-                {
-                  "key": "maxPostsPerPage",
-                  "value": "{{max_posts_per_page}}",
-                  "type": "text",
-                  "description": "1 a 20"
                 }
               ]
             },
             "url": {
               "raw": "{{base_url}}/scrape/csv-report",
-              "host": ["{{base_url}}"],
-              "path": ["scrape", "csv-report"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "scrape",
+                "csv-report"
+              ]
             },
             "description": "Cree un job batch CSV TikTok (nombre fixe de posts par page) et retourne scrape_id + nombre d'URLs detectees."
           },
@@ -253,8 +283,13 @@
             },
             "url": {
               "raw": "{{base_url}}/scrape/csv-report-24h",
-              "host": ["{{base_url}}"],
-              "path": ["scrape", "csv-report-24h"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "scrape",
+                "csv-report-24h"
+              ]
             },
             "description": "Cree un job batch CSV TikTok avec fenetre automatique des dernieres 24h (pas de maxPostsPerPage: chaque page scrolle jusqu'a sortir de la fenetre de 24h). C'est ce endpoint qui beneficie le plus de la repartition en parallele sur TIKTOK_PROXY_LIST (une lane/proxy dediee par groupe de pages, voir worker.py)."
           },
@@ -293,8 +328,13 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/scrape/{{scrape_id}}",
-              "host": ["{{base_url}}"],
-              "path": ["scrape", "{{scrape_id}}"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "scrape",
+                "{{scrape_id}}"
+              ]
             },
             "description": "Statut du dernier job cree (QUEUED, RUNNING, SUCCESS, PARTIAL_SUCCESS ou FAILED). PARTIAL_SUCCESS signifie que des posts ont ete recuperes malgre une erreur/challenge en cours de route (voir metadata pour le detail)."
           },
@@ -324,8 +364,14 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/scrape/{{scrape_id}}/results",
-              "host": ["{{base_url}}"],
-              "path": ["scrape", "{{scrape_id}}", "results"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "scrape",
+                "{{scrape_id}}",
+                "results"
+              ]
             },
             "description": "Recupere TOUS les resultats stockes en MongoDB pour ce scrape_id (snapshot, pas de pagination)."
           },
@@ -354,12 +400,30 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/scrape/{{scrape_id_facebook}}/results/stream?cursor={{result_cursor_facebook}}&limit=5&waitMs=15000",
-              "host": ["{{base_url}}"],
-              "path": ["scrape", "{{scrape_id_facebook}}", "results", "stream"],
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "scrape",
+                "{{scrape_id_facebook}}",
+                "results",
+                "stream"
+              ],
               "query": [
-                { "key": "cursor", "value": "{{result_cursor_facebook}}", "description": "Cursor renvoye par l'appel precedent (vide au premier appel)" },
-                { "key": "limit", "value": "5" },
-                { "key": "waitMs", "value": "15000", "description": "Long-poll en ms (0..30000)" }
+                {
+                  "key": "cursor",
+                  "value": "{{result_cursor_facebook}}",
+                  "description": "Cursor renvoye par l'appel precedent (vide au premier appel)"
+                },
+                {
+                  "key": "limit",
+                  "value": "5"
+                },
+                {
+                  "key": "waitMs",
+                  "value": "15000",
+                  "description": "Long-poll en ms (0..30000)"
+                }
               ]
             },
             "description": "Ne retourne que les NOUVEAUX resultats apres le cursor (mode progressif). Rejouez cette requete en boucle jusqu'a done=true. Met a jour result_cursor_facebook automatiquement."
@@ -390,12 +454,30 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/scrape/{{scrape_id_tiktok}}/results/stream?cursor={{result_cursor_tiktok}}&limit=5&waitMs=15000",
-              "host": ["{{base_url}}"],
-              "path": ["scrape", "{{scrape_id_tiktok}}", "results", "stream"],
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "scrape",
+                "{{scrape_id_tiktok}}",
+                "results",
+                "stream"
+              ],
               "query": [
-                { "key": "cursor", "value": "{{result_cursor_tiktok}}", "description": "Cursor renvoye par l'appel precedent (vide au premier appel)" },
-                { "key": "limit", "value": "5" },
-                { "key": "waitMs", "value": "15000", "description": "Long-poll en ms (0..30000)" }
+                {
+                  "key": "cursor",
+                  "value": "{{result_cursor_tiktok}}",
+                  "description": "Cursor renvoye par l'appel precedent (vide au premier appel)"
+                },
+                {
+                  "key": "limit",
+                  "value": "5"
+                },
+                {
+                  "key": "waitMs",
+                  "value": "15000",
+                  "description": "Long-poll en ms (0..30000)"
+                }
               ]
             },
             "description": "Ne retourne que les NOUVEAUX resultats apres le cursor (mode progressif). Rejouez cette requete en boucle jusqu'a done=true. Met a jour result_cursor_tiktok automatiquement."
@@ -431,12 +513,28 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/scrape/jobs?platform=tiktok&status=SUCCESS&limit=20",
-              "host": ["{{base_url}}"],
-              "path": ["scrape", "jobs"],
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "scrape",
+                "jobs"
+              ],
               "query": [
-                { "key": "platform", "value": "tiktok", "description": "facebook|tiktok (optionnel)" },
-                { "key": "status", "value": "SUCCESS", "description": "QUEUED|RUNNING|SUCCESS|PARTIAL_SUCCESS|FAILED (optionnel)" },
-                { "key": "limit", "value": "20" }
+                {
+                  "key": "platform",
+                  "value": "tiktok",
+                  "description": "facebook|tiktok (optionnel)"
+                },
+                {
+                  "key": "status",
+                  "value": "SUCCESS",
+                  "description": "QUEUED|RUNNING|SUCCESS|PARTIAL_SUCCESS|FAILED (optionnel)"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
               ]
             },
             "description": "Liste les jobs stockes en MongoDB avec filtres optionnels."
@@ -466,12 +564,27 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/scrape/results?scrapeId={{scrape_id}}&platform=tiktok&limit=100",
-              "host": ["{{base_url}}"],
-              "path": ["scrape", "results"],
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "scrape",
+                "results"
+              ],
               "query": [
-                { "key": "scrapeId", "value": "{{scrape_id}}" },
-                { "key": "platform", "value": "tiktok", "description": "facebook|tiktok (optionnel)" },
-                { "key": "limit", "value": "100" }
+                {
+                  "key": "scrapeId",
+                  "value": "{{scrape_id}}"
+                },
+                {
+                  "key": "platform",
+                  "value": "tiktok",
+                  "description": "facebook|tiktok (optionnel)"
+                },
+                {
+                  "key": "limit",
+                  "value": "100"
+                }
               ]
             },
             "description": "Liste les resultats stockes en MongoDB avec filtres optionnels."
@@ -503,15 +616,24 @@
           "name": "Validation Error - POST /scrape (plateforme invalide)",
           "request": {
             "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"url\": \"https://example.com\",\n  \"platform\": \"instagram\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/scrape",
-              "host": ["{{base_url}}"],
-              "path": ["scrape"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "scrape"
+              ]
             },
             "description": "Teste l'erreur metier pour une plateforme non supportee (doit repondre 400)."
           },
@@ -536,8 +658,13 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/scrape/not-existing-id",
-              "host": ["{{base_url}}"],
-              "path": ["scrape", "not-existing-id"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "scrape",
+                "not-existing-id"
+              ]
             },
             "description": "Teste le 404 quand le scrape_id n'existe pas."
           },
@@ -559,16 +686,51 @@
     }
   ],
   "variable": [
-    { "key": "base_url", "value": "http://localhost:8080", "description": "URL de la gateway Spring Boot (ex: http://VOTRE_VPS_IP:8080 en production)" },
-    { "key": "proxy_control_base_url", "value": "http://127.0.0.1:8091", "description": "Port de controle du proxy IPv6 (voir note dans la description de la collection: tunnel SSH requis si Postman ne tourne pas sur le VPS)" },
-    { "key": "scrape_id", "value": "" },
-    { "key": "scrape_id_facebook", "value": "" },
-    { "key": "scrape_id_tiktok", "value": "" },
-    { "key": "result_cursor", "value": "" },
-    { "key": "result_cursor_facebook", "value": "" },
-    { "key": "result_cursor_tiktok", "value": "" },
-    { "key": "csv_file_path", "value": "" },
-    { "key": "max_posts_per_page", "value": "3" },
-    { "key": "batch_report_json_path", "value": "" }
+    {
+      "key": "base_url",
+      "value": "http://localhost:8080",
+      "description": "URL de la gateway Spring Boot (ex: http://VOTRE_VPS_IP:8080 en production)"
+    },
+    {
+      "key": "proxy_control_base_url",
+      "value": "http://127.0.0.1:8091",
+      "description": "Port de controle du proxy IPv6 (voir note dans la description de la collection: tunnel SSH requis si Postman ne tourne pas sur le VPS)"
+    },
+    {
+      "key": "scrape_id",
+      "value": ""
+    },
+    {
+      "key": "scrape_id_facebook",
+      "value": ""
+    },
+    {
+      "key": "scrape_id_tiktok",
+      "value": ""
+    },
+    {
+      "key": "result_cursor",
+      "value": ""
+    },
+    {
+      "key": "result_cursor_facebook",
+      "value": ""
+    },
+    {
+      "key": "result_cursor_tiktok",
+      "value": ""
+    },
+    {
+      "key": "csv_file_path",
+      "value": ""
+    },
+    {
+      "key": "csv_window_hours",
+      "value": "24"
+    },
+    {
+      "key": "batch_report_json_path",
+      "value": ""
+    }
   ]
 }

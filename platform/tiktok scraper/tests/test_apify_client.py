@@ -92,6 +92,18 @@ def test_actor_input_no_downloads():
     assert body["resultsPerPage"] == 30
     assert body["shouldDownloadVideos"] is False
     assert body["shouldDownloadCovers"] is False
+    assert body["profileSorting"] == "latest"
+    assert "oldestPostDateUnified" not in body
+
+    # max_posts=2 doit rester 2 (pas de default 20 qui ecrase)
+    body2 = apify_client.build_actor_input("x", 2)
+    assert body2["resultsPerPage"] == 2
+
+    # Fenetre 24h → filtre date natif Apify
+    body3 = apify_client.build_actor_input("x", 100, max_age_hours=24)
+    assert body3["resultsPerPage"] == 100
+    assert "oldestPostDateUnified" in body3
+    assert len(body3["oldestPostDateUnified"]) == 10  # YYYY-MM-DD
 
 
 def test_redact_url():

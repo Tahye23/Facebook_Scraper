@@ -1,6 +1,7 @@
 package com.richatt.scraper.config.rabbit;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 import org.springframework.amqp.core.Binding;
 import org.springframework.amqp.core.BindingBuilder;
@@ -96,8 +97,11 @@ public class RabbitConfig {
     // ─── CONVERTER & TEMPLATE ─────────────────────────────────────────────────
     @Bean
     public MessageConverter messageConverter() {
+        // Aligne sur spring.jackson.property-naming-strategy=SNAKE_CASE (API HTTP)
+        // pour que worker.py recoive max_posts / scrape_id / time_window_hours.
         ObjectMapper objectMapper = JsonMapper.builder()
                 .findAndAddModules()
+                .propertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE)
                 .build();
         return new Jackson2JsonMessageConverter(objectMapper);
     }

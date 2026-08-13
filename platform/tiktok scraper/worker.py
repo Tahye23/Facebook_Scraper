@@ -696,6 +696,74 @@ def _enrich_post_video(post: dict, output_dir: str) -> dict:
     return post_copy
 
 
+def _video_id_from_url(url: str) -> str:
+    raw = str(url or "")
+    marker = "/video/"
+    idx = raw.find(marker)
+    if idx < 0:
+        return ""
+    rest = raw[idx + len(marker) :]
+    for sep in ("?", "/", "&"):
+        cut = rest.find(sep)
+        if cut >= 0:
+            rest = rest[:cut]
+    return rest.strip()
+
+
+def _publish_batch_gemini_enrichments(
+    channel,
+    scrape_id: str,
+    gemini_report: dict,
+    videos_payload: list[dict],
+) -> None:
+    """Apres le rapport 24h, publie un video_report par post pour l'UI / Mongo."""
+    items = gemini_report.get("videos") if isinstance(gemini_report, dict) else None
+    if not isinstance(items, list) or not items:
+        return
+    by_url = {
+        str(v.get("post_url") or "").strip(): v
+        for v in (videos_payload or [])
+        if isinstance(v, dict) and str(v.get("post_url") or "").strip()
+    }
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        post_url = str(item.get("post_url") or "").strip()
+        if not post_url:
+            continue
+        base = by_url.get(post_url) or {}
+        pid = _video_id_from_url(post_url) or str(base.get("post_id") or "").strip()
+        desc = str(item.get("description_ar") or "").strip()
+        sentiment = str(item.get("sentiment_ar") or "").strip()
+        topic = str(item.get("topic_ar") or "").strip()
+        post = {
+            "post_id": pid,
+            "author": base.get("author") or "",
+            "text": base.get("description") or "",
+            "post_url": post_url,
+            "likes": base.get("likes"),
+            "comments_count": base.get("comments"),
+            "shares": base.get("shares"),
+            "views": base.get("views"),
+            "published_at": base.get("published_at"),
+            "video_report": {
+                "executive_summary": [desc] if desc else [],
+                "sentiment": sentiment or None,
+                "themes": [topic] if topic else [],
+                "confidence_and_limits": {"level": "batch_24h"},
+            },
+        }
+        publish_enrichment_update(
+            channel=channel,
+            scrape_id=scrape_id,
+            url=str(base.get("source") or post_url),
+            post=post,
+            event_type="POST_ENRICHED",
+            success=True,
+            error_message=None,
+        )
+
+
 def _build_batch_pages_report(scrape_id: str, source_rows: list[dict], failed_pages: list[dict], output_dir: Path) -> str:
     output_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -2039,6 +2107,17 @@ def _process_csv_batch_task(
             )
         except Exception:
             scoped_logger.exception("Failed to generate Mauritanie 24h DOCX (non-fatal)")
+
+        # Rattache un video_report par post (pour la colonne Gemini de l'UI).
+        try:
+            _publish_batch_gemini_enrichments(
+                channel=channel,
+                scrape_id=scrape_id,
+                gemini_report=gemini_report_obj,
+                videos_payload=videos_payload,
+            )
+        except Exception:
+            scoped_logger.exception("Failed to publish per-video Gemini enrichments (non-fatal)")
 
     has_results = published_count > 0
     if not has_results:

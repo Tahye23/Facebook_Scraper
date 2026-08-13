@@ -182,12 +182,15 @@
       renderResults(payload);
 
       const done = ["SUCCESS", "PARTIAL_SUCCESS", "FAILED"].includes(status);
-      // Export CSV pour jobs 24h / CSV batch (y compris succes partiel apres quota).
-      const canDownload = state.isCsvJob && done && (status === "SUCCESS" || status === "PARTIAL_SUCCESS");
+      // Rapport HTML 24h/CSV (metadata.htmlPath) — pas le CSV brut.
+      const meta = payload.metadata || job.metadata || {};
+      const hasReport = !!(payload.report_url || meta.htmlPath || meta.html_path);
+      const canDownload = state.isCsvJob && done && status !== "FAILED" && hasReport;
       downloadBtn.classList.toggle("hidden", !canDownload);
       if (canDownload) {
-        downloadBtn.href = `/scrape/${state.scrapeId}/export.csv`;
-        downloadBtn.setAttribute("download", `scrape_${state.scrapeId}.csv`);
+        downloadBtn.href = payload.report_url || `/scrape/${state.scrapeId}/report`;
+        downloadBtn.removeAttribute("download");
+        downloadBtn.textContent = "Télécharger le rapport";
       }
       if (done) {
         clearInterval(state.pollTimer);

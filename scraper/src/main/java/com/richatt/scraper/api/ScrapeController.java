@@ -9,9 +9,12 @@ import com.richatt.scraper.model.ScrapeResult;
 import com.richatt.scraper.model.ScrapeStatus;
 import com.richatt.scraper.service.ApifyUsageService;
 import com.richatt.scraper.service.CsvUrlExtractor;
+import com.richatt.scraper.service.ReportArtifactService;
 import com.richatt.scraper.service.ScrapeOrchestrationService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import org.springframework.core.io.Resource;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -38,6 +41,7 @@ public class ScrapeController {
 
     private final ScrapeOrchestrationService orchestrationService;
     private final ApifyUsageService usageService;
+    private final ReportArtifactService reportArtifactService;
 
     @PostMapping
     public ResponseEntity<ScrapeResponse> enqueue(@Valid @RequestBody ScrapeRequest request) {
@@ -134,6 +138,8 @@ public class ScrapeController {
         ok.put("scrape_id", scrapeId);
         ok.put("status", job.getStatus().name());
         ok.put("count", results.size());
+        // Mode 24h: le rapport Gemini est batch (HTML) — rattache un resume par ligne pour l'UI.
+        reportArtifactService.attachBatchGeminiReports(job, results);
         ok.put("results", results);
         if (job.getErrorReason() != null) {
             ok.put("error_reason", job.getErrorReason());
@@ -143,12 +149,39 @@ public class ScrapeController {
         }
         if (job.getMetadata() != null) {
             ok.put("metadata", job.getMetadata());
+            Object html = job.getMetadata().get("htmlPath");
+            if (html == null) {
+                html = job.getMetadata().get("html_path");
+            }
+            if (html != null) {
+                ok.put("report_url", "/scrape/" + scrapeId + "/report");
+            }
         }
         return ResponseEntity.ok(ok);
     }
 
     /**
-     * Export CSV des resultats du job (utile pour mode CSV/24h — bouton telecharger).
+     * Rapport HTML Mauritanie 24h (meme fichier que video_reports/*.html).
+     */
+    @GetMapping("/{scrapeId}/report")
+    public ResponseEntity<Resource> downloadReport(@PathVariable String scrapeId) {
+        ScrapeJob job = orchestrationService.getJob(scrapeId).orElse(null);
+        if (job == null) {
+            return ResponseEntity.notFound().build();
+        }
+        Resource resource = reportArtifactService.loadHtmlReport(job);
+        if (resource == null || !resource.exists()) {
+            return ResponseEntity.notFound().build();
+        }
+        String filename = resource.getFilename() != null ? resource.getFilename() : ("rapport_" + scrapeId + ".html");
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "inline; filename=\"" + filename + "\"")
+                .contentType(MediaType.TEXT_HTML)
+                .body(resource);
+    }
+
+    /**
+     * Export CSV des resultats du job (mode profil / debug).
      */
     @GetMapping(value = "/{scrapeId}/export.csv", produces = "text/csv")
     public ResponseEntity<String> exportCsv(@PathVariable String scrapeId) {

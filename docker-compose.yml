@@ -64,9 +64,12 @@ services:
       APIFY_TOKEN: ${APIFY_TOKEN:-}
       APIFY_DAILY_VIDEO_LIMIT: ${APIFY_DAILY_VIDEO_LIMIT:-33}
       APIFY_QUOTA_FILE: /app/apify_quota.json
+      VIDEO_REPORTS_DIR: /app/video_reports
     volumes:
       # Quota journalier Apify (lecture pour dashboard usage).
       - "./platform/tiktok scraper/apify_quota.json:/app/apify_quota.json:ro"
+      # Rapports HTML/PDF Mauritanie 24h (telechargement depuis l'UI).
+      - "./platform/tiktok scraper/video_reports:/app/video_reports:ro"
     command:
       - --spring.rabbitmq.host=rabbitmq
       - --spring.rabbitmq.port=5672

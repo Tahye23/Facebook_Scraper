@@ -7,6 +7,7 @@ import com.richatt.scraper.model.ScrapeJob;
 import com.richatt.scraper.model.Platform;
 import com.richatt.scraper.model.ScrapeResult;
 import com.richatt.scraper.model.ScrapeStatus;
+import com.richatt.scraper.service.ApifyUsageService;
 import com.richatt.scraper.service.CsvUrlExtractor;
 import com.richatt.scraper.service.ScrapeOrchestrationService;
 import jakarta.validation.Valid;
@@ -36,6 +37,7 @@ public class ScrapeController {
     private static final int MAX_WAIT_MS = 30000;
 
     private final ScrapeOrchestrationService orchestrationService;
+    private final ApifyUsageService usageService;
 
     @PostMapping
     public ResponseEntity<ScrapeResponse> enqueue(@Valid @RequestBody ScrapeRequest request) {
@@ -305,6 +307,15 @@ public class ScrapeController {
                 ),
                 "jobs", jobs
         ));
+    }
+
+    /**
+     * Dashboard usage (FIX I): Apify monthly $ + quota journalier interne + scrapes recents.
+     * Token Apify reste cote serveur (jamais expose au browser).
+     */
+    @GetMapping("/usage")
+    public ResponseEntity<?> usage() {
+        return ResponseEntity.ok(usageService.dashboardUsage());
     }
 
     @GetMapping("/results")

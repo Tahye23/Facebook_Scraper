@@ -58,8 +58,15 @@ services:
       SPRING_MONGODB_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/${MONGO_DB}?authSource=admin
       # Cache de re-scraping: fenetre de fraicheur des metriques + token de
       # l'endpoint interne appele par le worker (voir InternalController).
-      SCRAPE_METRICS_TTL_HOURS: ${SCRAPE_METRICS_TTL_HOURS:-12}
+      SCRAPE_METRICS_TTL_HOURS: ${SCRAPE_METRICS_TTL_HOURS:-24}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-}
+      # Dashboard usage (FIX I) — token jamais expose au frontend.
+      APIFY_TOKEN: ${APIFY_TOKEN:-}
+      APIFY_DAILY_VIDEO_LIMIT: ${APIFY_DAILY_VIDEO_LIMIT:-33}
+      APIFY_QUOTA_FILE: /app/apify_quota.json
+    volumes:
+      # Quota journalier Apify (lecture pour dashboard usage).
+      - "./platform/tiktok scraper/apify_quota.json:/app/apify_quota.json:ro"
     command:
       - --spring.rabbitmq.host=rabbitmq
       - --spring.rabbitmq.port=5672

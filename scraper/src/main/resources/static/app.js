@@ -254,8 +254,14 @@
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || data.message || res.statusText);
         const id = data.scrape_id || data.scrapeId;
-        showStatus("running", `Job accepté · ${id}`);
+        const st = (data.status || "").toUpperCase();
+        if (st === "SUCCESS") {
+          showStatus("ok", `Servi depuis le cache · ${id}`);
+        } else {
+          showStatus("running", `Job accepté · ${id}`);
+        }
         startPolling(id, false);
+        loadDashboard();
       }
     } catch (err) {
       submitBtn.disabled = false;
@@ -265,12 +271,84 @@
 
   refreshBtn.addEventListener("click", () => pollJob());
 
-  fetch("/scrape/jobs?limit=1")
-    .then((r) => {
-      apiPill.textContent = r.ok ? "API OK" : `API ${r.status}`;
-      apiPill.classList.toggle("ok", r.ok);
-    })
-    .catch(() => {
+  function money(n) {
+    const x = Number(n);
+    if (!Number.isFinite(x)) return "—";
+    return `$${x.toFixed(2)}`;
+  }
+
+  function pct(used, max) {
+    if (!max || max <= 0) return 0;
+    return Math.min(100, Math.round((used / max) * 100));
+  }
+
+  async function loadDashboard() {
+    try {
+      const [usageRes, jobsRes] = await Promise.all([
+        fetch("/scrape/usage"),
+        fetch("/scrape/jobs?limit=8"),
+      ]);
+      apiPill.textContent = jobsRes.ok ? "API OK" : `API ${jobsRes.status}`;
+      apiPill.classList.toggle("ok", jobsRes.ok);
+
+      if (usageRes.ok) {
+        const u = await usageRes.json();
+        const apify = u.apify || {};
+        const daily = u.daily || {};
+        if (apify.available) {
+          const used = Number(apify.monthly_usage_usd) || 0;
+          const max = Number(apify.max_monthly_usage_usd) || 5;
+          $("apifyAmount").textContent = `${money(used)} / ${money(max)}`;
+          $("apifyBar").style.width = `${pct(used, max)}%`;
+          const ram = Number(apify.ram_mb) || 0;
+          const ramMax = Number(apify.max_ram_mb) || 16384;
+          $("apifyHint").textContent = `RAM ~${Math.round(ram)} MB / ${Math.round(ramMax / 1024)} GB · mois en cours`;
+        } else {
+          $("apifyAmount").textContent = "N/A";
+          $("apifyHint").textContent = apify.error || "Token Apify non configuré sur le gateway";
+        }
+        const count = Number(daily.count) || 0;
+        const limit = Number(daily.limit) || 33;
+        $("dailyAmount").textContent = `${count} / ${limit}`;
+        $("dailyBar").style.width = `${pct(count, limit)}%`;
+        $("dailyHint").textContent = `Reste ${Math.max(0, limit - count)} vidéo(s) · ${daily.date || "aujourd'hui"} (UTC)`;
+      }
+
+      if (jobsRes.ok) {
+        const payload = await jobsRes.json();
+        const jobs = payload.jobs || [];
+        const list = $("recentList");
+        if (!jobs.length) {
+          list.innerHTML = `<li class="hint">Aucun scrape récent.</li>`;
+        } else {
+          list.innerHTML = jobs
+            .map((j) => {
+              const id = j.scrape_id || j.scrapeId;
+              const url = j.url || "";
+              const status = j.status || "?";
+              const platform = j.platform || "";
+              const created = (j.created_at || j.createdAt || "").toString().slice(0, 19);
+              return `<li><button type="button" data-scrape-id="${escapeHtml(id)}">
+                <div>${escapeHtml(platform)} · ${escapeHtml(status)}</div>
+                <div class="recent-meta">${escapeHtml(url.slice(0, 60))} · ${escapeHtml(created)}</div>
+              </button></li>`;
+            })
+            .join("");
+          list.querySelectorAll("[data-scrape-id]").forEach((btn) => {
+            btn.addEventListener("click", () => {
+              const id = btn.getAttribute("data-scrape-id");
+              const isCsv = /csv-batch/i.test(btn.querySelector(".recent-meta")?.textContent || "");
+              showStatus("running", `Rechargement · ${id}`);
+              startPolling(id, isCsv);
+            });
+          });
+        }
+      }
+    } catch (e) {
       apiPill.textContent = "API hors ligne";
-    });
+      $("apifyHint").textContent = e.message || "Erreur usage";
+    }
+  }
+
+  loadDashboard();
 })();

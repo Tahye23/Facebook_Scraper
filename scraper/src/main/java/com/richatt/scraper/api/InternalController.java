@@ -40,7 +40,7 @@ public class InternalController {
     @Value("${INTERNAL_API_TOKEN:}")
     private String internalApiToken;
 
-    @Value("${SCRAPE_METRICS_TTL_HOURS:12}")
+    @Value("${SCRAPE_METRICS_TTL_HOURS:24}")
     private long metricsTtlHours;
 
     @PostMapping("/results/reports")

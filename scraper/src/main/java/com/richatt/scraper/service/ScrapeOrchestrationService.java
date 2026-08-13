@@ -9,18 +9,25 @@ import com.richatt.scraper.model.ScrapeResult;
 import com.richatt.scraper.model.ScrapeStatus;
 import com.richatt.scraper.repository.ScrapeJobRepository;
 import com.richatt.scraper.repository.ScrapeResultRepository;
+import com.richatt.scraper.util.TikTokUrlUtils;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 
+import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class ScrapeOrchestrationService {
 
     private final ScrapeJobRepository jobRepository;
@@ -29,16 +36,20 @@ public class ScrapeOrchestrationService {
 
     /**
      * Fenetre temporelle CSV (heures). Aligne avec APIFY_CSV_REPORT_WINDOW_HOURS cote worker.
-     * Plafond de fetch Apify par profil (pas une limite metier) = 200.
      */
     @Value("${scrape.csv-report-window-hours:24}")
     private int csvReportWindowHours;
 
-    @Value("${scrape.csv-report-fetch-limit:100}")
-    private int csvReportFetchLimit;
+    /** TTL cache: servir Mongo sans Apify si scrapedAt plus recent (FIX H). */
+    @Value("${SCRAPE_METRICS_TTL_HOURS:24}")
+    private int cacheTtlHours;
 
     public int csvReportWindowHours() {
         return Math.max(1, csvReportWindowHours);
+    }
+
+    public int cacheTtlHours() {
+        return Math.max(1, cacheTtlHours);
     }
 
     public ScrapeJob enqueue(ScrapeRequest request) {
@@ -65,6 +76,66 @@ public class ScrapeOrchestrationService {
 
         jobRepository.save(job);
 
+        // FIX H (TikTok): cache Mongo avant RabbitMQ.
+        if (platform == Platform.TIKTOK && !forceRefresh) {
+            String author = TikTokUrlUtils.extractAuthor(request.url());
+            if (!author.isBlank()) {
+                List<ScrapeResult> authorPosts = resultRepository
+                        .findByPlatformAndAuthorIgnoreCaseOrderByScrapedAtDesc(
+                                Platform.TIKTOK, author, PageRequest.of(0, Math.max(maxPosts * 3, 60)));
+
+                List<ScrapeResult> fresh = new ArrayList<>();
+                int staleCount = 0;
+                for (ScrapeResult r : authorPosts) {
+                    if (isWithinCacheTtl(r.getScrapedAt(), now)) {
+                        fresh.add(r);
+                    } else {
+                        staleCount++;
+                    }
+                }
+
+                if (fresh.size() >= maxPosts) {
+                    List<ScrapeResult> served = fresh.subList(0, maxPosts);
+                    for (ScrapeResult r : served) {
+                        r.setScrapeId(scrapeId);
+                        resultRepository.save(r);
+                    }
+                    Map<String, Object> meta = new HashMap<>();
+                    meta.put("from_cache", true);
+                    meta.put("cache_ttl_hours", cacheTtlHours());
+                    meta.put("served_count", served.size());
+                    meta.put("author", author);
+                    job.setMetadata(meta);
+                    job.setStatus(ScrapeStatus.SUCCESS);
+                    job.setUpdatedAt(Instant.now());
+                    jobRepository.save(job);
+                    log.info("Cache hit (<{}h): scrapeId={} author={} served={}",
+                            cacheTtlHours(), scrapeId, author, served.size());
+                    return job;
+                }
+
+                // Des posts existent mais hors TTL → refresh metrics only.
+                String refreshMode = (!authorPosts.isEmpty() || staleCount > 0) ? "METRICS_ONLY" : null;
+                try {
+                    taskPublisher.publish(ScrapeTaskMessage.builder()
+                            .scrapeId(scrapeId)
+                            .url(request.url())
+                            .platform(platform.name().toLowerCase())
+                            .maxPosts(maxPosts)
+                            .forceRefresh(false)
+                            .refreshMode(refreshMode)
+                            .requestedAt(now.toString())
+                            .build());
+                } catch (RuntimeException ex) {
+                    failPublish(job, ex);
+                    throw ex;
+                }
+                log.info("Enqueue tiktok scrapeId={} author={} refreshMode={} fresh={} stale={}",
+                        scrapeId, author, refreshMode, fresh.size(), staleCount);
+                return job;
+            }
+        }
+
         try {
             taskPublisher.publish(ScrapeTaskMessage.builder()
                     .scrapeId(scrapeId)
@@ -72,17 +143,29 @@ public class ScrapeOrchestrationService {
                     .platform(platform.name().toLowerCase())
                     .maxPosts(maxPosts)
                     .forceRefresh(forceRefresh)
+                    .refreshMode(forceRefresh ? "FULL" : null)
                     .requestedAt(now.toString())
                     .build());
         } catch (RuntimeException ex) {
-            job.setStatus(ScrapeStatus.FAILED);
-            job.setErrorMessage("Failed to publish task: " + ex.getMessage());
-            job.setUpdatedAt(Instant.now());
-            jobRepository.save(job);
+            failPublish(job, ex);
             throw ex;
         }
 
         return job;
+    }
+
+    private void failPublish(ScrapeJob job, RuntimeException ex) {
+        job.setStatus(ScrapeStatus.FAILED);
+        job.setErrorMessage("Failed to publish task: " + ex.getMessage());
+        job.setUpdatedAt(Instant.now());
+        jobRepository.save(job);
+    }
+
+    private boolean isWithinCacheTtl(Instant scrapedAt, Instant now) {
+        if (scrapedAt == null) {
+            return false;
+        }
+        return Duration.between(scrapedAt, now).compareTo(Duration.ofHours(cacheTtlHours())) < 0;
     }
 
     /**
@@ -90,7 +173,6 @@ public class ScrapeOrchestrationService {
      */
     @Deprecated
     public ScrapeJob enqueueTikTokCsvBatch(List<String> urls, int maxPostsPerPage) {
-        // Ignore maxPostsPerPage: meme comportement que le rapport 24h.
         return enqueueTikTokCsvBatchLast24h(urls);
     }
 
@@ -102,7 +184,9 @@ public class ScrapeOrchestrationService {
         Instant now = Instant.now();
         String scrapeId = UUID.randomUUID().toString();
         int windowHours = csvReportWindowHours();
-        int fetchLimit = Math.max(1, Math.min(csvReportFetchLimit, 200));
+        // FIX G: plus de fetchLimit=100 — le filtre date Apify fait le travail.
+        // max_posts reste un plafond de securite (= quota journalier typique).
+        int safetyCeiling = 33;
 
         ScrapeJob job = ScrapeJob.builder()
                 .scrapeId(scrapeId)
@@ -116,24 +200,19 @@ public class ScrapeOrchestrationService {
         jobRepository.save(job);
 
         try {
-            // max_posts = plafond de FETCH Apify (pas une limite metier).
-            // time_window_hours = contrainte reelle (videos des N dernieres heures).
             taskPublisher.publish(ScrapeTaskMessage.builder()
                     .scrapeId(scrapeId)
                     .url(urls.get(0))
                     .urls(urls)
                     .platform("tiktok")
-                    .maxPosts(fetchLimit)
+                    .maxPosts(safetyCeiling)
                     .reportMode(true)
                     .reportType("csv_24h")
                     .timeWindowHours(windowHours)
                     .requestedAt(now.toString())
                     .build());
         } catch (RuntimeException ex) {
-            job.setStatus(ScrapeStatus.FAILED);
-            job.setErrorMessage("Failed to publish task: " + ex.getMessage());
-            job.setUpdatedAt(Instant.now());
-            jobRepository.save(job);
+            failPublish(job, ex);
             throw ex;
         }
 

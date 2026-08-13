@@ -48,6 +48,14 @@ public class ScrapeTaskMessage {
     @JsonAlias({"forceRefresh"})
     private Boolean forceRefresh;
 
+    /**
+     * FULL | METRICS_ONLY — FIX H.
+     * METRICS_ONLY: Apify ok, pas de Gemini, upsert metrics seulement pour posts existants.
+     */
+    @JsonProperty("refresh_mode")
+    @JsonAlias({"refreshMode"})
+    private String refreshMode;
+
     @JsonProperty("requested_at")
     @JsonAlias({"requestedAt"})
     private String requestedAt;

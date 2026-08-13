@@ -99,11 +99,16 @@ def test_actor_input_no_downloads():
     body2 = apify_client.build_actor_input("x", 2)
     assert body2["resultsPerPage"] == 2
 
-    # Fenetre 24h → filtre date natif Apify
-    body3 = apify_client.build_actor_input("x", 100, max_age_hours=24)
-    assert body3["resultsPerPage"] == 100
+    # Fenetre 24h → filtre date natif Apify (YYYY-MM-DD absolu)
+    body3 = apify_client.build_actor_input("x", 33, max_age_hours=24)
+    assert body3["resultsPerPage"] == 33  # plafond securite, pas un fetch 100
     assert "oldestPostDateUnified" in body3
     assert len(body3["oldestPostDateUnified"]) == 10  # YYYY-MM-DD
+    assert body3["profileSorting"] == "latest"
+
+    # Helper date
+    d = apify_client.oldest_post_date_unified(24)
+    assert len(d) == 10
 
 
 def test_redact_url():

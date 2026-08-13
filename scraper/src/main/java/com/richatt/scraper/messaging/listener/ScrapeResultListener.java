@@ -34,7 +34,7 @@ public class ScrapeResultListener {
     // existantes sont encore nulles, on accepte toujours les nouvelles valeurs.
     // 0 ou negatif => TTL desactive (on rafraichit toujours). Configurable via
     // SCRAPE_METRICS_TTL_HOURS.
-    @Value("${SCRAPE_METRICS_TTL_HOURS:12}")
+    @Value("${SCRAPE_METRICS_TTL_HOURS:24}")
     private long metricsTtlHours;
 
     @RabbitListener(queues = RabbitConfig.QUEUE_RESULT)
@@ -97,6 +97,9 @@ public class ScrapeResultListener {
         }
 
         // Sauvegarder le résultat dans scrape_results
+        String refreshMode = getString(message, "refreshMode", "refresh_mode");
+        boolean metricsOnly = "METRICS_ONLY".equalsIgnoreCase(refreshMode);
+
         ScrapeResult incoming = ScrapeResult.builder()
                 .scrapeId(scrapeId)
                 .platform(Platform.from(getString(message, "platform")))
@@ -113,8 +116,8 @@ public class ScrapeResultListener {
                 .scrapedAt(parseInstantOrNow(getString(message, "scrapedAt", "scraped_at")))
                 .build();
 
-        ScrapeResult result = upsertResult(incoming);
-        log.info("ScrapeResult sauvegardé : postId={}", result.getPostId());
+        ScrapeResult result = upsertResult(incoming, metricsOnly);
+        log.info("ScrapeResult sauvegardé : postId={} metricsOnly={}", result.getPostId(), metricsOnly);
 
         // Tant que des résultats arrivent, le job est en cours.
         updateJobStatus(job, ScrapeStatus.RUNNING, null);
@@ -193,6 +196,10 @@ public class ScrapeResultListener {
     }
 
     private ScrapeResult upsertResult(ScrapeResult incoming) {
+        return upsertResult(incoming, false);
+    }
+
+    private ScrapeResult upsertResult(ScrapeResult incoming, boolean metricsOnly) {
         String postId = incoming.getPostId();
         // Sans postId (ou sans plateforme) on ne peut pas dedupliquer: insertion simple.
         if (postId == null || postId.isBlank() || incoming.getPlatform() == null) {
@@ -205,22 +212,34 @@ public class ScrapeResultListener {
                 .orElse(null);
 
         if (existing == null) {
+            // Nouveau post: meme en METRICS_ONLY on persiste ce que le worker a envoye
+            // (il doit alors avoir transmis le contenu complet pour les inconnus).
             return resultRepository.save(incoming);
         }
 
         // Re-scrape de la meme video: on garde LE meme document et on le rattache
-        // au dernier job (scrapeId), pour que GET /scrape/{scrapeId}/results reste
-        // complet tout en n'ayant qu'un document par video.
+        // au dernier job (scrapeId).
         existing.setScrapeId(incoming.getScrapeId());
         existing.setPlatform(incoming.getPlatform());
         existing.setAuthor(preferNonBlank(incoming.getAuthor(), existing.getAuthor()));
-        existing.setTextContent(preferNonBlank(incoming.getTextContent(), existing.getTextContent()));
         existing.setSourceUrl(preferNonBlank(incoming.getSourceUrl(), existing.getSourceUrl()));
+
+        if (metricsOnly) {
+            // FIX H: ne jamais ecraser text/hashtags/video_report/published_at.
+            existing.setMetrics(mergeMetrics(existing.getMetrics(), incoming.getMetrics()));
+            if (incoming.getScrapedAt() != null) {
+                existing.setScrapedAt(incoming.getScrapedAt());
+            } else {
+                existing.setScrapedAt(Instant.now());
+            }
+            return resultRepository.save(existing);
+        }
+
+        existing.setTextContent(preferNonBlank(incoming.getTextContent(), existing.getTextContent()));
         existing.setSourceMediaUrl(preferNonBlank(incoming.getSourceMediaUrl(), existing.getSourceMediaUrl()));
         existing.setMediaPath(preferNonBlank(incoming.getMediaPath(), existing.getMediaPath()));
         // video_report = analyse IA STABLE: on conserve l'existante, on ne
-        // merge que si le worker en renvoie une (il saute Gemini quand une
-        // analyse existe deja -> incoming.videoReport souvent null ici).
+        // merge que si le worker en renvoie une.
         existing.setVideoReport(mergeObjectMaps(existing.getVideoReport(), incoming.getVideoReport()));
         existing.setHashtags((incoming.getHashtags() == null || incoming.getHashtags().isEmpty())
                 ? existing.getHashtags()
@@ -228,11 +247,6 @@ public class ScrapeResultListener {
         existing.setPublishedAt(incoming.getPublishedAt() != null ? incoming.getPublishedAt() : existing.getPublishedAt());
 
         // Regle TTL metriques:
-        // - Si le doc a deja des metriques NON nulles et qu'il est encore dans
-        //   la fenetre TTL, on ne force PAS un refresh (donnees jugees fraiches).
-        // - Si les metriques existantes sont absentes/vides, on accepte TOUJOURS
-        //   les valeurs entrantes (sinon un 1er scrape sans likes bloque 12h
-        //   les scrapes suivants qui ont enfin recupere les stats).
         boolean existingMetricsMissing = isMetricsMissing(existing.getMetrics());
         boolean withinTtl = isWithinMetricsTtl(existing.getScrapedAt());
         if (!withinTtl || existingMetricsMissing) {

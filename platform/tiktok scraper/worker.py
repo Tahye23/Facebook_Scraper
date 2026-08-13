@@ -427,7 +427,7 @@ def _safe_int(val) -> int | None:
         return None
 
 
-def normalize_post(scrape_id: str, url: str, post: dict) -> dict:
+def normalize_post(scrape_id: str, url: str, post: dict, *, refresh_mode: str | None = None) -> dict:
     """Normalise un post brut vers le format contractuel du gateway.
 
     Permet de conserver un schema stable entre plateformes pour le stockage
@@ -435,8 +435,9 @@ def normalize_post(scrape_id: str, url: str, post: dict) -> dict:
     """
     text = post.get("message") or post.get("text") or ""
     hashtags = [w for w in text.split() if w.startswith("#")]
+    mode = (refresh_mode or "").strip().upper() or None
 
-    return {
+    payload = {
         "scrapeId": scrape_id,
         "platform": "tiktok",
         "postId": post.get("post_id") or post.get("id") or "",
@@ -458,6 +459,10 @@ def normalize_post(scrape_id: str, url: str, post: dict) -> dict:
         "success": True,
         "errorMessage": None,
     }
+    if mode:
+        payload["refreshMode"] = mode
+        payload["refresh_mode"] = mode
+    return payload
 
 
 def _post_signature(post: dict) -> str:
@@ -2129,18 +2134,29 @@ def on_message(channel, method, properties, body):
             if task.get("force_refresh") is not None
             else task.get("forceRefresh")
         )
+        refresh_mode = str(
+            task.get("refresh_mode")
+            if task.get("refresh_mode") is not None
+            else task.get("refreshMode")
+            or ""
+        ).strip().upper() or None
+        if force_refresh:
+            refresh_mode = "FULL"
+        # METRICS_ONLY: toujours appeler Apify (skip cache TTL worker) pour metrics fraiches.
+        apify_force = force_refresh or refresh_mode == "METRICS_ONLY"
 
         scoped_logger.info(
-            "Task parsed max_posts=%s force_refresh=%s (raw_max=%s keys=%s)",
+            "Task parsed max_posts=%s force_refresh=%s refresh_mode=%s (raw_max=%s keys=%s)",
             max_posts,
             force_refresh,
+            refresh_mode,
             raw_max_posts,
             sorted(str(k) for k in task.keys()),
         )
 
         if report_mode and report_type in ("csv", "csv_24h") and urls:
-            # CSV = fenetre temporelle (APIFY_CSV_REPORT_WINDOW_HOURS), pas max_posts metier.
-            # max_posts du message = plafond de FETCH Apify par profil seulement.
+            # CSV = fenetre temporelle (APIFY_CSV_REPORT_WINDOW_HOURS).
+            # FIX G: plus de fetch large APIFY_CSV_FETCH_LIMIT — filtre date natif.
             window = time_window_hours
             if window is None or window <= 0:
                 try:
@@ -2148,11 +2164,6 @@ def on_message(channel, method, properties, body):
                 except ValueError:
                     window = 24
             fetch_limit = max_posts
-            try:
-                env_fetch = int((os.getenv("APIFY_CSV_FETCH_LIMIT") or "100").strip())
-                fetch_limit = max(fetch_limit, max(1, min(env_fetch, 200)))
-            except ValueError:
-                fetch_limit = max(fetch_limit, 100)
             scoped_logger.info(
                 "CSV batch task received window_hours=%s fetch_limit=%s urls=%s",
                 window,
@@ -2208,7 +2219,7 @@ def on_message(channel, method, properties, body):
         def _publish_post_if_new(post: dict) -> None:
             nonlocal published_count
             sig = _post_signature(post)
-            payload = normalize_post(scrape_id, url, post)
+            payload = normalize_post(scrape_id, url, post, refresh_mode=refresh_mode)
             snapshot = _payload_snapshot(payload)
             collected_posts_by_sig[sig] = post
             previous = published_snapshots.get(sig)
@@ -2237,7 +2248,7 @@ def on_message(channel, method, properties, body):
                     max_posts=max_posts,
                     on_post=on_post,
                     analyze_video_content=False,
-                    force_refresh=force_refresh,
+                    force_refresh=apify_force,
                 )
             except Exception:
                 scoped_logger.exception("Scrape failed")
@@ -2318,9 +2329,19 @@ def on_message(channel, method, properties, body):
         posts = list(collected_posts_by_sig.values())
 
         enriched_posts = []
-        enrichment_enabled = _env_bool("TIKTOK_ASYNC_ENRICHMENT_ENABLED", True)
+        # FIX H: METRICS_ONLY → aucun appel Gemini (economie reseau + cout).
+        enrichment_enabled = (
+            _env_bool("TIKTOK_ASYNC_ENRICHMENT_ENABLED", True)
+            and refresh_mode != "METRICS_ONLY"
+        )
         enrichment_workers = max(1, int((os.getenv("TIKTOK_ENRICHMENT_WORKERS") or "2").strip()))
         output_dir = os.getenv("VIDEO_ANALYSIS_OUTPUT_DIR") or "video_reports"
+
+        if refresh_mode == "METRICS_ONLY":
+            scoped_logger.info(
+                "METRICS_ONLY: skipping Gemini enrichment entirely",
+                extra={"post_id": None, "posts": len(posts)},
+            )
 
         if enrichment_enabled and posts:
             # Cache de re-scraping (Option B): avant d'appeler Gemini, on demande

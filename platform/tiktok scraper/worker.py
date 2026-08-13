@@ -100,6 +100,7 @@ def _scrape_with_hard_timeout(**kwargs) -> dict:
         "analyze_video_content": bool(kwargs.get("analyze_video_content") or False),
         "headless_override": kwargs.get("headless_override"),
         "proxy_override": kwargs.get("proxy_override"),
+        "force_refresh": bool(kwargs.get("force_refresh") or False),
     }
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="tiktok_scrape_"))
@@ -488,7 +489,7 @@ def publish_result(channel, result: dict):
     )
 
 
-def publish_error(channel, scrape_id: str, error_msg: str):
+def publish_error(channel, scrape_id: str, error_msg: str, error_reason: str | None = None):
     """Publie un evenement de cycle de vie ERROR pour un job de scraping."""
     scoped_logger = with_context(LOGGER, scrape_id=scrape_id)
     payload = {
@@ -497,8 +498,13 @@ def publish_error(channel, scrape_id: str, error_msg: str):
         "eventType": "ERROR",
         "success": False,
         "errorMessage": error_msg,
+        "errorReason": error_reason,
     }
-    scoped_logger.error("Publishing ERROR event", extra={"url": None})
+    scoped_logger.error(
+        "Publishing ERROR event reason=%s",
+        error_reason or "",
+        extra={"url": None},
+    )
     channel.basic_publish(
         exchange=EXCHANGE,
         routing_key=ROUTING_RESULT,
@@ -602,6 +608,53 @@ def _fetch_cached_video_reports(post_ids: list[str]) -> dict:
             extra={"error": str(exc)},
         )
         return {}
+
+
+def _fetch_fresh_posts_from_gateway(
+    author: str,
+    *,
+    max_posts: int = 20,
+    max_age_hours: int | None = None,
+) -> dict | None:
+    """Posts avec metrics fraiches (TTL gateway) — skip Apify / pas de quota.
+
+    Retourne {posts, enough} ou None si gateway injoignable.
+    """
+    handle = (author or "").strip().lstrip("@")
+    if not handle:
+        return None
+    base_url = (os.getenv("GATEWAY_INTERNAL_URL") or "http://gateway:8080").rstrip("/")
+    endpoint = f"{base_url}/internal/results/fresh"
+    token = (os.getenv("INTERNAL_API_TOKEN") or "").strip()
+    body = {
+        "platform": "tiktok",
+        "author": handle,
+        "max_posts": max_posts,
+    }
+    if max_age_hours:
+        body["max_age_hours"] = int(max_age_hours)
+    payload = json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(endpoint, data=payload, method="POST")
+    request.add_header("Content-Type", "application/json")
+    if token:
+        request.add_header("X-Internal-Token", token)
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        if not isinstance(data, dict):
+            return None
+        return data
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        LOGGER.warning("Fresh metrics lookup failed: %s", exc)
+        return None
+
+
+def _classify_error_reason(error_msg: str, error_code: str | None = None) -> str | None:
+    code = (error_code or "").strip().lower()
+    low = (error_msg or "").lower()
+    if code == "apify_quota_exceeded" or ("quota" in low and "apify" in low):
+        return "QUOTA_EXCEEDED"
+    return None
 
 
 def _enrich_post_video(post: dict, output_dir: str) -> dict:
@@ -1683,7 +1736,10 @@ def _process_csv_batch_task(
                 # eviter de "jeter" un succes partiel en retentant a vide.
                 break
 
-            error_code = str(result.get("error") or "").strip().lower()
+            error_code = str(result.get("error_code") or result.get("error") or "").strip().lower()
+            # Quota: aucun interet a retenter — la limite ne changera pas avant demain.
+            if "quota" in error_code or "apify_quota" in error_code:
+                break
             if error_code not in {
                 "challenge_detected",
                 "no_posts_found",
@@ -1719,9 +1775,22 @@ def _process_csv_batch_task(
         for p in list(active_proxies) + list(spare_proxies)
         if p is not None
     }
+    quota_exhausted = False
+    quota_error_message = ""
+
+    def _mark_quota_exhausted(msg: str) -> None:
+        nonlocal quota_exhausted, quota_error_message
+        with state_lock:
+            if not quota_exhausted:
+                quota_exhausted = True
+                quota_error_message = msg or "Quota Apify journalier atteint."
+                # Stopper le batch: vider la file pour que les autres lanes sortent.
+                pending_urls.clear()
 
     def _next_pending_url() -> str | None:
         with state_lock:
+            if quota_exhausted:
+                return None
             return pending_urls.popleft() if pending_urls else None
 
     def _take_spare_proxy() -> dict | None:
@@ -1780,6 +1849,9 @@ def _process_csv_batch_task(
                 # ou nouvelle IP du pool 20k), puis on retente la meme page.
                 while not posts:
                     reason = str(result.get("error_code") or result.get("error") or "no_posts_found")
+                    if _classify_error_reason(str(result.get("error") or ""), reason) == "QUOTA_EXCEEDED":
+                        _mark_quota_exhausted(str(result.get("error") or reason))
+                        break
                     spare = _retire_and_replace(current_proxy, reason)
                     if spare is None:
                         break
@@ -1792,9 +1864,15 @@ def _process_csv_batch_task(
                     posts = _clip_posts(result)
 
                 if not posts:
+                    err_txt = str(result.get("error") or "no_posts_found")
+                    err_code = str(result.get("error_code") or "")
+                    if _classify_error_reason(err_txt, err_code) == "QUOTA_EXCEEDED":
+                        _mark_quota_exhausted(err_txt)
                     with state_lock:
-                        failed_pages.append({"url": page_url, "error": str(result.get("error") or "no_posts_found")})
+                        failed_pages.append({"url": page_url, "error": err_txt})
                     page_logger.warning("Page scrape failed")
+                    if quota_exhausted:
+                        return
                     _page_cooldown(multiplier=1.3)
                     continue
 
@@ -1824,7 +1902,7 @@ def _process_csv_batch_task(
     # marquees en echec pour cause de challenge/absence de posts. Objectif:
     # que le plus de profils possible reviennent avec une reponse au lieu de
     # rester marques en echec definitif dans le rapport.
-    final_retry_enabled = _env_bool("TIKTOK_BATCH_FINAL_RETRY_ENABLED", True)
+    final_retry_enabled = _env_bool("TIKTOK_BATCH_FINAL_RETRY_ENABLED", True) and not quota_exhausted
     recoverable_failed = [
         row for row in failed_pages
         if str(row.get("error") or "").strip().lower() in {"challenge_detected", "no_posts_found"}
@@ -1965,13 +2043,29 @@ def _process_csv_batch_task(
     else:
         completion_status = "SUCCESS"
 
+    err_msg = None
+    err_reason = None
+    if quota_exhausted and not has_results:
+        err_msg = quota_error_message or (
+            "Quota Apify journalier atteint. Réessayez demain ou "
+            "augmentez APIFY_DAILY_VIDEO_LIMIT."
+        )
+        err_reason = "QUOTA_EXCEEDED"
+    elif not has_results:
+        err_msg = "No posts extracted from CSV pages (TikTok challenge/no_posts_found)"
+    elif quota_exhausted:
+        # Succes partiel: des posts avant le plafond, puis stop.
+        err_msg = quota_error_message or "Quota Apify journalier atteint (batch interrompu)."
+        err_reason = "QUOTA_EXCEEDED"
+
     completion_payload = {
         "scrapeId": scrape_id,
         "platform": "tiktok",
         "eventType": "COMPLETED",
         "success": has_results,
         "status": completion_status,
-        "errorMessage": None if has_results else "No posts extracted from CSV pages (TikTok challenge/no_posts_found)",
+        "errorMessage": err_msg,
+        "errorReason": err_reason,
         "sessionReports": {
             "jsonPath": report_json_path,
             "htmlPath": mauritanie_html_path,
@@ -1986,6 +2080,7 @@ def _process_csv_batch_task(
             "pagesFailed": len(failed_pages),
             "failedPages": failed_pages,
             "timeWindowHours": time_window_hours,
+            "quotaExceeded": bool(quota_exhausted),
         },
         "count": published_count,
     }
@@ -2029,9 +2124,16 @@ def on_message(channel, method, properties, body):
         if max_posts <= 0:
             max_posts = 20
 
+        force_refresh = bool(
+            task.get("force_refresh")
+            if task.get("force_refresh") is not None
+            else task.get("forceRefresh")
+        )
+
         scoped_logger.info(
-            "Task parsed max_posts=%s (raw=%s keys=%s)",
+            "Task parsed max_posts=%s force_refresh=%s (raw_max=%s keys=%s)",
             max_posts,
+            force_refresh,
             raw_max_posts,
             sorted(str(k) for k in task.keys()),
         )
@@ -2135,6 +2237,7 @@ def on_message(channel, method, properties, body):
                     max_posts=max_posts,
                     on_post=on_post,
                     analyze_video_content=False,
+                    force_refresh=force_refresh,
                 )
             except Exception:
                 scoped_logger.exception("Scrape failed")
@@ -2154,6 +2257,11 @@ def on_message(channel, method, properties, body):
 
             attempt_error = str(result.get("error") or "").strip()
             if not attempt_error:
+                break
+
+            # Quota: pas de retry (ne changera pas avant demain).
+            if _classify_error_reason(attempt_error, str(result.get("error_code") or "")) == "QUOTA_EXCEEDED":
+                scoped_logger.error("Apify quota exceeded — aborting retries")
                 break
 
             if published_count > 0:
@@ -2184,14 +2292,26 @@ def on_message(channel, method, properties, body):
         if published_count == 0:
             # Echec sec: malgre les tentatives, aucun post n'a pu etre recupere.
             scoped_logger.error("No posts found for task after retries", extra={"post_id": None})
-            friendly = (
-                "TikTok a bloque les proxies testes (0 video recuperee). "
-                "Les proxies en echec sont mis en pause 24h. "
-                "Reessaie dans quelques minutes."
-            )
-            # Preferer le message clair renvoye par le scraper s'il est present.
-            err_msg = attempt_error if attempt_error and "TikTok a bloque" in attempt_error else friendly
-            publish_error(channel, scrape_id, err_msg)
+            err_code = str(result.get("error_code") or "").strip()
+            reason = _classify_error_reason(attempt_error, err_code)
+            if reason == "QUOTA_EXCEEDED":
+                err_msg = attempt_error or (
+                    "Quota Apify journalier atteint. Réessayez demain ou "
+                    "augmentez APIFY_DAILY_VIDEO_LIMIT."
+                )
+            elif attempt_error and (
+                "Quota Apify" in attempt_error
+                or "TikTok a bloque" in attempt_error
+                or attempt_error.startswith("apify_")
+            ):
+                err_msg = attempt_error
+            else:
+                err_msg = (
+                    "TikTok a bloque les proxies testes (0 video recuperee). "
+                    "Les proxies en echec sont mis en pause 24h. "
+                    "Reessaie dans quelques minutes."
+                )
+            publish_error(channel, scrape_id, err_msg, error_reason=reason)
             channel.basic_ack(delivery_tag=method.delivery_tag)
             return
 

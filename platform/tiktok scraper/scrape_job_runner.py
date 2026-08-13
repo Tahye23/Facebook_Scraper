@@ -50,6 +50,7 @@ def main() -> int:
         "analyze_video_content": bool(payload.get("analyze_video_content") or False),
         "headless_override": payload.get("headless_override"),
         "proxy_override": payload.get("proxy_override"),
+        "force_refresh": bool(payload.get("force_refresh") or False),
     }
     # Drop None optional keys that scrape_tiktok_page treats via defaults.
     if kwargs["max_age_hours"] is None:

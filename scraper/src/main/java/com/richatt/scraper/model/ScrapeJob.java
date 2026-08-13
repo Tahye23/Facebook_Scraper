@@ -27,6 +27,8 @@ public class ScrapeJob {
     private Platform platform;
     private ScrapeStatus status;
     private String errorMessage;
+    /** Code machine pour le frontend (ex: QUOTA_EXCEEDED). */
+    private String errorReason;
     private Map<String, Object> metadata;
     private Instant createdAt;
     private Instant updatedAt;

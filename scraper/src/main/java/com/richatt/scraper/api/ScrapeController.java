@@ -118,21 +118,85 @@ public class ScrapeController {
         }
 
         if (job.getStatus() == ScrapeStatus.FAILED && results.isEmpty()) {
-            return ResponseEntity.ok(Map.of(
-                "scrape_id", scrapeId,
-                "status", job.getStatus().name(),
-                "message", job.getErrorMessage() != null ? job.getErrorMessage() : "Scraping failed",
-                "count", 0,
-                "results", List.of()
-            ));
+            Map<String, Object> body = new java.util.HashMap<>();
+            body.put("scrape_id", scrapeId);
+            body.put("status", job.getStatus().name());
+            body.put("message", job.getErrorMessage() != null ? job.getErrorMessage() : "Scraping failed");
+            body.put("error_reason", job.getErrorReason() != null ? job.getErrorReason() : "");
+            body.put("count", 0);
+            body.put("results", List.of());
+            return ResponseEntity.ok(body);
         }
 
-        return ResponseEntity.ok(Map.of(
-                "scrape_id", scrapeId,
-            "status", job.getStatus().name(),
-                "count", results.size(),
-                "results", results
-        ));
+        Map<String, Object> ok = new java.util.HashMap<>();
+        ok.put("scrape_id", scrapeId);
+        ok.put("status", job.getStatus().name());
+        ok.put("count", results.size());
+        ok.put("results", results);
+        if (job.getErrorReason() != null) {
+            ok.put("error_reason", job.getErrorReason());
+        }
+        if (job.getErrorMessage() != null) {
+            ok.put("message", job.getErrorMessage());
+        }
+        if (job.getMetadata() != null) {
+            ok.put("metadata", job.getMetadata());
+        }
+        return ResponseEntity.ok(ok);
+    }
+
+    /**
+     * Export CSV des resultats du job (utile pour mode CSV/24h — bouton telecharger).
+     */
+    @GetMapping(value = "/{scrapeId}/export.csv", produces = "text/csv")
+    public ResponseEntity<String> exportCsv(@PathVariable String scrapeId) {
+        ScrapeJob job = orchestrationService.getJob(scrapeId).orElse(null);
+        if (job == null) {
+            return ResponseEntity.notFound().build();
+        }
+        List<ScrapeResult> results = orchestrationService.getResultsByScrapeId(scrapeId);
+        StringBuilder sb = new StringBuilder();
+        sb.append("post_id,author,text,likes,comments,shares,views,published_at,source_url,sentiment,themes\n");
+        for (ScrapeResult r : results) {
+            String likes = "", comments = "", shares = "", views = "";
+            if (r.getMetrics() != null) {
+                likes = r.getMetrics().getLikes() != null ? r.getMetrics().getLikes().toString() : "";
+                comments = r.getMetrics().getComments() != null ? r.getMetrics().getComments().toString() : "";
+                shares = r.getMetrics().getShares() != null ? r.getMetrics().getShares().toString() : "";
+                views = r.getMetrics().getViews() != null ? r.getMetrics().getViews().toString() : "";
+            }
+            String sentiment = "";
+            String themes = "";
+            if (r.getVideoReport() != null) {
+                Object s = r.getVideoReport().get("sentiment");
+                if (s != null) sentiment = String.valueOf(s);
+                Object t = r.getVideoReport().get("themes");
+                if (t instanceof List<?> list) {
+                    themes = list.stream().map(String::valueOf).reduce((a, b) -> a + "|" + b).orElse("");
+                }
+            }
+            sb.append(csv(r.getPostId())).append(',')
+                    .append(csv(r.getAuthor())).append(',')
+                    .append(csv(r.getTextContent())).append(',')
+                    .append(csv(likes)).append(',')
+                    .append(csv(comments)).append(',')
+                    .append(csv(shares)).append(',')
+                    .append(csv(views)).append(',')
+                    .append(csv(r.getPublishedAt() != null ? r.getPublishedAt().toString() : "")).append(',')
+                    .append(csv(r.getSourceUrl())).append(',')
+                    .append(csv(sentiment)).append(',')
+                    .append(csv(themes)).append('\n');
+        }
+        return ResponseEntity.ok()
+                .header("Content-Disposition", "attachment; filename=\"scrape_" + scrapeId + ".csv\"")
+                .body(sb.toString());
+    }
+
+    private static String csv(String value) {
+        if (value == null) {
+            return "\"\"";
+        }
+        return "\"" + value.replace("\"", "\"\"") + "\"";
     }
 
     @GetMapping("/{scrapeId}/results/stream")

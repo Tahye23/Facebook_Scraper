@@ -53,7 +53,17 @@ public class ScrapeResultListener {
         }
 
         if (!success) {
-            updateJobStatus(job, ScrapeStatus.FAILED, getString(message, "errorMessage", "error_message"));
+            String errMsg = getString(message, "errorMessage", "error_message");
+            String errReason = getString(message, "errorReason", "error_reason");
+            if (errReason == null || errReason.isBlank()) {
+                // Fallback heuristique si le worker n'a envoye que le message.
+                String low = errMsg != null ? errMsg.toLowerCase() : "";
+                if (low.contains("quota") && low.contains("apify")) {
+                    errReason = "QUOTA_EXCEEDED";
+                }
+            }
+            job.setErrorReason(errReason);
+            updateJobStatus(job, ScrapeStatus.FAILED, errMsg);
             return;
         }
 
@@ -75,9 +85,14 @@ public class ScrapeResultListener {
             ScrapeStatus finalStatus = "PARTIAL_SUCCESS".equalsIgnoreCase(reportedStatus)
                     ? ScrapeStatus.PARTIAL_SUCCESS
                     : ScrapeStatus.SUCCESS;
+            String errReason = getString(message, "errorReason", "error_reason");
+            if (errReason != null && !errReason.isBlank()) {
+                job.setErrorReason(errReason);
+            }
+            String errMsg = getString(message, "errorMessage", "error_message");
             updateJobStatus(job, finalStatus, "PARTIAL_SUCCESS".equalsIgnoreCase(reportedStatus)
-                    ? getString(message, "errorMessage", "error_message")
-                    : null);
+                    ? (errMsg != null ? errMsg : getString(message, "errorMessage", "error_message"))
+                    : errMsg);
             return;
         }
 
@@ -108,9 +123,13 @@ public class ScrapeResultListener {
     private void updateJobStatus(ScrapeJob job, ScrapeStatus status, String errorMessage) {
         job.setStatus(status);
         job.setErrorMessage(errorMessage);
+        // Ne pas effacer errorReason sur PARTIAL_SUCCESS / FAILED (ex: QUOTA_EXCEEDED).
+        if (status == ScrapeStatus.SUCCESS || status == ScrapeStatus.QUEUED) {
+            job.setErrorReason(null);
+        }
         job.setUpdatedAt(Instant.now());
         jobRepository.save(job);
-        log.info("Job {} → {}", job.getScrapeId(), status);
+        log.info("Job {} → {} reason={}", job.getScrapeId(), status, job.getErrorReason());
     }
 
     private Instant parseInstant(String value) {

@@ -52,6 +52,7 @@ public class ScrapeOrchestrationService {
         Instant now = Instant.now();
         String scrapeId = UUID.randomUUID().toString();
         int maxPosts = request.maxPosts() != null ? request.maxPosts() : 20;
+        boolean forceRefresh = Boolean.TRUE.equals(request.forceRefresh());
 
         ScrapeJob job = ScrapeJob.builder()
                 .scrapeId(scrapeId)
@@ -70,6 +71,7 @@ public class ScrapeOrchestrationService {
                     .url(request.url())
                     .platform(platform.name().toLowerCase())
                     .maxPosts(maxPosts)
+                    .forceRefresh(forceRefresh)
                     .requestedAt(now.toString())
                     .build());
         } catch (RuntimeException ex) {

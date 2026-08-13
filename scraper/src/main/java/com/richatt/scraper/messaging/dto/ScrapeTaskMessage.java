@@ -44,6 +44,10 @@ public class ScrapeTaskMessage {
     @JsonAlias({"reportType"})
     private String reportType;
 
+    @JsonProperty("force_refresh")
+    @JsonAlias({"forceRefresh"})
+    private Boolean forceRefresh;
+
     @JsonProperty("requested_at")
     @JsonAlias({"requestedAt"})
     private String requestedAt;

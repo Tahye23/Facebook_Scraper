@@ -5183,6 +5183,7 @@ def scrape_tiktok_page(
     headless_override: bool | None = None,
     analyze_video_content: bool | None = None,
     proxy_override: dict | None = None,
+    force_refresh: bool = False,
 ) -> dict:
     """Point d'entree public: scrape une page TikTok et retourne un resultat.
 
@@ -5199,6 +5200,7 @@ def scrape_tiktok_page(
             url,
             max_posts=max_posts,
             max_age_hours=max_age_hours,
+            force_refresh=force_refresh,
         )
     if engine in ("legacy", "playwright", "old", "ssr"):
         return _scrape_tiktok_page_legacy(
@@ -5224,15 +5226,22 @@ def _scrape_tiktok_page_via_apify(
     url: str,
     max_posts: int = 20,
     max_age_hours: int | None = None,
+    force_refresh: bool = False,
 ) -> dict:
-    """Extraction via Apify — ignore proxies / identity pool / sticky sessions."""
+    """Extraction via Apify — ignore proxies / identity pool / sticky sessions.
+
+    force_refresh=False → scrape_profile tente d'abord le cache Mongo (TTL)
+    via gateway, sans consommer le quota Apify.
+    """
     profile_url = _normalize_profile_url(url)
     scoped_logger = with_context(LOGGER, url=profile_url)
     scoped_logger.info(
-        "[APIFY] scrape start max_posts=%s max_age_hours=%s (proxies/sticky bypassed)",
+        "[APIFY] scrape start max_posts=%s max_age_hours=%s force_refresh=%s",
         max_posts,
         max_age_hours,
+        force_refresh,
     )
+
     try:
         from apify_client import scrape_profile
     except Exception as exc:
@@ -5249,8 +5258,8 @@ def _scrape_tiktok_page_via_apify(
         profile_url,
         max_posts=max_posts,
         max_age_hours=max_age_hours,
+        force_refresh=force_refresh,
     )
-    # Pas d'identity pool Apify — finalize sans identity (metriques globales OK).
     return _finalize_classified_result(
         result,
         country="",

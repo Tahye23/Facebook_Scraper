@@ -15,6 +15,12 @@ public record ScrapeRequest(
         @JsonAlias({"maxPosts"})
         @Min(value = 1, message = "maxPosts must be >= 1")
         @Max(value = 200, message = "maxPosts must be <= 200")
-        Integer maxPosts
+        Integer maxPosts,
+        /**
+         * Si true: ignore le cache TTL metrics et force un scrape frais (consomme le quota Apify).
+         */
+        @JsonProperty("force_refresh")
+        @JsonAlias({"forceRefresh"})
+        Boolean forceRefresh
 ) {
 }

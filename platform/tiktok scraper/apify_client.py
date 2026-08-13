@@ -73,7 +73,7 @@ def apify_actor_id() -> str:
 
 
 def daily_video_limit() -> int:
-    return max(1, _env_int("APIFY_DAILY_VIDEO_LIMIT", 30))
+    return max(1, _env_int("APIFY_DAILY_VIDEO_LIMIT", 33))
 
 
 def poll_interval_s() -> float:
@@ -83,6 +83,14 @@ def poll_interval_s() -> float:
 def run_timeout_s() -> float:
     return max(30.0, _env_float("APIFY_RUN_TIMEOUT_S", 180.0))
 
+
+def quota_exceeded_message(used: int, requested: int, limit: int) -> str:
+    return (
+        f"Quota Apify journalier atteint ({used}/{limit} vidéos). "
+        f"Demande refusée ({requested} vidéo(s) supplémentaires feraient "
+        f"{used + requested}/{limit}). Réessayez demain ou augmentez "
+        f"APIFY_DAILY_VIDEO_LIMIT si votre plan Apify le permet."
+    )
 
 def _quota_path() -> Path:
     raw = (os.getenv("APIFY_QUOTA_FILE") or _DEFAULT_QUOTA_FILE).strip()
@@ -129,16 +137,13 @@ def get_daily_usage() -> int:
 
 
 def check_quota_or_raise(requested: int) -> None:
-    """Refuse si count + requested > limite journaliere."""
+    """Bloque AVANT l'appel si count + demande > limite (jamais de dépassement)."""
     requested = max(0, int(requested))
     limit = daily_video_limit()
     with _LOCK:
         used = int(_load_quota().get("count") or 0)
         if used + requested > limit:
-            msg = (
-                f"quota Apify journalier atteint "
-                f"(used={used}, requested={requested}, limit={limit})"
-            )
+            msg = quota_exceeded_message(used, requested, limit)
             LOGGER.warning("[APIFY] %s", msg)
             raise ApifyQuotaExceeded(msg)
 
@@ -192,6 +197,41 @@ def username_from_profile_url(url: str) -> str:
     if cleaned and "/" not in cleaned and " " not in cleaned:
         return cleaned.lower()
     return ""
+
+
+def fetch_fresh_posts_from_gateway(
+    author: str,
+    *,
+    max_posts: int = 20,
+    max_age_hours: int | None = None,
+) -> dict[str, Any] | None:
+    """Posts avec metrics fraiches (TTL) via gateway — skip Apify / pas de quota."""
+    handle = (author or "").strip().lstrip("@")
+    if not handle:
+        return None
+    base_url = (os.getenv("GATEWAY_INTERNAL_URL") or "http://gateway:8080").rstrip("/")
+    endpoint = f"{base_url}/internal/results/fresh"
+    token = (os.getenv("INTERNAL_API_TOKEN") or "").strip()
+    body: dict[str, Any] = {
+        "platform": "tiktok",
+        "author": handle,
+        "max_posts": max_posts,
+    }
+    if max_age_hours:
+        body["max_age_hours"] = int(max_age_hours)
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if token:
+        headers["X-Internal-Token"] = token
+    try:
+        resp = requests.post(endpoint, json=body, headers=headers, timeout=10)
+        if resp.status_code >= 400:
+            LOGGER.warning("[APIFY] fresh cache HTTP %s", resp.status_code)
+            return None
+        data = resp.json()
+        return data if isinstance(data, dict) else None
+    except requests.RequestException as exc:
+        LOGGER.warning("[APIFY] fresh cache lookup failed: %s", exc)
+        return None
 
 
 def _to_iso(raw: Any) -> str | None:
@@ -465,6 +505,7 @@ def scrape_profile(
     *,
     max_posts: int = 20,
     max_age_hours: int | None = None,
+    force_refresh: bool = False,
 ) -> dict[str, Any]:
     """Point d'entree: scrape un profil via Apify. Contrat scraper.py.
 
@@ -479,6 +520,36 @@ def scrape_profile(
             "error": "invalid_profile_url",
             "error_code": "invalid_profile_url",
         }
+
+    # Cache Mongo (TTL metrics) — avant tout appel Apify / quota.
+    if not force_refresh:
+        cached = fetch_fresh_posts_from_gateway(
+            username,
+            max_posts=max_posts,
+            max_age_hours=max_age_hours,
+        )
+        if cached and cached.get("enough") and cached.get("posts"):
+            posts = list(cached.get("posts") or [])
+            if not max_age_hours:
+                try:
+                    posts = posts[: max(1, int(max_posts or 20))]
+                except (TypeError, ValueError):
+                    posts = posts[:20]
+            LOGGER.info(
+                "[APIFY] cache hit @%s posts=%s (quota untouched)",
+                username,
+                len(posts),
+            )
+            return {
+                "posts": posts,
+                "total": len(posts),
+                "url": profile_url,
+                "from_cache": True,
+                "classification_signals": {
+                    "engine": "apify_cache",
+                    "username": username,
+                },
+            }
 
     if not apify_token():
         return {

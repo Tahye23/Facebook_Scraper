@@ -18,6 +18,12 @@ public interface ScrapeResultRepository extends MongoRepository<ScrapeResult, St
 
     List<ScrapeResult> findByPlatformAndPostIdIn(Platform platform, Collection<String> postIds);
 
+    List<ScrapeResult> findByPlatformAndAuthorIgnoreCaseOrderByScrapedAtDesc(
+            Platform platform,
+            String author,
+            Pageable pageable
+    );
+
     List<ScrapeResult> findByScrapeIdOrderByIdAsc(String scrapeId, Pageable pageable);
 
     List<ScrapeResult> findByScrapeIdAndIdGreaterThanOrderByIdAsc(String scrapeId, String id, Pageable pageable);

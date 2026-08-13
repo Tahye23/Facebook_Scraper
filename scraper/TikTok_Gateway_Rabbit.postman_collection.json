@@ -38,7 +38,7 @@
       ]
     },
     {
-      "name": "Create Job TikTok - POST /scrape",
+      "name": "Create Job TikTok - @bellewarmedia (panel news)",
       "request": {
         "method": "POST",
         "header": [
@@ -49,7 +49,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"url\": \"https://www.tiktok.com/@kingmauritan\",\n  \"platform\": \"tiktok\"\n}"
+          "raw": "{\n  \"url\": \"https://www.tiktok.com/@bellewarmedia\",\n  \"platform\": \"tiktok\",\n  \"max_posts\": 10\n}"
         },
         "url": {
           "raw": "{{base_url}}/scrape",
@@ -60,7 +60,101 @@
             "scrape"
           ]
         },
-        "description": "Cree un job TikTok et memorise scrape_id."
+        "description": "Panel news Mauritanie #1 — lancer SEUL (mesure soft_block page par page). Ne pas utiliser @tiktok (compte officiel rate-limite)."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 202', function () {",
+              "    pm.response.to.have.status(202);",
+              "});",
+              "const data = pm.response.json();",
+              "pm.test('Response contains scrape_id', function () {",
+              "    pm.expect(data.scrape_id).to.exist;",
+              "});",
+              "if (data.scrape_id) {",
+              "    pm.collectionVariables.set('scrape_id', data.scrape_id);",
+              "    pm.collectionVariables.set('result_cursor', '');",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create Job TikTok - @kingmauritan (panel news)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"url\": \"https://www.tiktok.com/@kingmauritan\",\n  \"platform\": \"tiktok\",\n  \"max_posts\": 10\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/scrape",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape"
+          ]
+        },
+        "description": "Panel news Mauritanie #2 — lancer SEUL apres le run precedent."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 202', function () {",
+              "    pm.response.to.have.status(202);",
+              "});",
+              "const data = pm.response.json();",
+              "pm.test('Response contains scrape_id', function () {",
+              "    pm.expect(data.scrape_id).to.exist;",
+              "});",
+              "if (data.scrape_id) {",
+              "    pm.collectionVariables.set('scrape_id', data.scrape_id);",
+              "    pm.collectionVariables.set('result_cursor', '');",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create Job TikTok - @tawaturnet (panel news)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"url\": \"https://www.tiktok.com/@tawaturnet\",\n  \"platform\": \"tiktok\",\n  \"max_posts\": 10\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/scrape",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape"
+          ]
+        },
+        "description": "Panel news Mauritanie #3 — lancer SEUL apres le run precedent."
       },
       "event": [
         {

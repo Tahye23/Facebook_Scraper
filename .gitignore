@@ -13,6 +13,7 @@ platform/tiktok scraper/diagnostic_metrics.json
 platform/tiktok scraper/diagnostic_identity_pool.json
 platform/tiktok scraper/identity_pool.json
 platform/tiktok scraper/scrape_metrics.json
+platform/tiktok scraper/apify_quota.json
 # Pool Webshare (credentials) + blacklist locale des proxies en cooldown
 platform/tiktok scraper/webshare_residential_proxies.txt
 platform/tiktok scraper/proxy_blacklist.json

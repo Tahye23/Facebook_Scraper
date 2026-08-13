@@ -151,14 +151,14 @@
             "header": [{ "key": "Content-Type", "value": "application/json" }],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"url\": \"https://www.tiktok.com/@someuser\",\n  \"platform\": \"tiktok\",\n  \"max_posts\": 5\n}"
+              "raw": "{\n  \"url\": \"https://www.tiktok.com/@bellewarmedia\",\n  \"platform\": \"tiktok\",\n  \"max_posts\": 10\n}"
             },
             "url": {
               "raw": "{{base_url}}/scrape",
               "host": ["{{base_url}}"],
               "path": ["scrape"]
             },
-            "description": "Cree un job de scraping TikTok (job unique, une seule URL de profil) et memorise scrape_id_tiktok."
+            "description": "Panel news Mauritanie (@bellewarmedia). Lancer aussi @kingmauritan / @tawaturnet separement — pas @tiktok."
           },
           "event": [
             {

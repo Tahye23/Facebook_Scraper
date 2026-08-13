@@ -169,7 +169,39 @@ def _parent_alive(ppid: int) -> bool:
     return os.path.exists(f"/proc/{ppid}")
 
 
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Existe mais pas accessible — considerer vivant.
+        return True
+    except OSError:
+        return False
+
+
+def _reap_zombie(pid: int) -> None:
+    """Tente de reaper un zombie dont on est parent (WNOHANG)."""
+    if pid <= 0 or sys.platform == "win32":
+        return
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass
+    except OSError:
+        pass
+
+
 def _kill_pid(pid: int) -> None:
+    """SIGTERM → wait 2s → SIGKILL si encore vivant + waitpid (anti-zombie).
+
+    Chrome ignore parfois SIGTERM (crashpad / enfants); le fallback SIGKILL
+    + reap evite les orphelins qui revenaient a chaque cycle watchdog.
+    """
     if pid <= 0:
         return
     try:
@@ -180,8 +212,46 @@ def _kill_pid(pid: int) -> None:
                 timeout=10,
                 check=False,
             )
+            return
+
+        # 1) SIGTERM d'abord (laisse Chrome flusher / tuer ses enfants).
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            _reap_zombie(pid)
+            return
+
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            if not _pid_alive(pid):
+                _reap_zombie(pid)
+                return
+            time.sleep(0.2)
+
+        # 2) Encore vivant → SIGKILL (+ kill process group si leader).
+        if _pid_alive(pid):
+            LOGGER.warning(
+                "[CHROME_WATCHDOG] pid=%s survived SIGTERM — escalating SIGKILL",
+                pid,
+            )
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            time.sleep(0.3)
+
+        _reap_zombie(pid)
+        if _pid_alive(pid):
+            LOGGER.error(
+                "[CHROME_WATCHDOG] pid=%s STILL alive after SIGKILL "
+                "(zombie/D-state or permission)",
+                pid,
+            )
         else:
-            os.kill(pid, signal.SIGKILL)
+            LOGGER.info("[CHROME_WATCHDOG] pid=%s confirmed dead", pid)
     except Exception:
         LOGGER.debug("watchdog kill pid=%s failed", pid, exc_info=True)
 

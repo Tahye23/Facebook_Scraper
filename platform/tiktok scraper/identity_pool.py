@@ -43,6 +43,8 @@ class Identity:
     in_use: bool = False  # checkout court (evite double-assign dans un job)
     # Epoch seconds; 0 = pas de cooldown. Skip checkout si > now.
     quarantine_until: float = 0.0
+    # Soft-blocks successifs sans succes entre-temps; 2+ → status=dead.
+    consecutive_soft_blocks: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -62,6 +64,7 @@ class Identity:
             proxy_username=str(raw.get("proxy_username") or ""),
             in_use=bool(raw.get("in_use") or False),
             quarantine_until=float(raw.get("quarantine_until") or 0.0),
+            consecutive_soft_blocks=max(0, int(raw.get("consecutive_soft_blocks") or 0)),
         )
 
 
@@ -134,7 +137,11 @@ def register_identity(
     session_id: str,
     status: Status = "virgin",
 ) -> Identity:
-    """Enregistre (ou met a jour) une sticky session dans le pool."""
+    """Enregistre (ou met a jour) une sticky session dans le pool.
+
+    Ne ressuscite JAMAIS une identite `dead` (sticky brulee) — le caller doit
+    generer un nouveau session_id.
+    """
     cc = (country or "us").strip().lower()
     sid = str(session_id).strip()
     iid = make_identity_id(cc, sid)
@@ -145,9 +152,13 @@ def register_identity(
         existing = identities.get(iid)
         if existing:
             ident = Identity.from_dict(existing)
-            ident.last_used_at = time.time()
             if ident.status == "dead":
-                ident.status = "virgin"
+                LOGGER.warning(
+                    "[IDENTITY_POOL] refuse resurrect dead %s — keep dead",
+                    iid,
+                )
+                return ident
+            ident.last_used_at = time.time()
             identities[iid] = ident.to_dict()
             _save(store)
             return ident
@@ -175,7 +186,10 @@ def acquire_for_country(
     base_user: str,
     prefer_warm: bool = True,
 ) -> Identity | None:
-    """Retourne une identite warm/active reutilisable pour ce pays, ou None."""
+    """Retourne une identite warm/active reutilisable pour ce pays, ou None.
+
+    Skip: in_use, cooldown, dead, quarantine.
+    """
     if not enabled():
         return None
     cc = (country or "").strip().lower()
@@ -199,6 +213,8 @@ def acquire_for_country(
         for raw in identities.values():
             ident = Identity.from_dict(raw)
             if ident.country != cc:
+                continue
+            if ident.status == "dead":
                 continue
             if ident.in_use:
                 continue
@@ -224,9 +240,10 @@ def acquire_for_country(
         identities[chosen.identity_id] = chosen.to_dict()
         _save(store)
         LOGGER.info(
-            "[IDENTITY_POOL] reuse+checkout %s status=%s",
+            "[IDENTITY_POOL] reuse+checkout %s status=%s consecutive_soft_blocks=%s",
             chosen.identity_id,
             chosen.status,
+            chosen.consecutive_soft_blocks,
         )
         return chosen
 
@@ -237,7 +254,21 @@ def create_virgin(
     country: str,
     session_id: str | None = None,
 ) -> Identity:
-    sid = session_id or str(random.randint(10_000_000, 99_999_999))
+    """Cree une sticky virgin. Si collision avec un dead, regenere un nouvel id."""
+    for _ in range(8):
+        sid = session_id or str(random.randint(10_000_000, 99_999_999))
+        ident = register_identity(
+            base_user=base_user,
+            country=country,
+            session_id=sid,
+            status="virgin",
+        )
+        if ident.status != "dead":
+            return ident
+        # Collision avec un dead: forcer un nouvel id aleatoire.
+        session_id = None
+    # Dernier recours (extremement improbable).
+    sid = str(random.randint(10_000_000, 99_999_999))
     return register_identity(
         base_user=base_user,
         country=country,
@@ -252,7 +283,13 @@ def apply_classification(
     *,
     success: bool = False,
 ) -> Identity | None:
-    """Met a jour le cycle de vie selon la classe Response Classifier."""
+    """Met a jour le cycle de vie selon la classe Response Classifier.
+
+    Soft-block:
+      1er → warm + cooldown (TIKTOK_QUARANTINE_COOLDOWN_HOURS)
+      2e consecutif (sans succes entre-temps) → dead (plus jamais auto-reuse)
+    Succes → consecutive_soft_blocks=0, status=active.
+    """
     if not enabled() or not identity_id:
         return None
     cls = (scrape_class or "unknown").strip().lower()
@@ -276,6 +313,7 @@ def apply_classification(
         if success or cls == "success":
             ident.status = "active"
             ident.quarantine_until = 0.0
+            ident.consecutive_soft_blocks = 0
         else:
             hist = list(ident.failure_history or [])
             hist.append(cls)
@@ -287,7 +325,31 @@ def apply_classification(
                 # garder warm/virgin — retry same identity recommande
                 if ident.status not in ("quarantine", "dead"):
                     ident.status = "warm" if ident.status == "active" else ident.status
-            elif cls in ("structural_change", "platform_change_suspected", "soft_block"):
+            elif cls == "soft_block":
+                ident.consecutive_soft_blocks = int(ident.consecutive_soft_blocks or 0) + 1
+                if ident.consecutive_soft_blocks >= 2:
+                    ident.status = "dead"
+                    ident.quarantine_until = 0.0
+                    LOGGER.warning(
+                        "[IDENTITY_POOL] %s → status=dead after consecutive_soft_blocks=%s",
+                        ident.identity_id,
+                        ident.consecutive_soft_blocks,
+                    )
+                else:
+                    if ident.status == "virgin":
+                        ident.status = "warm"
+                    elif ident.status == "active":
+                        ident.status = "warm"
+                    ident.quarantine_until = now + (_soft_cooldown_hours() * 3600.0)
+                    LOGGER.info(
+                        "[IDENTITY_POOL] cooldown %s until +%.1fh after class=%s "
+                        "(consecutive_soft_blocks=%s)",
+                        ident.identity_id,
+                        _soft_cooldown_hours(),
+                        cls,
+                        ident.consecutive_soft_blocks,
+                    )
+            elif cls in ("structural_change", "platform_change_suspected"):
                 # Soft cooldown reuse (pas status=quarantine dure pour structural).
                 if ident.status == "virgin":
                     ident.status = "warm"
@@ -308,10 +370,11 @@ def apply_classification(
         identities[ident.identity_id] = ident.to_dict()
         _save(store)
         LOGGER.info(
-            "[IDENTITY_POOL] %s → status=%s quarantine_until=%.0f after class=%s",
+            "[IDENTITY_POOL] %s → status=%s quarantine_until=%.0f consecutive_soft_blocks=%s after class=%s",
             ident.identity_id,
             ident.status,
             float(ident.quarantine_until or 0.0),
+            int(ident.consecutive_soft_blocks or 0),
             cls,
         )
         return ident

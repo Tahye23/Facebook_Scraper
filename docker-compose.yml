@@ -142,8 +142,20 @@ services:
       TIKTOK_STICKY_MAX_SESSIONS: "50"
       # false = cookies par IP + LRU (voir sticky_sessions.py).
       TIKTOK_WARMED_ONLY: "false"
-      # anti-detection-v2 MVP + harden (subprocess kill / cooldown / assets toggle)
-      TIKTOK_JOB_HARD_TIMEOUT_S: "90"
+      # Moteur TikTokApi + sticky residential (PAS proxyproviders.Webshare list API).
+      TIKTOK_ENGINE: ${TIKTOK_ENGINE:-tiktokapi}
+      TIKTOK_API_USE_CONTEXT_FACTORY: ${TIKTOK_API_USE_CONTEXT_FACTORY:-true}
+      TIKTOK_API_SESSION_TIMEOUT_MS: ${TIKTOK_API_SESSION_TIMEOUT_MS:-60000}
+      TIKTOK_API_SLEEP_AFTER: ${TIKTOK_API_SLEEP_AFTER:-5}
+      TIKTOK_API_MAX_ATTEMPTS: ${TIKTOK_API_MAX_ATTEMPTS:-4}
+      # Rotation: chromium puis webkit (suggestion EmptyResponseException TikTokApi).
+      TIKTOK_API_BROWSER_CANDIDATES: ${TIKTOK_API_BROWSER_CANDIDATES:-chromium,webkit}
+      # Ne pas forcer un ms_token .env (mismatch sticky) sauf TIKTOK_MS_TOKEN_FORCE=true.
+      TIKTOK_MS_TOKEN_FORCE: ${TIKTOK_MS_TOKEN_FORCE:-false}
+      TIKTOK_SCRAPE_SUBPROCESS_LOG_STDERR: ${TIKTOK_SCRAPE_SUBPROCESS_LOG_STDERR:-true}
+      # Hard timeout worker: 4 tentatives × (60s session + ~10s marge) ≈ 280s.
+      WORKER_HARD_TIMEOUT_S: ${WORKER_HARD_TIMEOUT_S:-280}
+      TIKTOK_JOB_HARD_TIMEOUT_S: ${TIKTOK_JOB_HARD_TIMEOUT_S:-280}
       TIKTOK_SCRAPE_SUBPROCESS: "true"
       TIKTOK_CHROME_WATCHDOG_ENABLED: "true"
       TIKTOK_BLOCK_HEAVY_ASSETS: "true"
@@ -164,7 +176,11 @@ services:
       # Cookies globaux (legacy / fallback hors sticky). En mode sticky on
       # prefere cookies.json DANS chaque dossier de session.
       - "./platform/tiktok scraper/tiktok_cookies.json:/app/platform/tiktok-scraper/tiktok_cookies.json:ro"
-      # Legacy pool 20k (ignore si TIKTOK_PROXY_MODE=rotate).
+      # Identity pool persisté (statuts virgin/warm/dead) — OBLIGATOIRE sinon
+      # les identities dead/soft-blockées reviennent apres chaque recreate.
+      - "./platform/tiktok scraper/identity_pool.json:/app/platform/tiktok-scraper/identity_pool.json"
+      # Quota journalier Apify (persisté hors recreate).
+      - "./platform/tiktok scraper/apify_quota.json:/app/platform/tiktok-scraper/apify_quota.json"
       - "./platform/tiktok scraper/webshare_residential_proxies.txt:/app/platform/tiktok-scraper/webshare_residential_proxies.txt:ro"
       # Blacklist locale (desactivee en mode rotate).
       - "./platform/tiktok scraper/proxy_blacklist.json:/app/platform/tiktok-scraper/proxy_blacklist.json"

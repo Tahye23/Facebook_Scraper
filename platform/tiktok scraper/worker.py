@@ -58,13 +58,20 @@ _SCRAPE_RUNNER = Path(__file__).resolve().parent / "scrape_job_runner.py"
 def _job_hard_timeout_s() -> float:
     """Budget dur worker: kill process scrape+Chrome apres N secondes.
 
-    Defaut 90s (>= attempt budget scraper ~45s + marge). Env: TIKTOK_JOB_HARD_TIMEOUT_S.
+    Doit couvrir le pire cas TikTokApi:
+      TIKTOK_API_MAX_ATTEMPTS * (SESSION_TIMEOUT_S + marge_warmup)
+    Ex: 4 * (60 + ~10) ≈ 280s. Env (priorite):
+      WORKER_HARD_TIMEOUT_S puis TIKTOK_JOB_HARD_TIMEOUT_S (legacy).
     """
-    raw = (os.getenv("TIKTOK_JOB_HARD_TIMEOUT_S") or "90").strip()
+    raw = (
+        os.getenv("WORKER_HARD_TIMEOUT_S")
+        or os.getenv("TIKTOK_JOB_HARD_TIMEOUT_S")
+        or "280"
+    ).strip()
     try:
         return max(45.0, float(raw))
     except ValueError:
-        return 90.0
+        return 280.0
 
 
 def _env_bool_local(name: str, default: bool) -> bool:
@@ -108,12 +115,27 @@ def _scrape_with_hard_timeout(**kwargs) -> dict:
         "--output",
         str(out_path),
     ]
+    # Capturer stderr pour diagnostiquer TikTokApi/Playwright (sinon DEVNULL = aveugle).
+    # TIKTOK_SCRAPE_SUBPROCESS_LOG_STDERR=false pour revenir au silence.
+    capture_stderr = (os.getenv("TIKTOK_SCRAPE_SUBPROCESS_LOG_STDERR") or "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    )
+    err_path = tmp_dir / "stderr.log"
+    err_fh = None
     popen_kwargs: dict = {
         "cwd": str(Path(__file__).resolve().parent),
         "env": os.environ.copy(),
         "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
     }
+    if capture_stderr:
+        err_fh = open(err_path, "w", encoding="utf-8", errors="replace")
+        popen_kwargs["stderr"] = err_fh
+    else:
+        popen_kwargs["stderr"] = subprocess.DEVNULL
     if sys.platform == "win32":
         # Nouveau process group Windows pour taskkill /T.
         popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -127,9 +149,11 @@ def _scrape_with_hard_timeout(**kwargs) -> dict:
         timeout_s,
         str(kwargs.get("url") or "")[:80],
     )
+    timed_out = False
     try:
         proc.wait(timeout=timeout_s)
     except subprocess.TimeoutExpired:
+        timed_out = True
         LOGGER.error(
             "[PERF] HARD TIMEOUT %.0fs — killing scrape process tree pid=%s",
             timeout_s,
@@ -141,6 +165,25 @@ def _scrape_with_hard_timeout(**kwargs) -> dict:
             proc.wait(timeout=5)
         except Exception:
             pass
+    finally:
+        if err_fh is not None:
+            try:
+                err_fh.flush()
+                err_fh.close()
+            except Exception:
+                pass
+        if capture_stderr and err_path.exists():
+            try:
+                err_tail = err_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+                if err_tail.strip():
+                    LOGGER.warning(
+                        "[PERF] scrape subprocess stderr tail:\n%s",
+                        err_tail,
+                    )
+            except Exception:
+                LOGGER.debug("Failed to read scrape stderr log", exc_info=True)
+
+    if timed_out:
         return {
             "posts": [],
             "total": 0,
@@ -2089,7 +2132,10 @@ def on_message(channel, method, properties, body):
                 time.sleep(backoff)
             else:
                 scoped_logger.error(
-                    "All attempts failed with 0 posts",
+                    "All attempts failed with 0 posts — error=%s class=%s detail=%s",
+                    (attempt_error or "")[:240],
+                    str(result.get("classification") or ""),
+                    str(result.get("error_detail") or result.get("classification_reason") or "")[:160],
                     extra={"attempts": job_max_attempts, "error": attempt_error},
                 )
 
@@ -2270,6 +2316,19 @@ def main():
     Declare exchange/queues/bindings, configure la QoS, puis demarre la
     consommation des messages TikTok jusqu'a interruption.
     """
+    # Garde-fou invariant #8: WEBSHARE_API_KEY ne doit pas etre utilise en mode
+    # rotate (plan Residential Rotating). Aucun code n'appelle proxyproviders.Webshare,
+    # mais une cle renseignee induit en erreur — on log un warning clair.
+    proxy_mode = (os.getenv("TIKTOK_PROXY_MODE") or "rotate").strip().lower()
+    webshare_key = (os.getenv("WEBSHARE_API_KEY") or "").strip()
+    if webshare_key and proxy_mode in ("rotate", "rotating", "endpoint"):
+        LOGGER.warning(
+            "[PROXY] WEBSHARE_API_KEY is set but TIKTOK_PROXY_MODE=%s — "
+            "ignored (proxyproviders.Webshare /proxy/list incompatible with "
+            "Residential Rotating). Use TIKTOK_PROXY_USERNAME/PASSWORD sticky only.",
+            proxy_mode,
+        )
+
     # Filet de securite: tue Chrome orphelins (parent mort / PPID=1).
     try:
         start_chrome_watchdog()

@@ -36,7 +36,7 @@
       ]
     },
     {
-      "name": "Scrape Page - POST /scrape/page",
+      "name": "Scrape Page - @bellewarmedia (panel news)",
       "request": {
         "method": "POST",
         "header": [
@@ -47,7 +47,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"url\": \"https://www.tiktok.com/@kingmauritan\",\n  \"max_posts\": 5,\n  \"headless\": false\n}"
+          "raw": "{\n  \"url\": \"https://www.tiktok.com/@bellewarmedia\",\n  \"max_posts\": 10,\n  \"headless\": false\n}"
         },
         "url": {
           "raw": "{{base_url}}/scrape/page",
@@ -58,7 +58,102 @@
             "scrape",
             "page"
           ]
+        },
+        "description": "Panel news #1 — un run par page. Eviter @tiktok (compte officiel)."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "const data = pm.response.json();",
+              "pm.test('Response contains posts array', function () {",
+              "    pm.expect(data.posts).to.be.an('array');",
+              "});",
+              "if (Array.isArray(data.posts) && data.posts.length > 0 && data.posts[0].post_url) {",
+              "    pm.collectionVariables.set('video_url', data.posts[0].post_url);",
+              "}"
+            ]
+          }
         }
+      ]
+    },
+    {
+      "name": "Scrape Page - @kingmauritan (panel news)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"url\": \"https://www.tiktok.com/@kingmauritan\",\n  \"max_posts\": 10,\n  \"headless\": false\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/scrape/page",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape",
+            "page"
+          ]
+        },
+        "description": "Panel news #2."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "const data = pm.response.json();",
+              "pm.test('Response contains posts array', function () {",
+              "    pm.expect(data.posts).to.be.an('array');",
+              "});",
+              "if (Array.isArray(data.posts) && data.posts.length > 0 && data.posts[0].post_url) {",
+              "    pm.collectionVariables.set('video_url', data.posts[0].post_url);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Scrape Page - @tawaturnet (panel news)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"url\": \"https://www.tiktok.com/@tawaturnet\",\n  \"max_posts\": 10,\n  \"headless\": false\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/scrape/page",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape",
+            "page"
+          ]
+        },
+        "description": "Panel news #3."
       },
       "event": [
         {

@@ -100,7 +100,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"url\": \"https://www.tiktok.com/@someuser\",\n  \"platform\": \"tiktok\",\n  \"max_posts\": 5\n}"
+          "raw": "{\n  \"url\": \"https://www.tiktok.com/@bellewarmedia\",\n  \"platform\": \"tiktok\",\n  \"max_posts\": 10\n}"
         },
         "url": {
           "raw": "{{base_url}}/scrape",
@@ -111,7 +111,7 @@
             "scrape"
           ]
         },
-        "description": "Crée un job de scraping TikTok et met à jour scrape_id."
+        "description": "Panel news Mauritanie (@bellewarmedia). Tester aussi @kingmauritan / @tawaturnet separement — pas @tiktok."
       },
       "event": [
         {

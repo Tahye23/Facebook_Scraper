@@ -580,7 +580,9 @@ def _assign_webshare_sticky_session(proxy_cfg: dict | None) -> dict | None:
     Sticky = 1 session_id = 1 IP pour toute la duree du browser.
 
     Phase 1: prefere une identite warm du Identity Pool pour le pays choisi;
-    sinon cree une sticky virgin et l'enregistre.
+    sinon cree une sticky virgin et l'enregistre. Si un pays n'a plus
+    d'identite dispo (cooldown/dead), on essaie les autres pays configures
+    avant de creer une virgin (evite de recycler un micro-pool US).
     """
     if not proxy_cfg:
         return None
@@ -589,32 +591,39 @@ def _assign_webshare_sticky_session(proxy_cfg: dict | None) -> dict | None:
 
     out = dict(proxy_cfg)
     base = _webshare_username_base(str(out.get("username") or ""))
-    country = random.choice(_webshare_sticky_countries())
+    countries = list(_webshare_sticky_countries())
+    random.shuffle(countries)
+    country = countries[0] if countries else "us"
     session_id: str | None = None
-    # Reutiliser une sticky warm/active si disponible (meme pays).
+    # Reutiliser une sticky warm/active: essayer chaque pays (pool US souvent trop petit).
     try:
         if identity_pool.enabled():
-            reused = identity_pool.acquire_for_country(
-                country, base_user=base, prefer_warm=True
-            )
-            if reused and reused.session_id:
-                session_id = reused.session_id
-                country = reused.country or country
-                LOGGER.info(
-                    "[IDENTITY] assigning reused sticky %s",
-                    reused.identity_id,
+            for cc in countries:
+                reused = identity_pool.acquire_for_country(
+                    cc, base_user=base, prefer_warm=True
                 )
+                if reused and reused.session_id:
+                    session_id = reused.session_id
+                    country = reused.country or cc
+                    LOGGER.info(
+                        "[IDENTITY] assigning reused sticky %s",
+                        reused.identity_id,
+                    )
+                    break
     except Exception:
         LOGGER.debug("identity_pool acquire failed", exc_info=True)
 
     if not session_id:
-        # Session ID numerique (doc Webshare: username-us-1234).
+        # Prefere un pays moins sature (moins de dead/warm) pour agrandir le pool.
+        country = random.choice(countries) if countries else "us"
         session_id = str(random.randint(10_000_000, 99_999_999))
         try:
             if identity_pool.enabled():
-                identity_pool.create_virgin(
+                virgin = identity_pool.create_virgin(
                     base_user=base, country=country, session_id=session_id
                 )
+                session_id = virgin.session_id
+                country = virgin.country or country
         except Exception:
             LOGGER.debug("identity_pool create_virgin failed", exc_info=True)
 
@@ -5176,6 +5185,234 @@ def scrape_tiktok_page(
     proxy_override: dict | None = None,
 ) -> dict:
     """Point d'entree public: scrape une page TikTok et retourne un resultat.
+
+    Moteurs (TIKTOK_ENGINE):
+      - apify     → Apify clockworks/tiktok-profile-scraper (pas de proxies locaux)
+      - tiktokapi → TikTokApi + sticky residential (defaut)
+      - legacy    → ancienne pipeline Playwright SSR/XHR/DOM
+
+    Contrat inchange pour worker.py / scrape_job_runner.py / RabbitMQ.
+    """
+    engine = (os.getenv("TIKTOK_ENGINE") or "tiktokapi").strip().lower()
+    if engine in ("apify", "apify_api", "clockworks"):
+        return _scrape_tiktok_page_via_apify(
+            url,
+            max_posts=max_posts,
+            max_age_hours=max_age_hours,
+        )
+    if engine in ("legacy", "playwright", "old", "ssr"):
+        return _scrape_tiktok_page_legacy(
+            url,
+            max_posts=max_posts,
+            max_age_hours=max_age_hours,
+            on_post=on_post,
+            headless_override=headless_override,
+            analyze_video_content=analyze_video_content,
+            proxy_override=proxy_override,
+        )
+    return _scrape_tiktok_page_via_api(
+        url,
+        max_posts=max_posts,
+        max_age_hours=max_age_hours,
+        headless_override=headless_override,
+        analyze_video_content=analyze_video_content,
+        proxy_override=proxy_override,
+    )
+
+
+def _scrape_tiktok_page_via_apify(
+    url: str,
+    max_posts: int = 20,
+    max_age_hours: int | None = None,
+) -> dict:
+    """Extraction via Apify — ignore proxies / identity pool / sticky sessions."""
+    profile_url = _normalize_profile_url(url)
+    scoped_logger = with_context(LOGGER, url=profile_url)
+    scoped_logger.info(
+        "[APIFY] scrape start max_posts=%s (proxies/sticky bypassed)",
+        max_posts,
+    )
+    try:
+        from apify_client import scrape_profile
+    except Exception as exc:
+        scoped_logger.error("[APIFY] import failed: %s", exc)
+        return {
+            "posts": [],
+            "total": 0,
+            "url": profile_url,
+            "error": f"apify_import_error:{exc}",
+            "error_code": "apify_import_error",
+        }
+
+    result = scrape_profile(
+        profile_url,
+        max_posts=max_posts,
+        max_age_hours=max_age_hours,
+    )
+    # Pas d'identity pool Apify — finalize sans identity (metriques globales OK).
+    return _finalize_classified_result(
+        result,
+        country="",
+        identity="",
+        record=True,
+    )
+
+
+def _scrape_tiktok_page_via_api(
+    url: str,
+    max_posts: int = 20,
+    max_age_hours: int | None = None,
+    headless_override: bool | None = None,
+    analyze_video_content: bool | None = None,
+    proxy_override: dict | None = None,
+) -> dict:
+    """Extraction via TikTokApi — conserve retries proxy + classifier."""
+    profile_url = _normalize_profile_url(url)
+    scoped_logger = with_context(LOGGER, url=profile_url)
+    if headless_override is None:
+        headless = _env_bool("TIKTOK_HEADLESS", True)
+    else:
+        headless = bool(headless_override)
+    if analyze_video_content is None:
+        analyze_video_content = _env_bool("TIKTOK_ANALYZE_VIDEO_CONTENT", False)
+
+    if _force_direct_mode():
+        scoped_logger.warning("TIKTOK_FORCE_DIRECT=true — TikTokApi without proxy")
+        proxy_candidates = [None]
+    elif proxy_override is not None:
+        # Plusieurs sticky distincts (IP neuves) — recommande 3-4 pour soft_block.
+        n = max(1, min(
+            _env_int("MAX_PROXY_RETRIES", 0) or _env_int("TIKTOK_PROXY_MAX_PER_JOB", 4),
+            _env_int("TIKTOK_API_MAX_ATTEMPTS", 4),
+        ))
+        if _rotating_proxy_mode():
+            proxy_candidates = [
+                _assign_webshare_sticky_session(dict(proxy_override)) for _ in range(n)
+            ]
+        else:
+            proxy_candidates = [proxy_override]
+    else:
+        # Residential rotating via TIKTOK_PROXY_* (PAS proxyproviders.Webshare).
+        proxy_candidates = _select_proxy_candidates()
+        max_attempts = max(1, _env_int("TIKTOK_API_MAX_ATTEMPTS", 4))
+        if len(proxy_candidates) > max_attempts:
+            proxy_candidates = proxy_candidates[:max_attempts]
+        # Garantir assez de sticky distincts meme si le pool renvoie 1 base.
+        if _rotating_proxy_mode() and proxy_candidates:
+            base = dict(proxy_candidates[0] or {})
+            while len(proxy_candidates) < max_attempts:
+                proxy_candidates.append(_assign_webshare_sticky_session(dict(base)))
+
+    from tiktok_extractor import api_browser_candidates, extract_profile
+
+    browsers = api_browser_candidates()
+    last_result: dict | None = None
+    for attempt_idx, proxy_cfg in enumerate(proxy_candidates, start=1):
+        if proxy_cfg is not None and _is_blacklisted(proxy_cfg):
+            scoped_logger.info(
+                "Skipping already-blacklisted proxy",
+                extra={"url": _describe_proxy(proxy_cfg)},
+            )
+            continue
+
+        # Nouvelle sticky a chaque retry (nouvelle IP).
+        if proxy_cfg is not None and _rotating_proxy_mode() and attempt_idx > 1:
+            proxy_cfg = _assign_webshare_sticky_session(dict(proxy_cfg))
+
+        browser_name = browsers[(attempt_idx - 1) % len(browsers)]
+        scoped_logger.info(
+            "[TikTokApi] scrape attempt %s/%s sticky=%s browser=%s ms_token=auto",
+            attempt_idx,
+            len(proxy_candidates),
+            _describe_proxy(proxy_cfg) if proxy_cfg else "direct",
+            browser_name,
+        )
+        try:
+            result = extract_profile(
+                profile_url,
+                max_posts=max_posts,
+                max_age_hours=max_age_hours,
+                headless=headless,
+                proxy_cfg=proxy_cfg,
+                analyze_video_content=bool(analyze_video_content),
+                browser_name=browser_name,
+            )
+        except Exception as exc:
+            result = {
+                "posts": [],
+                "total": 0,
+                "url": profile_url,
+                "error": f"scrape_exception:{exc}",
+                "error_code": "scrape_exception",
+            }
+
+        result = _finalize_classified_result(
+            result,
+            country=_sticky_country_from_proxy(proxy_cfg),
+            identity=_proxy_identity(proxy_cfg) if proxy_cfg else "",
+            record=True,
+        )
+        last_result = result
+        error_code = str(result.get("error") or "").strip().lower()
+        scrape_class = str(result.get("classification") or "").strip().lower()
+
+        if _is_fatal_proxy_auth_error(error_code) or scrape_class == "auth":
+            scoped_logger.warning(
+                "[TikTokApi] fatal proxy auth — aborting retries",
+                extra={"error": error_code[:160]},
+            )
+            return result
+
+        if result.get("posts") or not _is_retryable_soft_error(error_code):
+            if result.get("posts"):
+                scoped_logger.info("[TikTokApi] scrape finished successfully")
+            else:
+                scoped_logger.warning(
+                    "[TikTokApi] scrape finished with non-retryable error",
+                    extra={"error": error_code[:160]},
+                )
+            return result
+
+        # Soft empty / timeout: purge sticky + prochaine tentative.
+        if proxy_cfg is not None and sticky_sessions.sticky_enabled():
+            if _env_bool("PURGE_STICKY_ON_BLOCK", True):
+                sticky_sessions.purge_sticky_cookies(
+                    _proxy_identity(proxy_cfg),
+                    reason=error_code[:160],
+                    mark_waf=scrape_class in ("hard_block", "proxy_infra"),
+                )
+        scoped_logger.warning(
+            "[TikTokApi] soft failure — rotating identity/session",
+            extra={"error": error_code[:160], "class": scrape_class},
+        )
+
+    if last_result is None:
+        return {
+            "posts": [],
+            "total": 0,
+            "error": "all_proxies_blocked",
+            "error_code": "all_proxies_blocked",
+            "url": profile_url,
+        }
+    if not last_result.get("posts"):
+        last_result["error_code"] = str(last_result.get("error") or "all_proxies_blocked")
+        last_result["error"] = (
+            "TikTokApi: 0 video recuperee apres retries proxy/session. "
+            "Verifie TIKTOK_PROXY_* (rotate sticky) / ms_token — pas WEBSHARE_API_KEY."
+        )
+    return last_result
+
+
+def _scrape_tiktok_page_legacy(
+    url: str,
+    max_posts: int = 20,
+    max_age_hours: int | None = None,
+    on_post=None,
+    headless_override: bool | None = None,
+    analyze_video_content: bool | None = None,
+    proxy_override: dict | None = None,
+) -> dict:
+    """Ancien moteur Playwright SSR/XHR/DOM (rollback via TIKTOK_ENGINE=legacy).
 
     Orchestration:
     - normalise l'URL

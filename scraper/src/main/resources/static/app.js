@@ -182,15 +182,16 @@
       renderResults(payload);
 
       const done = ["SUCCESS", "PARTIAL_SUCCESS", "FAILED"].includes(status);
-      // Rapport HTML 24h/CSV (metadata.htmlPath) — pas le CSV brut.
+      // PDF 24h/CSV (metadata.pdfPath) — telechargement attachment.
       const meta = payload.metadata || job.metadata || {};
-      const hasReport = !!(payload.report_url || meta.htmlPath || meta.html_path);
+      const hasReport = !!(payload.report_url || payload.pdf_path || meta.pdfPath || meta.pdf_path);
       const canDownload = state.isCsvJob && done && status !== "FAILED" && hasReport;
       downloadBtn.classList.toggle("hidden", !canDownload);
       if (canDownload) {
         downloadBtn.href = payload.report_url || `/scrape/${state.scrapeId}/report`;
-        downloadBtn.removeAttribute("download");
-        downloadBtn.textContent = "Télécharger le rapport";
+        downloadBtn.setAttribute("download", "");
+        downloadBtn.removeAttribute("target");
+        downloadBtn.textContent = "Télécharger le PDF";
       }
       if (done) {
         clearInterval(state.pollTimer);

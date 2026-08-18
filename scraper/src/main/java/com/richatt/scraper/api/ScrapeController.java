@@ -138,8 +138,6 @@ public class ScrapeController {
         ok.put("scrape_id", scrapeId);
         ok.put("status", job.getStatus().name());
         ok.put("count", results.size());
-        // Mode 24h: le rapport Gemini est batch (HTML) — rattache un resume par ligne pour l'UI.
-        reportArtifactService.attachBatchGeminiReports(job, results);
         ok.put("results", results);
         if (job.getErrorReason() != null) {
             ok.put("error_reason", job.getErrorReason());
@@ -149,19 +147,17 @@ public class ScrapeController {
         }
         if (job.getMetadata() != null) {
             ok.put("metadata", job.getMetadata());
-            Object html = job.getMetadata().get("htmlPath");
-            if (html == null) {
-                html = job.getMetadata().get("html_path");
-            }
-            if (html != null) {
+            String pdf = reportArtifactService.pdfPathFromJob(job);
+            if (pdf != null && !pdf.isBlank()) {
                 ok.put("report_url", "/scrape/" + scrapeId + "/report");
+                ok.put("pdf_path", pdf);
             }
         }
         return ResponseEntity.ok(ok);
     }
 
     /**
-     * Rapport HTML Mauritanie 24h (meme fichier que video_reports/*.html).
+     * Telecharge le PDF 24h (attachment, pas d'ouverture inline HTML).
      */
     @GetMapping("/{scrapeId}/report")
     public ResponseEntity<Resource> downloadReport(@PathVariable String scrapeId) {
@@ -169,14 +165,16 @@ public class ScrapeController {
         if (job == null) {
             return ResponseEntity.notFound().build();
         }
-        Resource resource = reportArtifactService.loadHtmlReport(job);
+        Resource resource = reportArtifactService.loadPdfReport(job);
         if (resource == null || !resource.exists()) {
             return ResponseEntity.notFound().build();
         }
-        String filename = resource.getFilename() != null ? resource.getFilename() : ("rapport_" + scrapeId + ".html");
+        String filename = resource.getFilename() != null
+                ? resource.getFilename()
+                : ("rapport_" + scrapeId + ".pdf");
         return ResponseEntity.ok()
-                .header(HttpHeaders.CONTENT_DISPOSITION, "inline; filename=\"" + filename + "\"")
-                .contentType(MediaType.TEXT_HTML)
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + filename + "\"")
+                .contentType(MediaType.APPLICATION_PDF)
                 .body(resource);
     }
 

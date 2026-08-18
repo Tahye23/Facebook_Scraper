@@ -647,7 +647,12 @@ def _analyze_description_with_gemini_sdk(
     }
 
 
-def analyze_videos_json_with_gemini(videos_json_path: str, output_dir: str | None = None) -> dict:
+def analyze_videos_json_with_gemini(
+    videos_json_path: str,
+    output_dir: str | None = None,
+    *,
+    persist_json: bool = False,
+) -> dict:
     """Analyse un JSON consolide de videos TikTok et retourne un rapport arabe.
 
     Le JSON d'entree doit contenir une liste de videos avec au minimum:
@@ -776,24 +781,59 @@ def analyze_videos_json_with_gemini(videos_json_path: str, output_dir: str | Non
     if not isinstance(parsed, dict):
         raise RuntimeError("Gemini n'a pas retourne un JSON exploitable pour le rapport batch")
 
-    base_output = Path(output_dir or os.getenv("VIDEO_ANALYSIS_OUTPUT_DIR", "video_reports"))
-    base_output.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
-    out_path = base_output / f"mauritanie_24h_gemini_{ts}.json"
-    output_payload = {
-        "generated_at": datetime.now(tz=timezone.utc).isoformat(),
-        "model_name": model_name,
-        "input_videos_count": len(compact_videos),
-        "report": parsed,
-        "raw": raw_text,
-    }
-    out_path.write_text(json.dumps(output_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Par defaut on ne persiste plus le JSON (seul le PDF 24h est conserve).
+    persist = bool(persist_json)
+    report_path = None
+    if persist:
+        base_output = Path(output_dir or os.getenv("VIDEO_ANALYSIS_OUTPUT_DIR", "video_reports"))
+        base_output.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+        out_path = base_output / f"mauritanie_24h_gemini_{ts}.json"
+        output_payload = {
+            "generated_at": datetime.now(tz=timezone.utc).isoformat(),
+            "model_name": model_name,
+            "input_videos_count": len(compact_videos),
+            "report": parsed,
+            "raw": raw_text,
+        }
+        out_path.write_text(json.dumps(output_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        report_path = str(out_path)
 
     return {
         "report": parsed,
-        "report_path": str(out_path),
+        "report_path": report_path,
         "model_name": model_name,
     }
+
+
+def analyze_videos_batch_with_gemini(videos: list[dict], output_dir: str | None = None) -> dict:
+    """Analyse batch in-memory (pas de JSON ecrit sur disque)."""
+    import tempfile
+
+    payload = {
+        "videos": videos if isinstance(videos, list) else [],
+        "generated_at": datetime.now(tz=timezone.utc).isoformat(),
+    }
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".json",
+        prefix="batch_videos_",
+        encoding="utf-8",
+        delete=False,
+    ) as tmp:
+        tmp.write(json.dumps(payload, ensure_ascii=False))
+        tmp_path = tmp.name
+    try:
+        return analyze_videos_json_with_gemini(
+            videos_json_path=tmp_path,
+            output_dir=output_dir,
+            persist_json=False,
+        )
+    finally:
+        try:
+            Path(tmp_path).unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def analyze_tiktok_video(

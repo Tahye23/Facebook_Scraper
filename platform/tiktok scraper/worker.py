@@ -44,7 +44,7 @@ from scraper import _proxy_identity as proxy_identity
 from scraper import _blacklist_proxy as blacklist_proxy
 from video_analysis import (
     analyze_tiktok_video,
-    analyze_videos_json_with_gemini,
+    analyze_videos_batch_with_gemini,
     build_session_json_report,
     build_small_video_report,
 )
@@ -1034,8 +1034,9 @@ def _build_mauritanie_24h_pdf(
         return None
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
-    out_path = output_dir / f"mauritanie_24h_{scrape_id}_{ts}.pdf"
+    # Nom stable: date du scrape (UTC) + scrape_id unique.
+    scrape_date = datetime.now(tz=timezone.utc).strftime("%Y%m%d")
+    out_path = output_dir / f"mauritanie_24h_{scrape_date}_{scrape_id}.pdf"
 
     def _shape_ar(text: str) -> str:
         base = str(text or "")
@@ -2033,11 +2034,10 @@ def _process_csv_batch_task(
 
         failed_pages = [row for row in failed_pages if row["url"] not in recoverable_urls or row["url"] in still_failed_urls]
 
-    report_json_path = _build_batch_pages_report(scrape_id, source_rows, failed_pages, output_dir)
-    videos_json_path = _save_batch_videos_json(scrape_id=scrape_id, videos=videos_payload, output_dir=output_dir)
+    # Plus de JSON/HTML/DOCX persistés: uniquement le PDF 24h (chemin stocké en Mongo).
+    report_json_path = None
+    videos_json_path = None
 
-    # Rapports 24h: STRICTEMENT apres le scraping. Toute erreur ici est logguee
-    # mais ne doit JAMAIS empecher le COMPLETED ni casser le worker.
     gemini_report_path = None
     mauritanie_html_path = None
     mauritanie_pdf_path = None
@@ -2049,13 +2049,12 @@ def _process_csv_batch_task(
             scoped_logger.info("Starting Gemini batch report generation", extra={"post_id": None})
             with ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(
-                    analyze_videos_json_with_gemini,
-                    videos_json_path=videos_json_path,
+                    analyze_videos_batch_with_gemini,
+                    videos=videos_payload,
                     output_dir=str(output_dir),
                 )
                 gemini_result = future.result(timeout=gemini_timeout_seconds)
 
-            gemini_report_path = gemini_result.get("report_path")
             gemini_report_obj = gemini_result.get("report") or {}
             scoped_logger.info("Gemini batch report generation completed", extra={"post_id": None})
     except FuturesTimeoutError:
@@ -2072,18 +2071,6 @@ def _process_csv_batch_task(
 
     if videos_payload and gemini_report_obj:
         try:
-            mauritanie_html_path = _build_mauritanie_24h_html_report(
-                scrape_id=scrape_id,
-                source_rows=source_rows,
-                gemini_report=gemini_report_obj,
-                videos_payload=videos_payload,
-                failed_pages=failed_pages,
-                output_dir=output_dir,
-            )
-        except Exception:
-            scoped_logger.exception("Failed to generate Mauritanie 24h HTML (non-fatal)")
-
-        try:
             mauritanie_pdf_path = _build_mauritanie_24h_pdf(
                 scrape_id=scrape_id,
                 source_rows=source_rows,
@@ -2092,21 +2079,12 @@ def _process_csv_batch_task(
                 failed_pages=failed_pages,
                 output_dir=output_dir,
             )
+            # Chemin relatif stable pour Mongo / gateway.
+            if mauritanie_pdf_path:
+                pdf_name = Path(mauritanie_pdf_path).name
+                mauritanie_pdf_path = f"video_reports/{pdf_name}"
         except Exception:
             scoped_logger.exception("Failed to generate Mauritanie 24h PDF (non-fatal)")
-
-        # Word optionnel: lazy-import pour ne jamais casser le demarrage du worker.
-        try:
-            from mauritanie_24h_docx import build_mauritanie_24h_docx
-
-            mauritanie_docx_path = build_mauritanie_24h_docx(
-                scrape_id=scrape_id,
-                gemini_report=gemini_report_obj,
-                videos_payload=videos_payload,
-                output_dir=output_dir,
-            )
-        except Exception:
-            scoped_logger.exception("Failed to generate Mauritanie 24h DOCX (non-fatal)")
 
         # Rattache un video_report par post (pour la colonne Gemini de l'UI).
         try:
@@ -2151,12 +2129,9 @@ def _process_csv_batch_task(
         "errorMessage": err_msg,
         "errorReason": err_reason,
         "sessionReports": {
-            "jsonPath": report_json_path,
-            "htmlPath": mauritanie_html_path,
+            # Seul artefact conserve: le PDF 24h.
             "pdfPath": mauritanie_pdf_path,
-            "docxPath": mauritanie_docx_path,
-            "videosJsonPath": videos_json_path,
-            "geminiJsonPath": gemini_report_path,
+            "pdf_path": mauritanie_pdf_path,
         },
         "batchSummary": {
             "pagesRequested": len(urls),
@@ -2165,6 +2140,7 @@ def _process_csv_batch_task(
             "failedPages": failed_pages,
             "timeWindowHours": time_window_hours,
             "quotaExceeded": bool(quota_exhausted),
+            "reportType": "pdf_24h",
         },
         "count": published_count,
     }
